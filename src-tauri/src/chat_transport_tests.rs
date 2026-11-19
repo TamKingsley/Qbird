@@ -252,3 +252,51 @@ fn modified_source_fails_integrity_check_and_stays_unconfirmed() {
     assert!(alice.store.lock().unwrap().file_transfer(&message.id).unwrap().unwrap().status != "failed");
     crate::files::remove_quietly(&path);
 }
+
+#[test]
+fn group_message_reaches_member_and_clears_that_members_outbox_row() {
+    let alice = side("alice-group-text");
+    let bob = side("bob-group-text");
+    trust(&alice, &bob);
+    trust(&bob, &alice);
+    let alice_id = alice.identity.fingerprint();
+    let bob_id = bob.identity.fingerprint();
+    let group = alice.store.lock().unwrap().create_group(&alice_id, "Team", &[bob_id.clone()], 1).unwrap();
+    let message = alice.store.lock().unwrap().queue_group(&alice_id, &group.id, "hello group", 2).unwrap();
+    assert_eq!(message.pending, 1);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (identity, store) = (Arc::clone(&bob.identity), Arc::clone(&bob.store));
+    let worker = thread::spawn(move || accept_one(&identity, &store, listener.accept().unwrap().0).unwrap());
+    send_group_one(&alice.identity, &alice.store, &bob_id, address, &message.id).unwrap();
+    worker.join().unwrap();
+    let received = bob.store.lock().unwrap().list_group_messages(&group.id, 10, None).unwrap();
+    assert_eq!(received[0].body, "hello group");
+    assert_eq!(received[0].sender, alice_id);
+    assert_eq!(bob.store.lock().unwrap().list_group_members(&group.id).unwrap().iter().filter(|m| m.active).count(), 2);
+    assert_eq!(alice.store.lock().unwrap().list_group_messages(&group.id, 10, None).unwrap()[0].pending, 0);
+    assert!(alice.store.lock().unwrap().next_pending_group_delivery(None).unwrap().is_none());
+}
+
+#[test]
+fn group_invite_creates_the_group_for_the_invited_member() {
+    let alice = side("alice-group-invite");
+    let bob = side("bob-group-invite");
+    trust(&alice, &bob);
+    trust(&bob, &alice);
+    let alice_id = alice.identity.fingerprint();
+    let bob_id = bob.identity.fingerprint();
+    let group = alice.store.lock().unwrap().create_group(&alice_id, "Team", &[bob_id.clone()], 1).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    alice.store.lock().unwrap().set_contact_address(&bob_id, &address.to_string()).unwrap();
+    let task = alice.store.lock().unwrap().next_pending_control(None).unwrap().unwrap();
+    assert_eq!(task.kind, "invite");
+    let (identity, store) = (Arc::clone(&bob.identity), Arc::clone(&bob.store));
+    let worker = thread::spawn(move || accept_one(&identity, &store, listener.accept().unwrap().0).unwrap());
+    send_control_one(&alice.identity, &alice.store, &bob_id, address, &task).unwrap();
+    worker.join().unwrap();
+    let groups = bob.store.lock().unwrap().list_groups(&bob_id).unwrap();
+    assert!(groups.iter().any(|item| item.id == group.id && item.name == "Team"));
+    assert!(alice.store.lock().unwrap().next_pending_control(None).unwrap().is_none());
+}

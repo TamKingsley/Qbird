@@ -1,7 +1,7 @@
 //! Direct-message and file transport primitives. Content is never sent outside TLS.
 use std::{fs::{self, File, OpenOptions}, io::{self, Read, Seek, SeekFrom, Write}, net::{SocketAddr, TcpStream}, path::PathBuf, sync::{Arc, Mutex}, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
 use rustls::{ClientConnection, ServerConnection, StreamOwned, pki_types::ServerName};
-use crate::{certificate, files, identity::Identity, protocol::{self, Payload, ReadyGate}, storage::{DirectMessage, FileOfferDecision, Store}, tls};
+use crate::{certificate, files, identity::Identity, protocol::{self, Payload, ReadyGate}, storage::{DirectMessage, FileOfferDecision, IncomingResult, Store}, tls};
 
 pub const CHAT_PREFACE: &[u8] = b"QBIRD-CHAT/1\n";
 const SESSION_TIMEOUT: Duration = Duration::from_secs(15);
@@ -103,6 +103,7 @@ pub fn accept_one(identity: &Identity, store: &Mutex<Store>, socket: TcpStream) 
     let chain = stream.conn.peer_certificates().ok_or_else(|| invalid("missing client certificate"))?;
     if chain.len() != 1 { return Err(invalid("invalid certificate chain").into()); }
     let peer = certificate::fingerprint(chain[0].as_ref()).map_err(invalid)?;
+    let self_id = identity.fingerprint();
     let mut gate = exchange_ready(&mut stream)?;
     loop {
         stream.sock.touch();
@@ -125,6 +126,41 @@ pub fn accept_one(identity: &Identity, store: &Mutex<Store>, socket: TcpStream) 
             }
             Payload::FileOffer { id, name, size, sha256, created_at, logical } => {
                 receive_file(&mut stream, &mut gate, store, &peer, FileOffer { id, name, size, sha256, created_at, logical })?;
+            }
+            Payload::GroupText { id, group_id, name, owner, members, body, created_at, logical } => {
+                let result = store.lock().map_err(|_| invalid("store unavailable"))?
+                    .receive_group(&self_id, &peer, &group_id, &name, &owner, &members, &id, &body, created_at, logical, unix_now())?;
+                // NotMember is acknowledged so a removed member stops being retried.
+                if !matches!(result, IncomingResult::Inserted | IncomingResult::Duplicate | IncomingResult::NotMember) {
+                    return Err(invalid("group message rejected").into());
+                }
+                acknowledge(&mut stream, &mut gate, &id)?;
+            }
+            Payload::GroupUpdate { id, group_id, name, owner, members } => {
+                let payload = serde_json::json!({ "name": name, "owner": owner, "members": members }).to_string();
+                let result = store.lock().map_err(|_| invalid("store unavailable"))?
+                    .receive_group_control(&self_id, &peer, "invite", &group_id, &payload, unix_now())?;
+                if !matches!(result, IncomingResult::Inserted | IncomingResult::Duplicate | IncomingResult::NotMember) {
+                    return Err(invalid("group update rejected").into());
+                }
+                acknowledge(&mut stream, &mut gate, &id)?;
+            }
+            Payload::GroupRemove { id, group_id } => {
+                let result = store.lock().map_err(|_| invalid("store unavailable"))?
+                    .receive_group_control(&self_id, &peer, "remove", &group_id, "{}", unix_now())?;
+                if !matches!(result, IncomingResult::Inserted | IncomingResult::Duplicate | IncomingResult::NotMember) {
+                    return Err(invalid("group removal rejected").into());
+                }
+                acknowledge(&mut stream, &mut gate, &id)?;
+            }
+            Payload::GroupLeave { id, group_id, member } => {
+                let payload = serde_json::json!({ "member": member }).to_string();
+                let result = store.lock().map_err(|_| invalid("store unavailable"))?
+                    .receive_group_control(&self_id, &peer, "leave", &group_id, &payload, unix_now())?;
+                if !matches!(result, IncomingResult::Inserted | IncomingResult::Duplicate | IncomingResult::NotMember) {
+                    return Err(invalid("group leave rejected").into());
+                }
+                acknowledge(&mut stream, &mut gate, &id)?;
             }
             _ => return Err(invalid("unexpected payload").into()),
         }
@@ -227,6 +263,67 @@ fn receive_file(stream: &mut StreamOwned<ServerConnection, DeadlineStream>, gate
     let complete = Payload::FileComplete { id };
     gate.outbound(&complete)?;
     protocol::write_frame(&mut *stream, &complete)?;
+    Ok(())
+}
+
+fn acknowledge(stream: &mut StreamOwned<ServerConnection, DeadlineStream>, gate: &mut ReadyGate, id: &str) -> io::Result<()> {
+    let ack = Payload::Ack { id: id.to_owned() };
+    gate.outbound(&ack)?;
+    protocol::write_frame(&mut *stream, &ack)
+}
+
+/// Deliver one queued group message to a single member; only that member's outbox row is cleared.
+pub fn send_group_one(identity: &Identity, store: &Mutex<Store>, member: &str, address: SocketAddr, message_id: &str) -> ChatResult<()> {
+    if address.port() == 0 || !crate::address::is_unicast(address.ip()) { return Err(invalid("invalid address").into()); }
+    let dispatch = store.lock().map_err(|_| invalid("store unavailable"))?.group_dispatch(message_id)?
+        .ok_or_else(|| invalid("group message not found"))?;
+    let (mut stream, mut gate) = connect(identity, member, address)?;
+    let text = Payload::GroupText {
+        id: dispatch.message_id.clone(), group_id: dispatch.group_id, name: dispatch.group_name,
+        owner: dispatch.owner, members: dispatch.members, body: dispatch.body,
+        created_at: dispatch.created_at, logical: dispatch.logical,
+    };
+    gate.outbound(&text)?;
+    protocol::write_frame(&mut stream, &text)?;
+    let reply = protocol::read_frame(&mut stream)?;
+    gate.inbound(&reply)?;
+    if reply != (Payload::Ack { id: dispatch.message_id.clone() }) { return Err(invalid("invalid group acknowledgement").into()); }
+    if !store.lock().map_err(|_| invalid("store unavailable"))?.ack_group(member, &dispatch.message_id)? {
+        return Err(invalid("group delivery state changed").into());
+    }
+    Ok(())
+}
+
+/// Deliver one invite / roster update / removal / leave notice.
+pub fn send_control_one(identity: &Identity, store: &Mutex<Store>, target: &str, address: SocketAddr, task: &crate::storage::GroupControlTask) -> ChatResult<()> {
+    if address.port() == 0 || !crate::address::is_unicast(address.ip()) { return Err(invalid("invalid address").into()); }
+    let payload = match task.kind.as_str() {
+        "invite" | "members" => {
+            let value: serde_json::Value = serde_json::from_str(&task.payload)?;
+            let name = value.get("name").and_then(|v| v.as_str()).ok_or_else(|| invalid("invalid control payload"))?.to_owned();
+            let owner = value.get("owner").and_then(|v| v.as_str()).ok_or_else(|| invalid("invalid control payload"))?.to_owned();
+            let members: Vec<String> = value.get("members").and_then(|v| v.as_array())
+                .ok_or_else(|| invalid("invalid control payload"))?
+                .iter().filter_map(|v| v.as_str().map(str::to_owned)).collect();
+            Payload::GroupUpdate { id: task.id.clone(), group_id: task.group_id.clone(), name, owner, members }
+        }
+        "remove" => Payload::GroupRemove { id: task.id.clone(), group_id: task.group_id.clone() },
+        "leave" => {
+            let value: serde_json::Value = serde_json::from_str(&task.payload)?;
+            let member = value.get("member").and_then(|v| v.as_str()).ok_or_else(|| invalid("invalid control payload"))?.to_owned();
+            Payload::GroupLeave { id: task.id.clone(), group_id: task.group_id.clone(), member }
+        }
+        _ => return Err(invalid("unknown control kind").into()),
+    };
+    let (mut stream, mut gate) = connect(identity, target, address)?;
+    gate.outbound(&payload)?;
+    protocol::write_frame(&mut stream, &payload)?;
+    let reply = protocol::read_frame(&mut stream)?;
+    gate.inbound(&reply)?;
+    if reply != (Payload::Ack { id: task.id.clone() }) { return Err(invalid("invalid control acknowledgement").into()); }
+    if !store.lock().map_err(|_| invalid("store unavailable"))?.ack_control(&task.id)? {
+        return Err(invalid("control state changed").into());
+    }
     Ok(())
 }
 

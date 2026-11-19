@@ -291,7 +291,7 @@ pub fn v1_hide_self(state: tauri::State<'_, AppState>) -> Result<bool, String> {
 
 #[tauri::command]
 pub fn v1_list_conversations(state: tauri::State<'_, AppState>) -> Result<Vec<crate::storage::Conversation>, String> {
-    state.store.lock().map_err(|_| "本地存储不可用".to_owned())?.list_conversations().map_err(|_| "无法读取会话".to_owned())
+    state.store.lock().map_err(|_| "本地存储不可用".to_owned())?.list_conversations(&state.identity.fingerprint()).map_err(|_| "无法读取会话".to_owned())
 }
 
 #[tauri::command]
@@ -305,6 +305,91 @@ pub fn v1_send_self(state: tauri::State<'_, AppState>, body: String) -> Result<c
     let created_at = i64::try_from(now).map_err(|_| "系统时间无效".to_owned())?;
     state.store.lock().map_err(|_| "本地存储不可用".to_owned())?.send_self(&state.identity.fingerprint(), &body, created_at)
         .map_err(|_| "消息为空、过长或无法保存".to_owned())
+}
+
+fn unix_now() -> Result<i64, String> {
+    let seconds = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| "系统时间无效".to_owned())?.as_secs();
+    i64::try_from(seconds).map_err(|_| "系统时间无效".to_owned())
+}
+
+#[tauri::command]
+pub fn v1_create_group(state: tauri::State<'_, AppState>, name: String, members: Vec<String>) -> Result<crate::storage::GroupSummary, String> {
+    let owner = state.identity.fingerprint();
+    let now = unix_now()?;
+    state.store.lock().map_err(|_| "本地存储不可用".to_owned())?
+        .create_group(&owner, &name, &members, now)
+        .map_err(|_| "群名无效、成员尚未确认或数量超出限制".to_owned())
+}
+
+#[tauri::command]
+pub fn v1_list_groups(state: tauri::State<'_, AppState>) -> Result<Vec<crate::storage::GroupSummary>, String> {
+    let self_id = state.identity.fingerprint();
+    state.store.lock().map_err(|_| "本地存储不可用".to_owned())?
+        .list_groups(&self_id).map_err(|_| "无法读取群聊".to_owned())
+}
+
+#[tauri::command]
+pub fn v1_list_group_members(state: tauri::State<'_, AppState>, group_id: String) -> Result<Vec<crate::storage::GroupMember>, String> {
+    state.store.lock().map_err(|_| "本地存储不可用".to_owned())?
+        .list_group_members(&group_id).map_err(|_| "无法读取群成员".to_owned())
+}
+
+#[tauri::command]
+pub fn v1_open_group(state: tauri::State<'_, AppState>, group_id: String) -> Result<(), String> {
+    let self_id = state.identity.fingerprint();
+    let opened = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?
+        .open_group(&group_id, &self_id).map_err(|_| "无法打开群聊".to_owned())?;
+    if opened { Ok(()) } else { Err("已不在该群中".into()) }
+}
+
+#[tauri::command]
+pub fn v1_hide_group(state: tauri::State<'_, AppState>, group_id: String) -> Result<bool, String> {
+    let self_id = state.identity.fingerprint();
+    state.store.lock().map_err(|_| "本地存储不可用".to_owned())?
+        .hide_group(&group_id, &self_id).map_err(|_| "无法隐藏会话".to_owned())
+}
+
+#[tauri::command]
+pub fn v1_queue_group(state: tauri::State<'_, AppState>, group_id: String, body: String) -> Result<crate::storage::GroupMessage, String> {
+    let sender = state.identity.fingerprint();
+    let created_at = unix_now()?;
+    state.store.lock().map_err(|_| "本地存储不可用".to_owned())?
+        .queue_group(&sender, &group_id, &body, created_at)
+        .map_err(|_| "消息为空、过长或已不在该群中".to_owned())
+}
+
+#[tauri::command]
+pub fn v1_list_group(state: tauri::State<'_, AppState>, group_id: String, limit: u32, before: Option<crate::storage::DirectCursor>) -> Result<Vec<crate::storage::GroupMessage>, String> {
+    state.store.lock().map_err(|_| "本地存储不可用".to_owned())?
+        .list_group_messages(&group_id, limit, before.as_ref()).map_err(|_| "无法读取群聊记录".to_owned())
+}
+
+#[tauri::command]
+pub fn v1_add_group_member(state: tauri::State<'_, AppState>, group_id: String, member: String) -> Result<(), String> {
+    let actor = state.identity.fingerprint();
+    let now = unix_now()?;
+    let added = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?
+        .add_group_member(&group_id, &actor, &member, now).map_err(|_| "无法添加成员".to_owned())?;
+    if added { Ok(()) } else { Err("只有群主可以添加，且该联系人须已确认、尚未在群中".into()) }
+}
+
+#[tauri::command]
+pub fn v1_remove_group_member(state: tauri::State<'_, AppState>, group_id: String, member: String) -> Result<(), String> {
+    let actor = state.identity.fingerprint();
+    let now = unix_now()?;
+    let removed = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?
+        .remove_group_member(&group_id, &actor, &member, now).map_err(|_| "无法移除成员".to_owned())?;
+    if removed { Ok(()) } else { Err("只有群主可以移除群内成员".into()) }
+}
+
+#[tauri::command]
+pub fn v1_leave_group(state: tauri::State<'_, AppState>, group_id: String) -> Result<(), String> {
+    let self_id = state.identity.fingerprint();
+    let now = unix_now()?;
+    let left = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?
+        .leave_group(&group_id, &self_id, now).map_err(|_| "无法退出群聊".to_owned())?;
+    if left { Ok(()) } else { Err("群主不能退出群聊".into()) }
 }
 
 #[cfg(all(test, windows))]

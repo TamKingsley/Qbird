@@ -20,6 +20,15 @@ pub enum Payload {
     FileAccept { id: String, offset: u64 },
     FileReject { id: String, reason: String },
     FileComplete { id: String },
+    /// One group message. `members` is the sender's local snapshot; receivers accept it
+    /// only from the group owner, so a member cannot rewrite the roster.
+    GroupText { id: String, group_id: String, name: String, owner: String, members: Vec<String>, body: String, created_at: i64, logical: i64 },
+    /// Invite or member-list update; carries the same owner-controlled snapshot.
+    GroupUpdate { id: String, group_id: String, name: String, owner: String, members: Vec<String> },
+    /// The owner removed the receiver from the group.
+    GroupRemove { id: String, group_id: String },
+    /// A member left voluntarily and tells the owner.
+    GroupLeave { id: String, group_id: String, member: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,6 +42,21 @@ fn invalid(reason: &'static str) -> io::Error { io::Error::new(io::ErrorKind::In
 
 fn valid_sha256(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+pub const MAX_GROUP_MEMBERS: usize = 256;
+
+fn valid_group_id(value: &str) -> bool {
+    value.len() == 32 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+fn valid_members(owner: &str, members: &[String]) -> bool {
+    !members.is_empty()
+        && members.len() <= MAX_GROUP_MEMBERS
+        && members.iter().all(|member| {
+            member.len() == 64 && member.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+        && members.iter().any(|member| member == owner)
 }
 
 fn valid_file_name(name: &str) -> bool {
@@ -57,6 +81,16 @@ fn validate(payload: &Payload) -> io::Result<()> {
         Payload::FileAccept { id, offset } if valid_id(id) && *offset <= MAX_FILE_BYTES => Ok(()),
         Payload::FileReject { id, reason } if valid_id(id) && valid_reject_reason(reason) => Ok(()),
         Payload::FileComplete { id } if valid_id(id) => Ok(()),
+        Payload::GroupText { id, group_id, name, owner, members, body, logical, .. }
+            if valid_id(id) && valid_group_id(group_id) && !name.is_empty() && name.len() <= 128
+                && valid_members(owner, members) && !body.is_empty() && body.len() <= MAX_BODY && *logical > 0 => Ok(()),
+        Payload::GroupUpdate { id, group_id, name, owner, members }
+            if valid_id(id) && valid_group_id(group_id) && !name.is_empty() && name.len() <= 128
+                && valid_members(owner, members) => Ok(()),
+        Payload::GroupRemove { id, group_id } if valid_id(id) && valid_group_id(group_id) => Ok(()),
+        Payload::GroupLeave { id, group_id, member }
+            if valid_id(id) && valid_group_id(group_id)
+                && member.len() == 64 && member.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) => Ok(()),
         _ => Err(invalid("invalid message payload")),
     }
 }
@@ -174,5 +208,45 @@ mod tests {
         assert!(gate.inbound(&Payload::Ready {}).is_err());
         assert!(gate.outbound(&text).is_ok());
         assert!(gate.inbound(&Payload::Ack { id: "m1".into() }).is_ok());
+    }
+
+    #[test]
+    fn group_frames_enforce_group_id_ownership_and_member_bounds() {
+        let owner = "a".repeat(64);
+        let member = "b".repeat(64);
+        let group_id = "1".repeat(32);
+        let text = Payload::GroupText {
+            id: "m1".into(), group_id: group_id.clone(), name: "Team".into(), owner: owner.clone(),
+            members: vec![owner.clone(), member.clone()], body: "hi".into(), created_at: 1, logical: 1,
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &text).unwrap();
+        assert_eq!(read_frame(Cursor::new(&bytes)).unwrap(), text);
+
+        let base = |members: Vec<String>| Payload::GroupText {
+            id: "m1".into(), group_id: group_id.clone(), name: "Team".into(), owner: owner.clone(),
+            members, body: "hi".into(), created_at: 1, logical: 1,
+        };
+        // The owner must appear in the member snapshot.
+        assert!(write_frame(Vec::new(), &base(vec![member.clone()])).is_err());
+        // Duplicate or malformed fingerprints are rejected by receive, empty list here.
+        assert!(write_frame(Vec::new(), &base(vec![])).is_err());
+        // Group ids are exactly 32 hex characters.
+        let mut short = text.clone();
+        if let Payload::GroupText { group_id, .. } = &mut short { *group_id = "short".into(); }
+        assert!(write_frame(Vec::new(), &short).is_err());
+        // Too many members exceeds the frame contract.
+        let crowd: Vec<String> = (0..=MAX_GROUP_MEMBERS).map(|i| format!("{:064x}", i)).collect();
+        assert!(write_frame(Vec::new(), &base(crowd)).is_err());
+
+        let update = Payload::GroupUpdate { id: "u1".into(), group_id: group_id.clone(), name: "Team".into(), owner: owner.clone(), members: vec![owner.clone(), member.clone()] };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &update).unwrap();
+        assert_eq!(read_frame(Cursor::new(&bytes)).unwrap(), update);
+
+        assert!(write_frame(Vec::new(), &Payload::GroupRemove { id: "r1".into(), group_id: group_id.clone() }).is_ok());
+        assert!(write_frame(Vec::new(), &Payload::GroupRemove { id: "r1".into(), group_id: "x".repeat(31) }).is_err());
+        assert!(write_frame(Vec::new(), &Payload::GroupLeave { id: "l1".into(), group_id: group_id.clone(), member: member.clone() }).is_ok());
+        assert!(write_frame(Vec::new(), &Payload::GroupLeave { id: "l1".into(), group_id, member: "not-a-fingerprint".into() }).is_err());
     }
 }

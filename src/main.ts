@@ -3,6 +3,7 @@ import { invoke, isTauri } from '@tauri-apps/api/core';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { version as appVersion } from '../package.json';
 import { DirectChat } from './direct_chat';
+import { GroupChat } from './group_chat';
 
 type Page = 'messages' | 'contacts' | 'discover' | 'settings' | 'about';
 const root = document.querySelector<HTMLDivElement>('#app');
@@ -27,14 +28,17 @@ let observedAddress = '';
 let probeBusy = false;
 let selectedFingerprint = '';
 type Contact = { fingerprint: string; display_name: string; trust_state: string };
-type Conversation = { id: string; last_body: string; last_logical: number };
+type Conversation = { id: string; last_body: string; last_logical: number; kind: string };
+type Group = { id: string; name: string; owner: string; member_count: number; hidden: boolean; is_owner: boolean; last_body: string; last_logical: number };
+let groups: Group[] = [];
 type LocalMessage = { id: string; body: string; logical: number; created_at: number };
 let selfOpen = false;
 let selfMessages: LocalMessage[] = [];
 let selfHasOlder = false;
 let selfBusy = false;
 let selfDraft = '';
-const direct = new DirectChat(app, () => { selfOpen = false; page = 'messages'; menuOpen = false; render(); });
+const direct = new DirectChat(app, () => { groupChat.clear(); selfOpen = false; page = 'messages'; menuOpen = false; render(); });
+const groupChat = new GroupChat(app, () => { direct.clear(); selfOpen = false; page = 'messages'; menuOpen = false; render(); });
 
 const icons = {
   messages: '<path d="M4 5.75A2.75 2.75 0 0 1 6.75 3h10.5A2.75 2.75 0 0 1 20 5.75v7.5A2.75 2.75 0 0 1 17.25 16H10l-4.5 3v-3.25A2.75 2.75 0 0 1 4 13.25z"/>',
@@ -93,11 +97,27 @@ async function refreshConversations(): Promise<void> {
   if (!list) return;
   if (!isTauri()) { list.textContent = '请在桌面应用中查看会话'; return; }
   try {
-    const [conversations, contacts] = await Promise.all([invoke<Conversation[]>('v1_list_conversations'), invoke<Contact[]>('v1_list_contacts')]);
+    const [conversations, contacts, groupList] = await Promise.all([
+      invoke<Conversation[]>('v1_list_conversations'),
+      invoke<Contact[]>('v1_list_contacts'),
+      invoke<Group[]>('v1_list_groups'),
+    ]);
+    groups = groupList;
     if (!list.isConnected) return;
     list.replaceChildren();
     if (!conversations.length) { list.textContent = '暂无会话'; return; }
     for (const conversation of conversations) {
+      if (conversation.kind === 'group') {
+        const group = groups.find(item => item.id === conversation.id);
+        if (!group) continue;
+        const button = document.createElement('button');
+        button.className = `conversation-row${groupChat.groupId === conversation.id ? ' selected' : ''}`;
+        button.dataset.action = 'open-group'; button.dataset.group = group.id; button.dataset.name = group.name;
+        const name = document.createElement('strong'); name.textContent = group.name;
+        const preview = document.createElement('span'); preview.textContent = conversation.last_body || `${group.member_count} 位成员`;
+        button.append(name, preview); list.append(button);
+        continue;
+      }
       const contact = contacts.find(item => item.fingerprint === conversation.id && item.trust_state === 'verified');
       if (conversation.id !== 'self' && !contact) continue;
       const button = document.createElement('button');
@@ -209,10 +229,12 @@ async function refreshContacts(): Promise<void> {
   if (!status || !list) return;
   if (!isTauri()) { status.textContent = '仅桌面应用支持联系人'; return; }
   try {
-    const contacts = await invoke<Contact[]>('v1_list_contacts');
+    const [contacts, groupList] = await Promise.all([invoke<Contact[]>('v1_list_contacts'), invoke<Group[]>('v1_list_groups')]);
+    groups = groupList;
     if (!list.isConnected) return;
     list.replaceChildren();
     status.textContent = contacts.length ? `其他联系人：${contacts.length}` : '暂无其他联系人，可前往发现页面核对指纹。';
+    paintGroups(contacts);
     for (const contact of contacts) {
       const item = document.createElement('li');
       item.textContent = `${contact.display_name} · ${contact.trust_state === 'verified' ? '已确认' : '待确认'} · ${contact.fingerprint}`;
@@ -224,6 +246,58 @@ async function refreshContacts(): Promise<void> {
       list.append(item);
     }
   } catch { if (status.isConnected) status.textContent = '无法读取联系人'; }
+}
+
+function paintGroups(contacts: Contact[]): void {
+  const list = app.querySelector<HTMLUListElement>('#groups-list');
+  const pick = app.querySelector<HTMLElement>('#group-members-pick');
+  if (list) {
+    list.replaceChildren();
+    if (!groups.length) {
+      const empty = document.createElement('li');
+      empty.textContent = '还没有群聊。选择一个名称和至少一位已确认联系人即可创建。';
+      list.append(empty);
+    }
+    for (const group of groups) {
+      const item = document.createElement('li');
+      item.textContent = `${group.name} · ${group.member_count} 人${group.is_owner ? ' · 我创建的' : ''}`;
+      const open = document.createElement('button');
+      open.className = 'outline'; open.textContent = '打开群聊';
+      open.dataset.action = 'open-group'; open.dataset.group = group.id; open.dataset.name = group.name;
+      item.append(open); list.append(item);
+    }
+  }
+  if (pick) {
+    pick.replaceChildren();
+    const verified = contacts.filter(contact => contact.trust_state === 'verified');
+    if (!verified.length) { pick.textContent = '需要先在发现页面确认至少一位联系人。'; return; }
+    for (const contact of verified) {
+      const label = document.createElement('label');
+      const box = document.createElement('input');
+      box.type = 'checkbox'; box.dataset.groupMember = contact.fingerprint;
+      label.append(box, document.createTextNode(` ${contact.display_name}（${contact.fingerprint.slice(0, 8)}）`));
+      pick.append(label);
+    }
+  }
+}
+
+async function createGroup(): Promise<void> {
+  const input = app.querySelector<HTMLInputElement>('#group-name');
+  const status = app.querySelector<HTMLElement>('#group-create-status');
+  if (!isTauri() || !input || !status) return;
+  const name = input.value.trim();
+  const members = [...app.querySelectorAll<HTMLInputElement>('input[data-group-member]:checked')]
+    .map(node => node.dataset.groupMember || '').filter(Boolean);
+  if (!name) { status.textContent = '请输入群聊名称'; return; }
+  if (!members.length) { status.textContent = '请至少选择一位已确认联系人'; return; }
+  try {
+    const created = await invoke<Group>('v1_create_group', { name, members });
+    input.value = '';
+    for (const node of app.querySelectorAll<HTMLInputElement>('input[data-group-member]')) node.checked = false;
+    status.textContent = '群聊已创建；邀请会在对方在线时送达。';
+    selfOpen = false; page = 'messages';
+    await groupChat.open(created.id, created.name);
+  } catch (error) { status.textContent = displayError(error); }
 }
 
 function render(): void {
@@ -249,7 +323,7 @@ function render(): void {
         <div class="side-foot"><span class="dot"></span>开发中 · 本地桌面版</div>
       </aside>
       <main class="workspace">
-        ${page === 'messages' && direct.peer ? direct.view() : page === 'messages' && selfOpen ? selfChatView() : page === 'discover' ? discoveryView() : page === 'contacts' ? `<section class="discovery-panel card"><h2>联系人</h2><button class="self-contact" data-action="open-self" ${isTauri() ? '' : 'disabled'}><strong>自己</strong><span>打开本地自聊</span></button><p>已确认的联系人保存在本机；双方须各自核对指纹后才能聊天。</p><p id="contacts-status" aria-live="polite"></p><ul id="contacts-list" class="discovery-results"></ul></section>` : page === 'about' ? `<section class="card about"><span class="eyebrow">ABOUT / 关于</span><h2>Qbird 青鸟</h2><p>面向局域网的本地优先聊天与文件交流工具。</p><dl><div><dt>当前阶段</dt><dd>Windows 开发版 ${appVersion}</dd></div><div><dt>许可证</dt><dd>Apache License 2.0</dd></div><div><dt>平台规划</dt><dd>Windows 首发 · 后续 Linux / macOS</dd></div></dl><p class="notice">开发版未经安全审计，本地数据库未加密。</p></section>` : `<section class="empty"><div class="empty-mark">${icon(page === 'settings' ? 'settings' : 'spark')}</div><h2>${current.heading}</h2><p>${current.copy}</p>${page === 'settings' ? `<p>本机身份指纹（SHA-256）：<br><code class="fingerprint">${fingerprint}</code></p><button data-page="about" class="outline">关于 Qbird</button>` : ''}</section>`}
+        ${page === 'messages' && groupChat.groupId ? groupChat.view() : page === 'messages' && direct.peer ? direct.view() : page === 'messages' && selfOpen ? selfChatView() : page === 'discover' ? discoveryView() : page === 'contacts' ? `<section class="discovery-panel card"><h2>联系人</h2><button class="self-contact" data-action="open-self" ${isTauri() ? '' : 'disabled'}><strong>自己</strong><span>打开本地自聊</span></button><p>已确认的联系人保存在本机；双方须各自核对指纹后才能聊天。</p><p id="contacts-status" aria-live="polite"></p><ul id="contacts-list" class="discovery-results"></ul><div class="probe-box"><h3>我的群聊</h3><ul id="groups-list" class="discovery-results"></ul><label for="group-name">新建群聊名称</label><input id="group-name" type="text" maxlength="128" placeholder="例如：项目组"><div id="group-members-pick" class="group-pick"></div><button class="outline" data-action="create-group">创建群聊</button><p id="group-create-status" aria-live="polite"></p><small>只能邀请已确认的联系人；新成员只能看到加入之后的消息。</small></div></section>` : page === 'about' ? `<section class="card about"><span class="eyebrow">ABOUT / 关于</span><h2>Qbird 青鸟</h2><p>面向局域网的本地优先聊天与文件交流工具。</p><dl><div><dt>当前阶段</dt><dd>Windows 开发版 ${appVersion}</dd></div><div><dt>许可证</dt><dd>Apache License 2.0</dd></div><div><dt>平台规划</dt><dd>Windows 首发 · 后续 Linux / macOS</dd></div></dl><p class="notice">开发版未经安全审计，本地数据库未加密。</p></section>` : `<section class="empty"><div class="empty-mark">${icon(page === 'settings' ? 'settings' : 'spark')}</div><h2>${current.heading}</h2><p>${current.copy}</p>${page === 'settings' ? `<p>本机身份指纹（SHA-256）：<br><code class="fingerprint">${fingerprint}</code></p><button data-page="about" class="outline">关于 Qbird</button>` : ''}</section>`}
       </main>
     </div>`;
   if (page === 'discover') paintDiscovery();
@@ -386,6 +460,7 @@ async function probePeer(address: string): Promise<void> {
 app.addEventListener('input', (event) => {
   const target = event.target;
   if (target instanceof HTMLTextAreaElement && target.id === 'direct-input') { direct.draft(target.value); return; }
+  if (target instanceof HTMLTextAreaElement && target.id === 'group-input') { groupChat.draft(target.value); return; }
   if (target instanceof HTMLTextAreaElement && target.id === 'self-input') { selfDraft = target.value; return; }
   if (!(target instanceof HTMLInputElement)) return;
   if (target.id === 'direct-address') { direct.addressDraft(target.value); return; }
@@ -396,6 +471,9 @@ app.addEventListener('keydown', (event) => {
   if (event.target instanceof HTMLTextAreaElement && event.target.id === 'direct-input' && event.key === 'Enter' && !event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey && !event.isComposing) {
     event.preventDefault(); void direct.send(); return;
   }
+  if (event.target instanceof HTMLTextAreaElement && event.target.id === 'group-input' && event.key === 'Enter' && !event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey && !event.isComposing) {
+    event.preventDefault(); void groupChat.send(); return;
+  }
   if (event.target instanceof HTMLTextAreaElement && event.target.id === 'self-input' && event.key === 'Enter' && !event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey && !event.isComposing) {
     event.preventDefault(); void sendSelf();
   }
@@ -404,6 +482,13 @@ app.addEventListener('click', (event) => {
   const target = event.target;
   if (!(target instanceof Element)) return;
   const action = target.closest<HTMLButtonElement>('button[data-action]');
+  if (action?.dataset.action === 'open-group' && action.dataset.group) {
+    const groupId = action.dataset.group, name = action.dataset.name || '群聊';
+    direct.clear(); selfOpen = false; page = 'messages';
+    void groupChat.open(groupId, name).catch(error => {
+      const status = app.querySelector<HTMLElement>('#group-error'); if (status) status.textContent = displayError(error);
+    }); return;
+  }
   if (action?.dataset.action === 'open-direct' && action.dataset.peer) {
     void direct.open(action.dataset.peer, action.dataset.name || action.dataset.peer).catch(error => {
       const status = app.querySelector<HTMLElement>('#contacts-status'); if (status) status.textContent = displayError(error);
@@ -415,6 +500,14 @@ app.addEventListener('click', (event) => {
   if (action?.dataset.action === 'direct-file') { void direct.pick('file'); return; }
   if (action?.dataset.action === 'direct-older') { void direct.load(true); return; }
   if (action?.dataset.action === 'save-direct-address') { void direct.saveAddress(); return; }
+  if (action?.dataset.action === 'group-send') { void groupChat.send(); return; }
+  if (action?.dataset.action === 'group-older') { void groupChat.load(true); return; }
+  if (action?.dataset.action === 'hide-group') { void groupChat.hide(); return; }
+  if (action?.dataset.action === 'leave-group') { void groupChat.leave(); return; }
+  if (action?.dataset.action === 'toggle-group-members') { groupChat.toggleMembers(); return; }
+  if (action?.dataset.action === 'add-group-member') { void groupChat.addMember(); return; }
+  if (action?.dataset.action === 'remove-group-member' && action.dataset.member) { void groupChat.removeMember(action.dataset.member); return; }
+  if (action?.dataset.action === 'create-group') { void createGroup(); return; }
   if (action?.dataset.action === 'open-self') { void openSelf(); return; }
   if (action?.dataset.action === 'hide-self') { void hideSelf(); return; }
   if (action?.dataset.action === 'self-send') { void sendSelf(); return; }
@@ -440,7 +533,7 @@ render();
 app.addEventListener('conversations-changed', () => { void refreshConversations(); });
 window.setInterval(() => {
   void refreshDiscovery(); void refreshProbeStatus();
-  if (page === 'messages') { void refreshConversations(); }
+  if (page === 'messages') { void refreshConversations(); if (direct.peer) void direct.load(); if (groupChat.groupId) void groupChat.load(); }
 }, 4000);
 if (isTauri()) {
   // Dragging files onto the window provides real local paths, so no extra permission is needed.

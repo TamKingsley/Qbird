@@ -53,6 +53,16 @@ pub fn run() {
             app_state::v1_start_chat_service,
             app_state::v1_stop_probe_service,
             app_state::v1_probe_status,
+            app_state::v1_create_group,
+            app_state::v1_list_groups,
+            app_state::v1_list_group_members,
+            app_state::v1_open_group,
+            app_state::v1_hide_group,
+            app_state::v1_queue_group,
+            app_state::v1_list_group,
+            app_state::v1_add_group_member,
+            app_state::v1_remove_group_member,
+            app_state::v1_leave_group,
             app_state::v1_probe_peer
         ])
         .run(tauri::generate_context!())
