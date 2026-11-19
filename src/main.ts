@@ -34,6 +34,9 @@ let profileNotice = '';
 let avatarUrl: string | null = null;
 let avatarNotice = '';
 let avatarBusy = false;
+type ComposerSettings = { send_shortcut: string; rows: number };
+let composer: ComposerSettings = { send_shortcut: 'enter', rows: 3 };
+let composerNotice = '';
 type Profile = { nickname: string; email: string };
 type Conversation = { id: string; last_body: string; last_logical: number; kind: string };
 type Group = { id: string; name: string; owner: string; member_count: number; hidden: boolean; is_owner: boolean; last_body: string; last_logical: number };
@@ -329,6 +332,43 @@ async function clearAvatar(): Promise<void> {
   finally { avatarBusy = false; if (page === 'profile') render(); }
 }
 
+function sendHint(): string {
+  return composer.send_shortcut === 'ctrl+enter' ? 'Ctrl+Enter 发送 · Enter 换行' : 'Enter 发送 · Shift+Enter 换行';
+}
+
+function isSendKey(event: KeyboardEvent): boolean {
+  if (event.key !== 'Enter' || event.isComposing) return false;
+  if (composer.send_shortcut === 'ctrl+enter') return event.ctrlKey && !event.shiftKey && !event.altKey && !event.metaKey;
+  return !event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey;
+}
+
+/// Applies composer preferences to the current DOM without a full re-render.
+function applyComposerSettings(): void {
+  for (const id of ['direct-input', 'group-input', 'self-input']) {
+    const input = app.querySelector<HTMLTextAreaElement>('#' + id);
+    if (input) input.rows = composer.rows;
+  }
+  for (const hint of app.querySelectorAll<HTMLElement>('.compose-footer > span')) hint.textContent = sendHint();
+}
+
+async function refreshComposer(): Promise<void> {
+  if (!isTauri()) return;
+  try { composer = await invoke<ComposerSettings>('v1_composer_settings'); }
+  catch { composerNotice = '无法读取输入设置'; }
+}
+
+async function saveComposer(): Promise<void> {
+  if (!isTauri()) return;
+  const sendShortcut = app.querySelector<HTMLSelectElement>('#send-shortcut')?.value ?? 'enter';
+  const rows = Number(app.querySelector<HTMLInputElement>('#composer-rows')?.value ?? '3');
+  if (!Number.isInteger(rows) || rows < 2 || rows > 12) { composerNotice = '输入区高度需为 2–12 行'; if (page === 'settings') render(); return; }
+  try {
+    composer = await invoke<ComposerSettings>('v1_set_composer_settings', { sendShortcut, rows });
+    composerNotice = '输入设置已保存。';
+  } catch (error) { composerNotice = displayError(error); }
+  if (page === 'settings') render();
+}
+
 function settingsView(): string {
   const used = storageInfo ? formatBytes(storageInfo.used) : '读取中…';
   const quota = storageInfo ? formatBytes(storageInfo.quota) : '读取中…';
@@ -365,6 +405,17 @@ function settingsView(): string {
       <div class="probe-row"><input id="lock-idle" type="number" min="0" max="240" value="${lockState.idle_minutes}" ${lockBusy ? 'disabled' : ''}><button class="outline" data-action="save-lock-idle" ${lockBusy ? 'disabled' : ''}>保存空闲设置</button></div>
       <p id="lock-notice" role="status">${lockNotice}</p>
       <small>应用锁只隐藏界面，不加密本地 SQLite 数据库；备份密码与应用锁密码相互独立。忘记应用锁密码时目前只能在本机设置中移除后重设；Windows 身份验证重置尚未实现。</small>
+    </div>
+    <div class="probe-box"><h3>输入与快捷键</h3>
+      <label for="send-shortcut">发送方式</label>
+      <select id="send-shortcut">
+        <option value="enter" ${composer.send_shortcut === 'enter' ? 'selected' : ''}>Enter 发送，Shift+Enter 换行</option>
+        <option value="ctrl+enter" ${composer.send_shortcut === 'ctrl+enter' ? 'selected' : ''}>Ctrl+Enter 发送，Enter 换行</option>
+      </select>
+      <label for="composer-rows">输入区高度（行，2–12）</label>
+      <div class="probe-row"><input id="composer-rows" type="number" min="2" max="12" value="${composer.rows}"><button class="outline" data-action="save-composer">保存输入设置</button></div>
+      <p id="composer-notice" role="status">${composerNotice}</p>
+      <small>发送方式对单聊、群聊和自聊一致生效；输入区高度只影响本机界面，不随消息发送。</small>
     </div>
     <p>本机身份指纹（SHA-256）：<br><code class="fingerprint">${fingerprint}</code></p>
     <button data-page="about" class="outline">关于 Qbird</button>
@@ -657,6 +708,7 @@ function render(): void {
       paintSelfMessages('bottom');
     }
   }
+  applyComposerSettings();
 }
 
 function paintDiscovery(): void {
@@ -983,15 +1035,11 @@ app.addEventListener('input', (event) => {
   if (target.id === 'global-search') { searchQuery = target.value; scheduleSearch(); return; }
 });
 app.addEventListener('keydown', (event) => {
-  if (event.target instanceof HTMLTextAreaElement && event.target.id === 'direct-input' && event.key === 'Enter' && !event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey && !event.isComposing) {
-    event.preventDefault(); void direct.send(); return;
-  }
-  if (event.target instanceof HTMLTextAreaElement && event.target.id === 'group-input' && event.key === 'Enter' && !event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey && !event.isComposing) {
-    event.preventDefault(); void groupChat.send(); return;
-  }
-  if (event.target instanceof HTMLTextAreaElement && event.target.id === 'self-input' && event.key === 'Enter' && !event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey && !event.isComposing) {
-    event.preventDefault(); void sendSelf();
-  }
+  const target = event.target;
+  if (!(target instanceof HTMLTextAreaElement) || !isSendKey(event)) return;
+  if (target.id === 'direct-input') { event.preventDefault(); void direct.send(); return; }
+  if (target.id === 'group-input') { event.preventDefault(); void groupChat.send(); return; }
+  if (target.id === 'self-input') { event.preventDefault(); void sendSelf(); }
 });
 app.addEventListener('change', (event) => {
   const target = event.target;
@@ -1031,6 +1079,7 @@ app.addEventListener('click', (event) => {
   if (action?.dataset.action === 'backup-restore-merge') { void restoreBackup(false); return; }
   if (action?.dataset.action === 'backup-restore-overwrite') { void restoreBackup(true); return; }
   if (action?.dataset.action === 'save-profile') { void saveProfile(); return; }
+  if (action?.dataset.action === 'save-composer') { void saveComposer(); return; }
   if (action?.dataset.action === 'choose-avatar') { void chooseAvatar(); return; }
   if (action?.dataset.action === 'clear-avatar') { void clearAvatar(); return; }
   if (action?.dataset.action === 'save-contact-profile' && action.dataset.peer) { void saveContactProfile(action.dataset.peer); return; }
@@ -1086,6 +1135,7 @@ app.addEventListener('click', (event) => {
 render();
 void initLock();
 void refreshAvatar().then(() => { if (!lockState.locked) render(); });
+void refreshComposer().then(() => { if (!lockState.locked) render(); });
 for (const type of ['pointerdown', 'keydown', 'wheel', 'mousemove'] as const) {
   window.addEventListener(type, () => { lastActivity = Date.now(); }, { passive: true });
 }

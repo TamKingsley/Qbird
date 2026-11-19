@@ -377,6 +377,50 @@ pub fn v1_set_profile(state: tauri::State<'_, AppState>, nickname: String, email
     store.get_profile().map_err(|_| "无法读取个人资料".to_owned())
 }
 
+/// Composer preferences shared by direct, group and self chats.
+#[derive(serde::Serialize)]
+pub struct ComposerSettings {
+    /// `enter` or `ctrl+enter`.
+    pub send_shortcut: String,
+    /// Textarea height in rows.
+    pub rows: u32,
+}
+
+pub const MIN_COMPOSER_ROWS: u32 = 2;
+pub const MAX_COMPOSER_ROWS: u32 = 12;
+
+fn read_composer(store: &crate::storage::Store) -> Result<ComposerSettings, String> {
+    let shortcut = store.get_setting("send_shortcut").map_err(|_| "无法读取输入设置".to_owned())?
+        .filter(|value| value == "ctrl+enter").unwrap_or_else(|| "enter".to_owned());
+    let rows = store.get_setting("composer_rows").map_err(|_| "无法读取输入设置".to_owned())?
+        .and_then(|text| text.parse::<u32>().ok())
+        .unwrap_or(3)
+        .clamp(MIN_COMPOSER_ROWS, MAX_COMPOSER_ROWS);
+    Ok(ComposerSettings { send_shortcut: shortcut, rows })
+}
+
+#[tauri::command]
+pub fn v1_composer_settings(state: tauri::State<'_, AppState>) -> Result<ComposerSettings, String> {
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    read_composer(&store)
+}
+
+/// Validates before writing so a bad request never leaves half-applied settings.
+#[tauri::command]
+pub fn v1_set_composer_settings(state: tauri::State<'_, AppState>, send_shortcut: String, rows: u32)
+    -> Result<ComposerSettings, String> {
+    if send_shortcut != "enter" && send_shortcut != "ctrl+enter" {
+        return Err("发送快捷键无效".into());
+    }
+    if !(MIN_COMPOSER_ROWS..=MAX_COMPOSER_ROWS).contains(&rows) {
+        return Err(format!("输入区高度需为 {MIN_COMPOSER_ROWS}–{MAX_COMPOSER_ROWS} 行"));
+    }
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    store.set_setting("send_shortcut", Some(&send_shortcut)).map_err(|_| "无法保存输入设置".to_owned())?;
+    store.set_setting("composer_rows", Some(&rows.to_string())).map_err(|_| "无法保存输入设置".to_owned())?;
+    read_composer(&store)
+}
+
 /// Returns the local avatar as raw PNG bytes, or `null` when none is saved.
 #[tauri::command]
 pub fn v1_avatar(state: tauri::State<'_, AppState>) -> Result<Option<Vec<u8>>, String> {

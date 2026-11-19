@@ -35,6 +35,8 @@ pub fn run() {
             app_state::identity_fingerprint,
             app_state::v1_profile,
             app_state::v1_set_profile,
+            app_state::v1_composer_settings,
+            app_state::v1_set_composer_settings,
             app_state::v1_avatar,
             app_state::v1_set_avatar,
             app_state::v1_clear_avatar,
