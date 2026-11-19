@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::{params, Connection, OptionalExtension, Result};
 use serde::Serialize;
 
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 
 /// Default cap for locally received attachments; the user may change it in settings.
 pub const DEFAULT_STORAGE_QUOTA: u64 = 2 * 1024 * 1024 * 1024;
@@ -143,6 +143,17 @@ pub enum FileOfferDecision {
     NoSpace,
 }
 
+/// Outcome of one inbound group file offer. Trust is already implied by the group
+/// membership checks in `receive_group`, so there is no separate Untrusted case.
+#[derive(Debug)]
+pub enum GroupFileDecision {
+    Ready { offset: u64, target: PathBuf, partial: PathBuf },
+    Complete,
+    Conflict,
+    NoSpace,
+    NotMember,
+}
+
 const MESSAGE_COLUMNS: &str = "m.id, m.peer, m.sender, m.body, m.created_at, m.logical, m.status, m.kind, m.file_name, m.file_size, m.file_sha256, f.status, f.transferred, f.error";
 
 #[derive(Debug, serde::Deserialize)]
@@ -223,6 +234,26 @@ pub struct GroupMessage {
     pub reply_preview: Option<String>,
     /// Members explicitly mentioned with @; only active members are ever stored.
     pub mentions: Vec<String>,
+    /// "text" or "file"; file messages carry the metadata below.
+    pub kind: String,
+    pub file_name: Option<String>,
+    pub file_size: Option<i64>,
+    pub file_sha256: Option<String>,
+    pub file_status: Option<String>,
+    pub file_transferred: Option<i64>,
+    pub file_error: Option<String>,
+}
+
+/// Local transfer state for one group file message.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct GroupFileProgress {
+    pub message_id: String,
+    pub direction: String,
+    pub total: i64,
+    pub transferred: i64,
+    pub status: String,
+    pub error: Option<String>,
+    pub target_path: Option<String>,
 }
 
 /// One member a stored group message still has to be delivered to.
@@ -248,6 +279,12 @@ pub struct GroupDispatch {
     pub reply_sender: Option<String>,
     pub reply_preview: Option<String>,
     pub mentions: Vec<String>,
+    /// "text" or "file"; file dispatches also carry the local source path.
+    pub kind: String,
+    pub file_name: Option<String>,
+    pub file_size: Option<i64>,
+    pub file_sha256: Option<String>,
+    pub source_path: Option<String>,
 }
 
 /// A pending invite, member-list update, removal or leave notice.
@@ -518,6 +555,39 @@ impl Store {
                 }
             }
             transaction.execute_batch("PRAGMA user_version = 9;")?;
+            transaction.commit()?;
+        }
+        if version < 11 {
+            let transaction = connection.transaction()?;
+            // Group file messages reuse the accept / chunk / complete exchange and keep
+            // their own transfer rows so a direct and a group id can never collide.
+            for statement in [
+                "ALTER TABLE group_messages ADD COLUMN kind TEXT NOT NULL DEFAULT 'text' CHECK(kind IN ('text', 'file'))",
+                "ALTER TABLE group_messages ADD COLUMN file_name TEXT",
+                "ALTER TABLE group_messages ADD COLUMN file_size INTEGER",
+                "ALTER TABLE group_messages ADD COLUMN file_sha256 TEXT",
+            ] {
+                if let Err(error) = transaction.execute_batch(statement) {
+                    if !error.to_string().contains("duplicate column name") { return Err(error); }
+                }
+            }
+            transaction.execute_batch(
+                "CREATE TABLE IF NOT EXISTS group_file_transfers (
+                    message_id TEXT PRIMARY KEY NOT NULL,
+                    group_id TEXT NOT NULL CHECK(length(group_id) = 32),
+                    peer TEXT NOT NULL CHECK(length(peer) = 64),
+                    direction TEXT NOT NULL CHECK(direction IN ('incoming', 'outgoing')),
+                    source_path TEXT,
+                    target_path TEXT,
+                    total INTEGER NOT NULL CHECK(total > 0 AND total <= 536870912),
+                    transferred INTEGER NOT NULL DEFAULT 0 CHECK(transferred >= 0 AND transferred <= total),
+                    status TEXT NOT NULL CHECK(status IN ('pending', 'transferring', 'completed', 'failed')),
+                    error TEXT,
+                    updated_at INTEGER NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS group_file_transfers_by_peer ON group_file_transfers(peer, status);
+                 PRAGMA user_version = 11;",
+            )?;
             transaction.commit()?;
         }
         if version < 10 {
@@ -1190,6 +1260,29 @@ impl Store {
     }
 
     /// Local path of a stored attachment, only once it is complete on this device.
+    /// Completed group attachment path, only for active members of that group.
+    pub fn group_attachment_path(&self, group_id: &str, member: &str, id: &str) -> Result<Option<(String, PathBuf)>> {
+        if !valid_group_id(group_id) || !valid_fingerprint(member) || !valid_message_id(id) {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        let active: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM group_members WHERE group_id = ?1 AND member = ?2 AND active = 1)",
+            params![group_id, member], |row| row.get(0),
+        )?;
+        if !active { return Ok(None); }
+        let row: Option<(String, String, String)> = self.connection.query_row(
+            "SELECT m.file_name, COALESCE(f.target_path, f.source_path), f.status
+             FROM group_messages m JOIN group_file_transfers f ON f.message_id = m.id
+             WHERE m.id = ?1 AND m.group_id = ?2", params![id, group_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ).optional()?;
+        let Some((name, path, status)) = row else { return Ok(None); };
+        if status != "completed" { return Ok(None); }
+        let path = PathBuf::from(path);
+        if !path.is_file() { return Ok(None); }
+        Ok(Some((name, path)))
+    }
+
     pub fn attachment_path(&self, id: &str) -> Result<Option<(String, PathBuf)>> {
         if !valid_message_id(id) { return Err(rusqlite::Error::InvalidQuery); }
         let row: Option<(String, String, String)> = self.connection.query_row(
@@ -1597,6 +1690,8 @@ impl Store {
             body: body.into(), created_at, logical, pending,
             reply_to: reply_to.map(str::to_owned), reply_sender, reply_preview,
             mentions: unique_mentions,
+            kind: "text".into(), file_name: None, file_size: None, file_sha256: None,
+            file_status: None, file_transferred: None, file_error: None,
         })
     }
 
@@ -1609,8 +1704,10 @@ impl Store {
         let mut statement = self.connection.prepare(
             "SELECT m.id, m.group_id, m.sender, COALESCE(c.display_name, substr(m.sender, 1, 8)), m.body, m.created_at, m.logical,
                 (SELECT count(*) FROM group_outbox o WHERE o.message_id = m.id AND o.status = 'pending'),
-                m.reply_to, m.reply_sender, m.reply_preview, m.mentions
+                m.reply_to, m.reply_sender, m.reply_preview, m.mentions,
+                m.kind, m.file_name, m.file_size, m.file_sha256, f.status, f.transferred, f.error
              FROM group_messages m LEFT JOIN contacts c ON c.fingerprint = m.sender
+             LEFT JOIN group_file_transfers f ON f.message_id = m.id
              WHERE m.group_id = ?1 AND (?2 IS NULL OR (m.logical, m.sender, m.id) < (?2, ?3, ?4))
              ORDER BY m.logical DESC, m.sender DESC, m.id DESC LIMIT ?5"
         )?;
@@ -1749,19 +1846,26 @@ impl Store {
             || member.is_some_and(|value| !valid_fingerprint(value)) {
             return Err(rusqlite::Error::InvalidQuery);
         }
-        if !matches!(category, "all" | "text") { return Ok(Vec::new()); }
         let pattern = like_pattern(query);
         let mut statement = self.connection.prepare(
             "SELECT m.id, m.group_id, m.sender, COALESCE(c.display_name, substr(m.sender, 1, 8)), m.body, m.created_at, m.logical,
-                0, m.reply_to, m.reply_sender, m.reply_preview, m.mentions
-             FROM group_messages m LEFT JOIN contacts c ON c.fingerprint = m.sender
+                0, m.reply_to, m.reply_sender, m.reply_preview, m.mentions,
+                m.kind, m.file_name, m.file_size, m.file_sha256, f.status, f.transferred, f.error
+             FROM group_messages m
+             LEFT JOIN contacts c ON c.fingerprint = m.sender
+             LEFT JOIN group_file_transfers f ON f.message_id = m.id
              WHERE m.group_id = ?1
-               AND (?2 = '' OR m.body LIKE ?3 ESCAPE '\\')
+               AND ((?7 IN ('all', 'text') AND m.kind = 'text' AND (?2 = '' OR m.body LIKE ?3 ESCAPE '\\'))
+                 OR (?7 IN ('all', 'file') AND m.kind = 'file'
+                     AND (?2 = '' OR m.body LIKE ?3 ESCAPE '\\' OR COALESCE(m.file_name, '') LIKE ?3 ESCAPE '\\'))
+                 OR (?7 = 'image' AND m.kind = 'file'
+                     AND (lower(m.file_name) LIKE '%.png' OR lower(m.file_name) LIKE '%.jpg' OR lower(m.file_name) LIKE '%.jpeg'
+                       OR lower(m.file_name) LIKE '%.gif' OR lower(m.file_name) LIKE '%.webp' OR lower(m.file_name) LIKE '%.bmp')))
                AND (?4 IS NULL OR m.sender = ?4)
              ORDER BY m.logical DESC, m.sender DESC, m.id DESC LIMIT ?5 OFFSET ?6"
         )?;
         let rows = statement.query_map(
-            params![group_id, query, pattern, member, limit, offset], group_message_row)?;
+            params![group_id, query, pattern, member, limit, offset, category], group_message_row)?;
         rows.collect()
     }
 
@@ -1792,25 +1896,84 @@ impl Store {
     /// Snapshot of a group message plus the member list used when sending it.
     pub fn group_dispatch(&self, message_id: &str) -> Result<Option<GroupDispatch>> {
         if message_id.is_empty() || message_id.len() > 128 { return Err(rusqlite::Error::InvalidQuery); }
-        let found: Option<(String, String, String, String, String, i64, i64, Option<String>, Option<String>, Option<String>, String)> = self.connection.query_row(
+        let found: Option<(String, String, String, String, String, i64, i64, Option<String>, Option<String>, Option<String>, String, String, Option<String>, Option<i64>, Option<String>, Option<String>)> = self.connection.query_row(
             "SELECT m.id, m.group_id, g.name, g.owner, m.body, m.created_at, m.logical,
-                m.reply_to, m.reply_sender, m.reply_preview, m.mentions
+                m.reply_to, m.reply_sender, m.reply_preview, m.mentions,
+                m.kind, m.file_name, m.file_size, m.file_sha256,
+                (SELECT source_path FROM group_file_transfers WHERE message_id = m.id)
              FROM group_messages m JOIN groups g ON g.id = m.group_id WHERE m.id = ?1", [message_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?,
-                row.get(7)?, row.get(8)?, row.get(9)?, row.get(10)?)),
+                row.get(7)?, row.get(8)?, row.get(9)?, row.get(10)?, row.get(11)?, row.get(12)?, row.get(13)?, row.get(14)?, row.get(15)?)),
         ).optional()?;
-        let Some((message_id, group_id, group_name, owner, body, created_at, logical, reply_to, reply_sender, reply_preview, mentions)) = found else { return Ok(None); };
+        let Some((message_id, group_id, group_name, owner, body, created_at, logical, reply_to, reply_sender, reply_preview, mentions, kind, file_name, file_size, file_sha256, source_path)) = found else { return Ok(None); };
         let mut statement = self.connection.prepare(
             "SELECT member FROM group_members WHERE group_id = ?1 AND active = 1 ORDER BY member")?;
         let rows = statement.query_map([&group_id], |row| row.get(0))?;
         let members: Vec<String> = rows.collect::<Result<Vec<String>>>()?;
         Ok(Some(GroupDispatch { message_id, group_id, group_name, owner, members, body, created_at, logical,
-            reply_to, reply_sender, reply_preview, mentions: parse_mentions(&mentions) }))
+            reply_to, reply_sender, reply_preview, mentions: parse_mentions(&mentions),
+            kind, file_name, file_size, file_sha256, source_path }))
     }
 
     /// Applies one inbound group text. The member snapshot is only trusted from the owner;
     /// other members may create the group for us but cannot rewrite its member list.
     #[allow(clippy::too_many_arguments)]
+    /// Queues one group file message: the local source is referenced, one outbox row
+    /// is created per active member, and the message body is the cleaned file name.
+    pub fn queue_group_file(&self, sender: &str, group_id: &str, name: &str, size: u64, sha256: &str, source: &Path, created_at: i64) -> Result<GroupMessage> {
+        let clean = crate::files::sanitize_name(name).ok_or(rusqlite::Error::InvalidQuery)?;
+        let source_text = source.to_str().ok_or(rusqlite::Error::InvalidQuery)?;
+        if !valid_fingerprint(sender) || !valid_group_id(group_id)
+            || size == 0 || size > crate::protocol::MAX_FILE_BYTES || !valid_sha256(sha256)
+            || source_text.is_empty() || source_text.len() > 4096 {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        let size_i64 = i64::try_from(size).map_err(|_| rusqlite::Error::InvalidQuery)?;
+        let tx = self.connection.unchecked_transaction()?;
+        let active: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM group_members WHERE group_id = ?1 AND member = ?2 AND active = 1)",
+            params![group_id, sender], |row| row.get(0),
+        )?;
+        if !active { return Err(rusqlite::Error::InvalidQuery); }
+        if tx.execute("UPDATE logical_clock SET value = value + 1 WHERE singleton = 1 AND value < 9223372036854775807", [])? != 1 {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        let (id, logical): (String, i64) = tx.query_row(
+            "SELECT lower(hex(randomblob(16))), value FROM logical_clock WHERE singleton = 1", [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let collision: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM local_messages WHERE id = ?1
+                UNION ALL SELECT 1 FROM direct_messages WHERE id = ?1
+                UNION ALL SELECT 1 FROM group_messages WHERE id = ?1)", [&id], |row| row.get(0),
+        )?;
+        if collision { return Err(rusqlite::Error::InvalidQuery); }
+        tx.execute(
+            "INSERT INTO group_messages(id, group_id, sender, body, created_at, logical, kind, file_name, file_size, file_sha256)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'file', ?4, ?7, ?8)",
+            params![id, group_id, sender, clean, created_at, logical, size_i64, sha256],
+        )?;
+        tx.execute("UPDATE group_members SET hidden = 0 WHERE group_id = ?1 AND member = ?2", params![group_id, sender])?;
+        let pending = tx.execute(
+            "INSERT INTO group_outbox(message_id, group_id, member, status)
+             SELECT ?1, ?2, member, 'pending' FROM group_members WHERE group_id = ?2 AND active = 1 AND member != ?3",
+            params![id, group_id, sender],
+        )?;
+        tx.execute(
+            "INSERT INTO group_file_transfers(message_id, group_id, peer, direction, source_path, target_path, total, transferred, status, updated_at)
+             VALUES (?1, ?2, ?3, 'outgoing', ?4, NULL, ?5, 0, 'pending', ?6)",
+            params![id, group_id, sender, source_text, size_i64, created_at],
+        )?;
+        tx.commit()?;
+        Ok(GroupMessage {
+            id, group_id: group_id.into(), sender: sender.into(), sender_name: String::new(),
+            body: clean.clone(), created_at, logical, pending: i64::try_from(pending).unwrap_or(0),
+            reply_to: None, reply_sender: None, reply_preview: None, mentions: Vec::new(),
+            kind: "file".into(), file_name: Some(clean), file_size: Some(size_i64), file_sha256: Some(sha256.into()),
+            file_status: Some("pending".into()), file_transferred: Some(0), file_error: None,
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn receive_group(&self, self_id: &str, peer: &str, group_id: &str, name: &str, owner: &str,
         members: &[String], id: &str, body: &str, created_at: i64, logical: i64,
@@ -1926,6 +2089,146 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(IncomingResult::Inserted)
+    }
+
+    /// Validates an inbound group file offer through the normal group membership path,
+    /// then either creates the file record or resumes an existing partial transfer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn receive_group_file(&self, self_id: &str, peer: &str, group_id: &str, name: &str, owner: &str,
+        members: &[String], id: &str, file_name: &str, size: u64, sha256: &str, created_at: i64, logical: i64, now: i64)
+        -> Result<GroupFileDecision> {
+        let clean = match crate::files::sanitize_name(file_name) { Some(clean) => clean, None => return Ok(GroupFileDecision::Conflict) };
+        if !valid_fingerprint(self_id) || !valid_fingerprint(peer) || !valid_group_id(group_id)
+            || size == 0 || size > crate::protocol::MAX_FILE_BYTES || !valid_sha256(sha256)
+            || logical <= 0 || logical == i64::MAX {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        let size_i64 = i64::try_from(size).map_err(|_| rusqlite::Error::InvalidQuery)?;
+        let known_group: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM groups WHERE id = ?1)", [group_id], |row| row.get(0),
+        )?;
+        if !known_group && !members.iter().any(|member| member == self_id) { return Ok(GroupFileDecision::NotMember); }
+        let target = crate::files::incoming_target(&self.incoming_dir(), id, &clean);
+        let partial = crate::files::incoming_partial(&self.incoming_dir(), id);
+        // A partial download may already occupy space; count the full offer conservatively.
+        if self.storage_used().saturating_add(size) > self.storage_quota()? { return Ok(GroupFileDecision::NoSpace); }
+        let result = self.receive_group(self_id, peer, group_id, name, owner, members, id, &clean, created_at, logical,
+            None, None, None, &[], now)?;
+        if matches!(result, IncomingResult::NotMember) { return Ok(GroupFileDecision::NotMember); }
+        if matches!(result, IncomingResult::Unverified) { return Ok(GroupFileDecision::Conflict); }
+        if matches!(result, IncomingResult::Inserted) {
+            let tx = self.connection.unchecked_transaction()?;
+            tx.execute(
+                "UPDATE group_messages SET kind = 'file', file_name = ?2, file_size = ?3, file_sha256 = ?4 WHERE id = ?1",
+                params![id, clean, size_i64, sha256])?;
+            tx.execute(
+                "INSERT INTO group_file_transfers(message_id, group_id, peer, direction, source_path, target_path, total, transferred, status, updated_at)
+                 VALUES (?1, ?2, ?3, 'incoming', NULL, ?4, ?5, 0, 'transferring', ?6)",
+                params![id, group_id, peer, target.to_string_lossy(), size_i64, now])?;
+            tx.commit()?;
+            return Ok(GroupFileDecision::Ready { offset: 0, target, partial });
+        }
+        // Duplicate or a matching conflict: only resume when the stored metadata is identical.
+        let stored: Option<(Option<i64>, Option<String>, i64, i64)> = self.connection.query_row(
+            "SELECT file_size, file_sha256, created_at, logical FROM group_messages WHERE id = ?1 AND group_id = ?2",
+            params![id, group_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).optional()?;
+        let same = matches!(stored, Some((Some(old_size), Some(old_hash), old_created, old_logical))
+            if old_size == size_i64 && old_hash == sha256 && old_created == created_at && old_logical == logical);
+        if !same { return Ok(GroupFileDecision::Conflict); }
+        let state: Option<(String, i64)> = self.connection.query_row(
+            "SELECT status, transferred FROM group_file_transfers WHERE message_id = ?1", [id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?;
+        let Some((status, _)) = state else { return Ok(GroupFileDecision::Conflict); };
+        if status == "completed" { return Ok(GroupFileDecision::Complete); }
+        let offset = match std::fs::metadata(&partial) {
+            Ok(metadata) if metadata.is_file() && metadata.len() <= size => metadata.len(),
+            Ok(_) => { crate::files::remove_quietly(&partial); 0 }
+            Err(_) => 0,
+        };
+        self.connection.execute(
+            "UPDATE group_file_transfers SET status = 'transferring', transferred = ?2, target_path = ?3, error = NULL, updated_at = ?4
+             WHERE message_id = ?1",
+            params![id, offset as i64, target.to_string_lossy(), now],
+        )?;
+        Ok(GroupFileDecision::Ready { offset, target, partial })
+    }
+
+    /// A shared failure keeps partial bytes so the next offer can resume.
+    pub fn fail_group_file_transfer(&self, id: &str, error: &str, now: i64) -> Result<()> {
+        if !valid_message_id(id) || error.is_empty() || error.len() > 200 { return Err(rusqlite::Error::InvalidQuery); }
+        self.connection.execute(
+            "UPDATE group_file_transfers SET status = 'failed', error = ?2, updated_at = ?3 WHERE message_id = ?1",
+            params![id, error, now],
+        )?;
+        Ok(())
+    }
+
+    /// Transport hiccups pause the transfer without marking the message failed.
+    pub fn pause_group_file_transfer(&self, id: &str, error: &str, now: i64) -> Result<()> {
+        if !valid_message_id(id) || error.is_empty() || error.len() > 200 { return Err(rusqlite::Error::InvalidQuery); }
+        self.connection.execute(
+            "UPDATE group_file_transfers SET status = 'pending', error = ?2, updated_at = ?3 WHERE message_id = ?1 AND status IN ('pending', 'transferring')",
+            params![id, error, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_group_file_progress(&self, id: &str, transferred: u64, now: i64) -> Result<()> {
+        if !valid_message_id(id) { return Err(rusqlite::Error::InvalidQuery); }
+        let transferred = i64::try_from(transferred).map_err(|_| rusqlite::Error::InvalidQuery)?;
+        self.connection.execute(
+            "UPDATE group_file_transfers SET transferred = max(0, min(?2, total)), status = 'transferring', updated_at = ?3
+             WHERE message_id = ?1 AND status IN ('pending', 'transferring')",
+            params![id, transferred, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn complete_group_file_transfer(&self, id: &str, now: i64) -> Result<bool> {
+        if !valid_message_id(id) { return Err(rusqlite::Error::InvalidQuery); }
+        Ok(self.connection.execute(
+            "UPDATE group_file_transfers SET status = 'completed', transferred = total, error = NULL, updated_at = ?2 WHERE message_id = ?1",
+            params![id, now],
+        )? == 1)
+    }
+
+    /// Local source path for an outgoing group file; never exposed to the UI.
+    pub fn group_file_source(&self, id: &str) -> Result<Option<String>> {
+        if !valid_message_id(id) { return Err(rusqlite::Error::InvalidQuery); }
+        self.connection.query_row(
+            "SELECT source_path FROM group_file_transfers WHERE message_id = ?1", [id],
+            |row| row.get(0),
+        ).optional()
+    }
+
+    pub fn group_file_transfer(&self, id: &str) -> Result<Option<GroupFileProgress>> {
+        if !valid_message_id(id) { return Err(rusqlite::Error::InvalidQuery); }
+        self.connection.query_row(
+            "SELECT message_id, direction, total, transferred, status, error, target_path
+             FROM group_file_transfers WHERE message_id = ?1", [id],
+            |row| Ok(GroupFileProgress {
+                message_id: row.get(0)?, direction: row.get(1)?, total: row.get(2)?, transferred: row.get(3)?,
+                status: row.get(4)?, error: row.get(5)?, target_path: row.get(6)?,
+            }),
+        ).optional()
+    }
+
+    /// Local progress for one outgoing/incoming group file, used by the UI.
+    pub fn group_file_progress(&self, group_id: &str, self_id: &str) -> Result<Vec<GroupFileProgress>> {
+        if !valid_group_id(group_id) || !valid_fingerprint(self_id) { return Err(rusqlite::Error::InvalidQuery); }
+        let mut statement = self.connection.prepare(
+            "SELECT f.message_id, f.direction, f.total, f.transferred, f.status, f.error, f.target_path
+             FROM group_file_transfers f
+             JOIN group_messages m ON m.id = f.message_id AND m.group_id = ?1
+             JOIN group_members gm ON gm.group_id = ?1 AND gm.member = ?2 AND gm.active = 1
+             ORDER BY f.updated_at DESC LIMIT 200")?;
+        let rows = statement.query_map(params![group_id, self_id], |row| Ok(GroupFileProgress {
+            message_id: row.get(0)?, direction: row.get(1)?, total: row.get(2)?, transferred: row.get(3)?,
+            status: row.get(4)?, error: row.get(5)?, target_path: row.get(6)?,
+        }))?;
+        rows.collect()
     }
 
     pub fn next_pending_control(&self, after: Option<&str>) -> Result<Option<GroupControlTask>> {
@@ -2166,6 +2469,8 @@ fn group_message_row(row: &rusqlite::Row<'_>) -> Result<GroupMessage> {
         body: row.get(4)?, created_at: row.get(5)?, logical: row.get(6)?, pending: row.get(7)?,
         reply_to: row.get(8)?, reply_sender: row.get(9)?, reply_preview: row.get(10)?,
         mentions: parse_mentions(&row.get::<_, String>(11)?),
+        kind: row.get(12)?, file_name: row.get(13)?, file_size: row.get(14)?, file_sha256: row.get(15)?,
+        file_status: row.get(16)?, file_transferred: row.get(17)?, file_error: row.get(18)?,
     })
 }
 
@@ -2608,6 +2913,44 @@ mod tests {
         let store = Store::open(&path).unwrap();
         assert!(store.is_verified(&peer).unwrap());
         assert_eq!(store.list_messages(&peer, 20, 0).unwrap()[0].body, "persistent");
+    }
+
+    #[test]
+    fn group_file_offer_receives_resumes_and_completes() {
+        let sender = memory_store();
+        let receiver = memory_store();
+        let a = "a".repeat(64);
+        let b = "b".repeat(64);
+        sender.add_candidate(&b, "B").unwrap();
+        sender.confirm_candidate(&b).unwrap();
+        let group = sender.create_group(&a, "team", &[b.clone()], 1).unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "qbird-group-file-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("note.txt");
+        std::fs::write(&source, b"hello").unwrap();
+        let sha = crate::files::sha256_file(&source).unwrap();
+        let message = sender.queue_group_file(&a, &group.id, "note.txt", 5, &sha, &source, 2).unwrap();
+        assert_eq!(message.kind, "file");
+        assert_eq!(message.pending, 1);
+
+        receiver.add_candidate(&a, "A").unwrap();
+        receiver.confirm_candidate(&a).unwrap();
+        let members = vec![a.clone(), b.clone()];
+        let first = receiver.receive_group_file(&b, &a, &group.id, "team", &a, &members, &message.id, "note.txt", 5, &sha, 2, message.logical, 3).unwrap();
+        let partial = match first {
+            GroupFileDecision::Ready { offset: 0, partial, .. } => partial,
+            other => panic!("expected a fresh transfer, got {other:?}"),
+        };
+        std::fs::create_dir_all(partial.parent().unwrap()).unwrap();
+        std::fs::write(&partial, b"hel").unwrap();
+        let resumed = receiver.receive_group_file(&b, &a, &group.id, "team", &a, &members, &message.id, "note.txt", 5, &sha, 2, message.logical, 4).unwrap();
+        assert!(matches!(resumed, GroupFileDecision::Ready { offset: 3, .. }));
+        receiver.complete_group_file_transfer(&message.id, 5).unwrap();
+        let done = receiver.receive_group_file(&b, &a, &group.id, "team", &a, &members, &message.id, "note.txt", 5, &sha, 2, message.logical, 6).unwrap();
+        assert!(matches!(done, GroupFileDecision::Complete));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

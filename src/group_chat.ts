@@ -1,10 +1,13 @@
 import { invoke, isTauri } from '@tauri-apps/api/core';
+import { open } from '@tauri-apps/plugin-dialog';
 
 type GroupMessage = {
   id: string; group_id: string; sender: string; sender_name: string; body: string;
   created_at: number; logical: number; pending: number;
   reply_to: string | null; reply_sender: string | null; reply_preview: string | null;
   mentions: string[];
+  kind: string; file_name: string | null; file_size: number | null; file_sha256: string | null;
+  file_status: string | null; file_transferred: number | null; file_error: string | null;
 };
 type GroupMember = { group_id: string; member: string; display_name: string; role: string; joined_at: number; active: boolean };
 type Contact = { fingerprint: string; display_name: string; trust_state: string };
@@ -43,6 +46,9 @@ export class GroupChat {
   private searchResults: GroupMessage[] = [];
   private searchBusy = false;
   private searchStatus = '';
+  private thumbs = new Map<string, string>();
+  private thumbPending = new Set<string>();
+  private attaching = false;
 
   constructor(private root: HTMLElement, private onChange: () => void) {}
 
@@ -66,7 +72,8 @@ export class GroupChat {
         <label for="group-input">消息</label>
         <textarea id="group-input" rows="3" maxlength="32768" placeholder="发消息给群里的人…输入 @ 可选择成员"></textarea>
         <div class="mention-picker" id="mention-picker" hidden></div>
-        <div class="compose-footer"><span>Enter 发送 · Shift+Enter 换行</span><button data-action="group-send">发送</button></div>
+        <div class="compose-footer"><span>Enter 发送 · Shift+Enter 换行</span><div class="compose-actions"><button class="outline" data-action="group-image">发送图片</button><button class="outline" data-action="group-file">发送文件</button><button data-action="group-send">发送</button></div></div>
+        <p id="group-file-status" role="status"></p>
         <p id="group-error" role="status"></p>
       </div>
     </section>`;
@@ -74,6 +81,7 @@ export class GroupChat {
 
   clear(): void {
     this.groupId = ''; this.generation++; this.membersOpen = false; this.quoted = null;
+    this.thumbs.clear(); this.thumbPending.clear();
     this.mentionQuery = null; this.mentioned.clear(); this.closeSearch();
   }
 
@@ -120,7 +128,10 @@ export class GroupChat {
       const merged = new Map(this.messages.map(message => [message.id, message]));
       for (const message of [...batch, ...historical]) merged.set(message.id, message);
       const next = [...merged.values()].sort(compare);
-      const changed = next.length !== this.messages.length || next.some((item, i) => item.id !== this.messages[i]?.id || item.pending !== this.messages[i]?.pending);
+      const changed = next.length !== this.messages.length || next.some((item, i) => item.id !== this.messages[i]?.id
+        || item.pending !== this.messages[i]?.pending
+        || item.file_status !== this.messages[i]?.file_status
+        || item.file_transferred !== this.messages[i]?.file_transferred);
       this.messages = next;
       if (older || initial) this.hasOlder = batch.length === 200;
       if (changed || older || initial) this.paint(initial ? 'bottom' : older ? 'preserve' : 'auto');
@@ -144,6 +155,78 @@ export class GroupChat {
       this.paintSubtitle();
       this.paintSearchMembers();
     } catch { this.status('#group-error', '无法读取群成员'); }
+  }
+
+  notify(text: string): void { this.status('#group-error', text); }
+
+  async pick(kind: 'image' | 'file'): Promise<void> {
+    if (!isTauri() || !this.groupId || this.attaching) return;
+    this.attaching = true;
+    try {
+      const selected = await open({
+        multiple: false, directory: false,
+        title: kind === 'image' ? '选择图片' : '选择文件',
+        filters: kind === 'image' ? [{ name: '图片', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp'] }] : undefined,
+      });
+      if (!selected || typeof selected !== 'string') return;
+      await this.queuePaths([selected]);
+    } catch (error) { this.status('#group-error', typeof error === 'string' ? error : '无法打开文件选择器'); }
+    finally { this.attaching = false; }
+  }
+
+  async queuePaths(paths: string[]): Promise<void> {
+    for (const path of paths) await this.queuePath(path);
+  }
+
+  async queuePath(path: string): Promise<void> {
+    if (!this.groupId || this.attaching) return;
+    const groupId = this.groupId, generation = this.generation;
+    this.attaching = true;
+    this.status('#group-file-status', '正在计算校验值…');
+    try {
+      const message = await invoke<GroupMessage>('v1_queue_group_file', { groupId, path });
+      if (generation === this.generation) {
+        if (!this.messages.some(item => item.id === message.id)) { this.messages.push(message); this.messages.sort(compare); }
+        this.paint('bottom');
+        this.status('#group-file-status', `已加入待发送：${message.file_name ?? message.body}（对方在线后自动传输）`);
+        this.dispatchChanged();
+      }
+    } catch (error) {
+      if (generation === this.generation) this.status('#group-file-status', typeof error === 'string' ? error : '无法加入群文件');
+    } finally { this.attaching = false; }
+  }
+
+  private formatSize(bytes: number): string {
+    if (bytes >= 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
+    if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+    if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${bytes} B`;
+  }
+
+  private fileStatusText(message: GroupMessage): string {
+    const total = message.file_size ?? 0;
+    const done = message.file_transferred ?? 0;
+    if (message.file_status === 'completed') return '已完成';
+    if (message.file_status === 'failed') return message.file_error ?? '传输失败';
+    if (message.file_status === 'transferring') {
+      const percent = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
+      return `传输中 ${percent}%`;
+    }
+    return '等待传输';
+  }
+
+  private isImageMessage(message: GroupMessage): boolean {
+    return message.kind === 'file' && /\.(png|jpe?g|gif|webp|bmp)$/i.test(message.file_name ?? '');
+  }
+
+  private async loadThumbnail(id: string): Promise<void> {
+    if (this.thumbs.has(id) || this.thumbPending.has(id)) return;
+    this.thumbPending.add(id);
+    try {
+      const preview = await invoke<{ name: string; data_url: string } | null>('v1_read_group_attachment', { groupId: this.groupId, messageId: id });
+      if (preview) { this.thumbs.set(id, preview.data_url); this.paint('preserve'); }
+    } catch { /* 预览失败时保留文件卡片 */ }
+    finally { this.thumbPending.delete(id); }
   }
 
   async send(): Promise<void> {
@@ -280,10 +363,16 @@ export class GroupChat {
     } finally { this.searchBusy = false; if (generation === this.generation) this.paintSearch(); }
   }
 
-  /// Quote an existing message; the original stays clickable in the bubble.
-  quote(messageId: string): void {
+  /// Quote an existing message; file quotes stay behind the experimental switch.
+  async quote(messageId: string): Promise<void> {
     const message = this.messages.find(item => item.id === messageId);
     if (!message) return;
+    if (message.kind === 'file') {
+      try {
+        const settings = await invoke<{ group_file_quote: boolean }>('v1_experiment_settings');
+        if (!settings.group_file_quote) { this.status('#group-error', '群文件引用实验功能未开启（设置 → 实验功能）'); return; }
+      } catch { this.status('#group-error', '无法读取实验设置'); return; }
+    }
     this.quoted = { id: message.id, name: message.sender_name, preview: previewOf(message.body) };
     this.paintReplyBar();
     const input = this.root.querySelector<HTMLTextAreaElement>('#group-input');
@@ -490,8 +579,30 @@ export class GroupChat {
         quote.textContent = `${message.reply_sender ?? '原消息'}：${message.reply_preview}`;
         bubble.append(quote);
       }
-      const body = document.createElement('div'); body.className = 'message-text'; body.textContent = message.body;
-      bubble.append(body);
+      if (message.kind === 'file') {
+        const card = document.createElement('div'); card.className = 'file-card';
+        if (this.isImageMessage(message) && this.thumbs.has(message.id)) {
+          const image = document.createElement('img'); image.className = 'file-thumb'; image.src = this.thumbs.get(message.id) ?? '';
+          image.alt = message.file_name ?? '图片'; card.append(image);
+          this.loadThumbnail(message.id);
+        } else if (this.isImageMessage(message) && message.file_status === 'completed') {
+          this.loadThumbnail(message.id);
+        }
+        const name = document.createElement('div'); name.className = 'file-name'; name.textContent = message.file_name ?? message.body;
+        const meta = document.createElement('small'); meta.className = 'file-meta';
+        meta.textContent = `${this.formatSize(message.file_size ?? 0)} · ${this.fileStatusText(message)}`;
+        card.append(name, meta);
+        if (message.file_status === 'completed') {
+          const reveal = document.createElement('button');
+          reveal.className = 'linkish'; reveal.textContent = '打开所在目录';
+          reveal.dataset.action = 'group-reveal-file'; reveal.dataset.id = message.id;
+          card.append(reveal);
+        }
+        bubble.append(card);
+      } else {
+        const body = document.createElement('div'); body.className = 'message-text'; body.textContent = message.body;
+        bubble.append(body);
+      }
       if (incoming && message.mentions.includes(this.self)) {
         const badge = document.createElement('small'); badge.className = 'mention-badge'; badge.textContent = '@我';
         bubble.append(badge);

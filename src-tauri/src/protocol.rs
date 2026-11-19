@@ -31,6 +31,12 @@ pub enum Payload {
         #[serde(default)] reply_preview: Option<String>,
         #[serde(default)] mentions: Vec<String>,
     },
+    /// A group file message. Bytes follow the same accept / raw chunk / complete
+    /// exchange as a direct file offer; the receiver only trusts the roster from the owner.
+    GroupFileOffer {
+        id: String, group_id: String, name: String, owner: String, members: Vec<String>,
+        file_name: String, size: u64, sha256: String, created_at: i64, logical: i64,
+    },
     /// Owner handover, signed by the current owner like a roster update.
     GroupTransfer { id: String, group_id: String, name: String, owner: String, members: Vec<String> },
     /// The owner dissolved the group; members keep local history but leave the roster.
@@ -102,6 +108,10 @@ fn validate(payload: &Payload) -> io::Result<()> {
                 && (reply_to.is_some() == reply_preview.is_some())
                 && mentions.len() <= MAX_GROUP_MEMBERS
                 && mentions.iter().all(|member| members.contains(member)) => Ok(()),
+        Payload::GroupFileOffer { id, group_id, name, owner, members, file_name, size, sha256, logical, .. }
+            if valid_id(id) && valid_group_id(group_id) && !name.is_empty() && name.len() <= 128
+                && valid_members(owner, members) && valid_file_name(file_name)
+                && *size > 0 && *size <= MAX_FILE_BYTES && valid_sha256(sha256) && *logical > 0 => Ok(()),
         Payload::GroupTransfer { id, group_id, name, owner, members }
             if valid_id(id) && valid_group_id(group_id) && !name.is_empty() && name.len() <= 128
                 && valid_members(owner, members) => Ok(()),
@@ -230,6 +240,24 @@ mod tests {
         assert!(gate.inbound(&Payload::Ready {}).is_err());
         assert!(gate.outbound(&text).is_ok());
         assert!(gate.inbound(&Payload::Ack { id: "m1".into() }).is_ok());
+    }
+
+    #[test]
+    fn group_file_offer_roundtrips_and_validates() {
+        let offer = Payload::GroupFileOffer {
+            id: "m1".into(), group_id: "a".repeat(32), name: "team".into(),
+            owner: "b".repeat(64), members: vec!["b".repeat(64)],
+            file_name: "a.txt".into(), size: 5, sha256: "c".repeat(64), created_at: 1, logical: 1,
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &offer).unwrap();
+        assert_eq!(read_frame(Cursor::new(&bytes)).unwrap(), offer);
+        let mut bad = offer.clone();
+        if let Payload::GroupFileOffer { size, .. } = &mut bad { *size = 0; }
+        assert!(write_frame(Vec::new(), &bad).is_err());
+        let mut bad_name = offer.clone();
+        if let Payload::GroupFileOffer { file_name, .. } = &mut bad_name { *file_name = "../x".into(); }
+        assert!(write_frame(Vec::new(), &bad_name).is_err());
     }
 
     #[test]

@@ -46,6 +46,9 @@ let avatarUrl: string | null = null;
 let avatarNotice = '';
 let avatarBusy = false;
 type ComposerSettings = { send_shortcut: string; rows: number };
+type ExperimentSettings = { group_file_quote: boolean };
+let experiments: ExperimentSettings = { group_file_quote: false };
+let experimentNotice = '';
 let composer: ComposerSettings = { send_shortcut: 'enter', rows: 3 };
 let composerNotice = '';
 const COMMON_EMOJIS = ['😀', '😁', '😂', '🤣', '😊', '😍', '😘', '😜', '🤔', '😅', '😭', '😡', '👍', '👎', '👏', '🙏', '💪', '🎉', '❤️', '💔', '🔥', '✨', '⭐', '🌹', '🍀', '☕', '🍰', '🐱', '🐶', '🌙', '☀️', '💡', '✅', '❌', '⚠️', '📌', '📎', '🚀', '🎯', '💬', '🙌', '🤝', '😴', '😎', '🥳', '🤩', '😢', '😤'];
@@ -652,9 +655,28 @@ function workspaceSettingsHtml(): string {
 
 function experimentalSettingsHtml(): string {
   return `<div class="probe-box"><h3>实验功能</h3>
-      <p>当前版本没有开放的实验功能。</p>
-      <small>群文件内容引用、插件接口等仍在规划中，未实现前不会显示为可操作开关。</small>
+      <p><label><input id="experiment-group-file-quote" type="checkbox" ${experiments.group_file_quote ? 'checked' : ''}> 允许引用群文件消息（实验）</label></p>
+      <p>开启后，群聊里可以引用文件消息并在气泡中显示文件名；关闭时文件消息不能引用。默认关闭，不影响普通成员 @。</p>
+      <div class="probe-row"><button class="outline" data-action="save-experiment">保存实验设置</button></div>
+      <p id="experiment-notice" role="status">${experimentNotice}</p>
+      <small>插件接口与 Agent 能力仍未实现，不会显示为可操作开关。</small>
     </div>`;
+}
+
+async function refreshExperiments(): Promise<void> {
+  if (!isTauri()) return;
+  try { experiments = await invoke<ExperimentSettings>('v1_experiment_settings'); }
+  catch { experimentNotice = '无法读取实验设置'; }
+}
+
+async function saveExperiments(): Promise<void> {
+  if (!isTauri()) return;
+  const enabled = app.querySelector<HTMLInputElement>('#experiment-group-file-quote')?.checked ?? false;
+  try {
+    experiments = await invoke<ExperimentSettings>('v1_set_experiment_settings', { groupFileQuote: enabled });
+    experimentNotice = enabled ? '群文件引用已开启。' : '群文件引用已关闭。';
+  } catch (error) { experimentNotice = displayError(error); }
+  if (page === 'settings') render();
 }
 
 
@@ -1360,6 +1382,14 @@ app.addEventListener('click', (event) => {
   if (action?.dataset.action === 'save-contact-profile' && action.dataset.peer) { void saveContactProfile(action.dataset.peer); return; }
   if (action?.dataset.action === 'save-direct-address') { void direct.saveAddress(); return; }
   if (action?.dataset.action === 'group-send') { void groupChat.send(); return; }
+  if (action?.dataset.action === 'group-image') { void groupChat.pick('image'); return; }
+  if (action?.dataset.action === 'group-file') { void groupChat.pick('file'); return; }
+  if (action?.dataset.action === 'group-reveal-file' && action.dataset.id) {
+    void invoke('v1_reveal_group_attachment', { groupId: groupChat.groupId, messageId: action.dataset.id })
+      .catch((error) => { groupChat.notify(displayError(error)); });
+    return;
+  }
+  if (action?.dataset.action === 'save-experiment') { void saveExperiments(); return; }
   if (action?.dataset.action === 'group-older') { void groupChat.load(true); return; }
   if (action?.dataset.action === 'hide-group') { void groupChat.hide(); return; }
   if (action?.dataset.action === 'leave-group') { void groupChat.leave(); return; }
@@ -1391,7 +1421,7 @@ app.addEventListener('click', (event) => {
   if (action?.dataset.action === 'toggle-group-search') { groupChat.toggleSearch(); return; }
   if (action?.dataset.action === 'group-search-close') { groupChat.closeSearch(); return; }
   if (action?.dataset.action === 'group-search-run') { void groupChat.runSearch(); return; }
-  if (action?.dataset.action === 'group-reply' && action.dataset.id) { groupChat.quote(action.dataset.id); return; }
+  if (action?.dataset.action === 'group-reply' && action.dataset.id) { void groupChat.quote(action.dataset.id); return; }
   if (action?.dataset.action === 'group-cancel-reply') { groupChat.cancelQuote(); return; }
   if (action?.dataset.action === 'group-jump' && action.dataset.id) { void groupChat.jumpTo(action.dataset.id); return; }
   if (action?.dataset.action === 'group-mention' && action.dataset.member) { groupChat.selectMention(action.dataset.member); return; }
@@ -1422,6 +1452,7 @@ void refreshAvatar().then(() => { if (!lockState.locked) render(); });
 void refreshComposer().then(() => { if (!lockState.locked) render(); });
 void refreshNetwork().then(() => { if (!lockState.locked) render(); });
 void refreshScanState().then(() => { if (!lockState.locked) render(); });
+void refreshExperiments().then(() => { if (!lockState.locked) render(); });
 for (const type of ['pointerdown', 'keydown', 'wheel', 'mousemove'] as const) {
   window.addEventListener(type, () => { lastActivity = Date.now(); }, { passive: true });
 }
@@ -1434,9 +1465,11 @@ window.setInterval(() => {
 if (isTauri()) {
   // Dragging files onto the window provides real local paths, so no extra permission is needed.
   void getCurrentWebview().onDragDropEvent((event) => {
-    if (event.payload.type !== 'drop' || !direct.peer) return;
+    if (event.payload.type !== 'drop') return;
     const paths = event.payload.paths.filter(path => path.length <= 4096);
-    if (paths.length) void direct.queuePaths(paths);
+    if (!paths.length) return;
+    if (direct.peer) void direct.queuePaths(paths);
+    else if (groupChat.groupId) void groupChat.queuePaths(paths);
   }).catch(() => undefined);
   invoke<string>('identity_fingerprint').then((value) => {
     fingerprint = /^[0-9a-f]{64}$/.test(value) ? value : '无法读取';

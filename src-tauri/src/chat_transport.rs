@@ -1,7 +1,7 @@
 //! Direct-message and file transport primitives. Content is never sent outside TLS.
 use std::{fs::{self, File, OpenOptions}, io::{self, Read, Seek, SeekFrom, Write}, net::{SocketAddr, TcpStream}, path::PathBuf, sync::{Arc, Mutex}, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
 use rustls::{ClientConnection, ServerConnection, StreamOwned, pki_types::ServerName};
-use crate::{certificate, files, identity::Identity, protocol::{self, Payload, ReadyGate}, storage::{DirectMessage, FileOfferDecision, IncomingResult, Store}, tls};
+use crate::{certificate, files, identity::Identity, protocol::{self, Payload, ReadyGate}, storage::{DirectMessage, FileOfferDecision, GroupFileDecision, GroupDispatch, IncomingResult, Store}, tls};
 
 pub const CHAT_PREFACE: &[u8] = b"QBIRD-CHAT/1\n";
 const SESSION_TIMEOUT: Duration = Duration::from_secs(15);
@@ -136,6 +136,11 @@ pub fn accept_one(identity: &Identity, store: &Mutex<Store>, socket: TcpStream) 
                     return Err(invalid("group message rejected").into());
                 }
                 acknowledge(&mut stream, &mut gate, &id)?;
+            }
+            Payload::GroupFileOffer { id, group_id, name, owner, members, file_name, size, sha256, created_at, logical } => {
+                receive_group_file(&mut stream, &mut gate, store, &self_id, &peer, GroupFilePayload {
+                    id, group_id, name, owner, members, file_name, size, sha256, created_at, logical,
+                })?;
             }
             Payload::GroupUpdate { id, group_id, name, owner, members } => {
                 let payload = serde_json::json!({ "name": name, "owner": owner, "members": members }).to_string();
@@ -285,6 +290,182 @@ fn receive_file(stream: &mut StreamOwned<ServerConnection, DeadlineStream>, gate
     Ok(())
 }
 
+struct GroupFilePayload {
+    id: String,
+    group_id: String,
+    name: String,
+    owner: String,
+    members: Vec<String>,
+    file_name: String,
+    size: u64,
+    sha256: String,
+    created_at: i64,
+    logical: i64,
+}
+
+/// Mirrors `receive_file` but records progress in the group transfer table and
+/// validates membership through `receive_group_file`.
+fn receive_group_file(stream: &mut StreamOwned<ServerConnection, DeadlineStream>, gate: &mut ReadyGate,
+    store: &Mutex<Store>, self_id: &str, peer: &str, offer: GroupFilePayload) -> ChatResult<()> {
+    let GroupFilePayload { id, group_id, name, owner, members, file_name, size, sha256, created_at, logical } = offer;
+    let decision = store.lock().map_err(|_| invalid("store unavailable"))?
+        .receive_group_file(self_id, peer, &group_id, &name, &owner, &members, &id, &file_name, size, &sha256, created_at, logical, unix_now())?;
+    let (offset, target, partial) = match decision {
+        GroupFileDecision::NotMember => { let _ = reject(stream, gate, &id, "untrusted"); return Err(invalid("not a group member").into()); }
+        GroupFileDecision::Conflict => { let _ = reject(stream, gate, &id, "conflict"); return Err(invalid("group file conflict").into()); }
+        GroupFileDecision::NoSpace => { let _ = reject(stream, gate, &id, "no_space"); return Err(invalid("storage quota reached").into()); }
+        GroupFileDecision::Complete => {
+            let clean = files::sanitize_name(&file_name).ok_or_else(|| invalid("invalid name"))?;
+            let dir = store.lock().map_err(|_| invalid("store unavailable"))?.attachments_dir();
+            (size, files::incoming_target(&dir.join("in"), &id, &clean), files::incoming_partial(&dir.join("in"), &id))
+        }
+        GroupFileDecision::Ready { offset, target, partial } => (offset, target, partial),
+    };
+    let accept = Payload::FileAccept { id: id.clone(), offset };
+    gate.outbound(&accept)?;
+    protocol::write_frame(&mut *stream, &accept)?;
+
+    let mut buffer = vec![0u8; CHUNK_SIZE];
+    let mut file = if offset == size && target.is_file() {
+        None
+    } else {
+        if let Some(parent) = partial.parent() { fs::create_dir_all(parent)?; }
+        let handle = if offset == 0 {
+            File::create(&partial)?
+        } else {
+            let existing = fs::metadata(&partial).map(|m| m.len()).unwrap_or(0);
+            if existing != offset {
+                let _ = store.lock().map_err(|_| invalid("store unavailable"))?.fail_group_file_transfer(&id, "断点不一致", unix_now());
+                return Err(invalid("partial file mismatch").into());
+            }
+            OpenOptions::new().append(true).open(&partial)?
+        };
+        Some(handle)
+    };
+    let mut received = offset;
+    let mut reported = offset;
+    loop {
+        stream.sock.touch_chunk();
+        let read = read_chunk(&mut *stream, &mut buffer)?;
+        if read == 0 { break; }
+        if let Some(handle) = file.as_mut() { handle.write_all(&buffer[..read])?; }
+        received += read as u64;
+        if received > size {
+            let _ = store.lock().map_err(|_| invalid("store unavailable"))?.fail_group_file_transfer(&id, "文件大小超出声明", unix_now());
+            return Err(invalid("file larger than offered").into());
+        }
+        if received - reported >= PROGRESS_STEP {
+            reported = received;
+            if let Ok(store) = store.lock() { let _ = store.update_group_file_progress(&id, received, unix_now()); }
+        }
+    }
+    if received != size {
+        let _ = store.lock().map_err(|_| invalid("store unavailable"))?.pause_group_file_transfer(&id, "连接中断，等待续传", unix_now());
+        return Err(invalid("incomplete file").into());
+    }
+    if let Some(handle) = file.as_ref() { handle.sync_all()?; }
+    let verified = if received == offset && offset == size { files::sha256_file(&target) } else { files::sha256_file(&partial) };
+    match verified {
+        Ok(hash) if hash == sha256 => {}
+        _ => {
+            files::remove_quietly(&partial);
+            let _ = store.lock().map_err(|_| invalid("store unavailable"))?.fail_group_file_transfer(&id, "完整性校验失败", unix_now());
+            return Err(invalid("file checksum mismatch").into());
+        }
+    }
+    if file.is_some() {
+        if target.exists() { files::remove_quietly(&target); }
+        fs::rename(&partial, &target)?;
+    }
+    {
+        let store = store.lock().map_err(|_| invalid("store unavailable"))?;
+        store.complete_group_file_transfer(&id, unix_now())?;
+    }
+    let complete = Payload::FileComplete { id };
+    gate.outbound(&complete)?;
+    protocol::write_frame(&mut *stream, &complete)?;
+    Ok(())
+}
+
+/// Sends one queued group file to a single member with the same chunk rules as a direct file.
+fn send_group_file(identity: &Identity, store: &Mutex<Store>, member: &str, address: SocketAddr, dispatch: &GroupDispatch) -> ChatResult<()> {
+    let message_id = dispatch.message_id.clone();
+    let transfer = store.lock().map_err(|_| invalid("store unavailable"))?.group_file_transfer(&message_id)?
+        .ok_or_else(|| invalid("group file record missing"))?;
+    let source = store.lock().map_err(|_| invalid("store unavailable"))?.group_file_source(&message_id)?
+        .ok_or_else(|| invalid("group file source missing"))?;
+    let source_path = PathBuf::from(&source);
+    let sha256 = dispatch.file_sha256.clone().ok_or_else(|| invalid("file hash missing"))?;
+    let size = u64::try_from(transfer.total).map_err(|_| invalid("invalid file size"))?;
+    match files::file_size(&source_path) {
+        Ok(actual) if actual == size => {}
+        _ => {
+            if let Ok(store) = store.lock() { let _ = store.fail_group_file_transfer(&message_id, "文件已移动或大小已变化", unix_now()); }
+            return Err(invalid("source file changed").into());
+        }
+    }
+    let attempt = (|| -> ChatResult<()> {
+        let (mut stream, mut gate) = connect(identity, member, address)?;
+        let offer = Payload::GroupFileOffer {
+            id: message_id.clone(), group_id: dispatch.group_id.clone(), name: dispatch.group_name.clone(),
+            owner: dispatch.owner.clone(), members: dispatch.members.clone(),
+            file_name: dispatch.file_name.clone().unwrap_or_else(|| "file".into()),
+            size, sha256: sha256.clone(), created_at: dispatch.created_at, logical: dispatch.logical,
+        };
+        gate.outbound(&offer)?;
+        protocol::write_frame(&mut stream, &offer)?;
+        let reply = protocol::read_frame(&mut stream)?;
+        gate.inbound(&reply)?;
+        let offset = match reply {
+            Payload::FileReject { id, reason } if id == message_id => {
+                let text = reject_reason_text(&reason);
+                if let Ok(store) = store.lock() { let _ = store.fail_group_file_transfer(&message_id, text, unix_now()); }
+                return Err(invalid("group file rejected").into());
+            }
+            Payload::FileAccept { id, offset } if id == message_id && offset <= size => offset,
+            _ => return Err(invalid("invalid file reply").into()),
+        };
+        let mut file = File::open(&source_path)?;
+        if offset > 0 { file.seek(SeekFrom::Start(offset))?; }
+        let mut buffer = vec![0u8; CHUNK_SIZE];
+        let mut sent = offset;
+        let mut reported = offset;
+        if let Ok(store) = store.lock() { let _ = store.update_group_file_progress(&message_id, offset, unix_now()); }
+        while sent < size {
+            let wanted = std::cmp::min(CHUNK_SIZE as u64, size - sent) as usize;
+            let read = file.read(&mut buffer[..wanted])?;
+            if read == 0 { return Err(invalid("source file ended early").into()); }
+            stream.sock.touch_chunk();
+            write_chunk(&mut stream, &buffer[..read])?;
+            sent += read as u64;
+            if sent - reported >= PROGRESS_STEP {
+                reported = sent;
+                if let Ok(store) = store.lock() { let _ = store.update_group_file_progress(&message_id, sent, unix_now()); }
+            }
+        }
+        stream.sock.touch_chunk();
+        write_chunk(&mut stream, &[])?;
+        let reply = protocol::read_frame(&mut stream)?;
+        gate.inbound(&reply)?;
+        if reply != (Payload::FileComplete { id: message_id.clone() }) { return Err(invalid("file not confirmed").into()); }
+        let store = store.lock().map_err(|_| invalid("store unavailable"))?;
+        store.complete_group_file_transfer(&message_id, unix_now())?;
+        store.ack_group(member, &message_id)?;
+        Ok(())
+    })();
+    match attempt {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            if let Ok(store) = store.lock() {
+                if store.group_file_transfer(&message_id).ok().flatten().is_some_and(|transfer| transfer.status != "failed") {
+                    let _ = store.pause_group_file_transfer(&message_id, "连接中断，等待重试", unix_now());
+                }
+            }
+            Err(error)
+        }
+    }
+}
+
 fn acknowledge(stream: &mut StreamOwned<ServerConnection, DeadlineStream>, gate: &mut ReadyGate, id: &str) -> io::Result<()> {
     let ack = Payload::Ack { id: id.to_owned() };
     gate.outbound(&ack)?;
@@ -296,6 +477,7 @@ pub fn send_group_one(identity: &Identity, store: &Mutex<Store>, member: &str, a
     if address.port() == 0 || !crate::address::is_unicast(address.ip()) { return Err(invalid("invalid address").into()); }
     let dispatch = store.lock().map_err(|_| invalid("store unavailable"))?.group_dispatch(message_id)?
         .ok_or_else(|| invalid("group message not found"))?;
+    if dispatch.kind == "file" { return send_group_file(identity, store, member, address, &dispatch); }
     let (mut stream, mut gate) = connect(identity, member, address)?;
     let text = Payload::GroupText {
         id: dispatch.message_id.clone(), group_id: dispatch.group_id, name: dispatch.group_name,

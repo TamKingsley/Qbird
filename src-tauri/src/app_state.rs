@@ -142,6 +142,37 @@ pub fn v1_read_text_attachment(state: tauri::State<'_, AppState>, message_id: St
     Ok(Some(TextPreview { name, kind: kind.to_owned(), text }))
 }
 
+/// Completed group image preview for active members only.
+#[tauri::command]
+pub fn v1_read_group_attachment(state: tauri::State<'_, AppState>, group_id: String, message_id: String)
+    -> Result<Option<AttachmentPreview>, String> {
+    let self_id = state.identity.fingerprint();
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    let Some((name, path)) = store.group_attachment_path(&group_id, &self_id, &message_id)
+        .map_err(|_| "无法读取群文件".to_owned())? else { return Ok(None); };
+    if !crate::files::is_image(&name) { return Ok(None); }
+    let size = crate::files::file_size(&path).map_err(|_| "无法读取群文件".to_owned())?;
+    if size == 0 || size > crate::files::MAX_PREVIEW_BYTES { return Ok(None); }
+    let data = std::fs::read(&path).map_err(|_| "无法读取群文件".to_owned())?;
+    let extension = std::path::Path::new(&name).extension().and_then(|ext| ext.to_str()).unwrap_or("").to_ascii_lowercase();
+    let mime = match extension.as_str() {
+        "png" => "image/png", "jpg" | "jpeg" => "image/jpeg", "gif" => "image/gif",
+        "webp" => "image/webp", "bmp" => "image/bmp", _ => return Ok(None),
+    };
+    Ok(Some(AttachmentPreview { name: name.to_string(), data_url: format!("data:{mime};base64,{}", crate::files::base64_encode(&data)) }))
+}
+
+#[tauri::command]
+pub fn v1_reveal_group_attachment(state: tauri::State<'_, AppState>, group_id: String, message_id: String) -> Result<(), String> {
+    let self_id = state.identity.fingerprint();
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    let Some((_, path)) = store.group_attachment_path(&group_id, &self_id, &message_id)
+        .map_err(|_| "无法读取群文件".to_owned())? else {
+        return Err("文件尚未接收完成或已被移动".into());
+    };
+    reveal_path(&path)
+}
+
 /// Opens the system file manager with the received/sent attachment selected.
 /// The path always comes from the local database, never from UI input.
 #[tauri::command]
@@ -150,6 +181,10 @@ pub fn v1_reveal_attachment(state: tauri::State<'_, AppState>, message_id: Strin
     let Some((_, path)) = store.attachment_path(&message_id).map_err(|_| "无法读取附件".to_owned())? else {
         return Err("附件尚未完成传输或已被移动".into());
     };
+    reveal_path(&path)
+}
+
+fn reveal_path(path: &std::path::Path) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
         std::process::Command::new("explorer")
@@ -375,6 +410,33 @@ pub fn v1_set_profile(state: tauri::State<'_, AppState>, nickname: String, email
         return Err("昵称不超过 64 字符；邮箱需包含一个 @ 或留空".into());
     }
     store.get_profile().map_err(|_| "无法读取个人资料".to_owned())
+}
+
+/// Experimental switches; each defaults to off and is stored as "0"/"1".
+#[derive(serde::Serialize)]
+pub struct ExperimentSettings {
+    pub group_file_quote: bool,
+}
+
+fn read_experiments(store: &crate::storage::Store) -> Result<ExperimentSettings, String> {
+    let enabled = store.get_setting("experiment_group_file_quote").map_err(|_| "无法读取实验设置".to_owned())?
+        .map(|value| value == "1").unwrap_or(false);
+    Ok(ExperimentSettings { group_file_quote: enabled })
+}
+
+#[tauri::command]
+pub fn v1_experiment_settings(state: tauri::State<'_, AppState>) -> Result<ExperimentSettings, String> {
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    read_experiments(&store)
+}
+
+#[tauri::command]
+pub fn v1_set_experiment_settings(state: tauri::State<'_, AppState>, group_file_quote: bool)
+    -> Result<ExperimentSettings, String> {
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    store.set_setting("experiment_group_file_quote", Some(if group_file_quote { "1" } else { "0" }))
+        .map_err(|_| "无法保存实验设置".to_owned())?;
+    read_experiments(&store)
 }
 
 fn read_scan_blacklist(store: &crate::storage::Store) -> Result<Vec<String>, String> {
@@ -763,6 +825,49 @@ pub fn v1_queue_group(state: tauri::State<'_, AppState>, group_id: String, body:
     state.store.lock().map_err(|_| "本地存储不可用".to_owned())?
         .queue_group(&sender, &group_id, &body, reply_to.as_deref(), &mentions, created_at)
         .map_err(|_| "消息为空、过长、引用的消息不存在或已不在该群中".to_owned())
+}
+
+/// Queue a file into a group; hashing and size checks run off the UI thread.
+#[tauri::command]
+pub async fn v1_queue_group_file(state: tauri::State<'_, AppState>, group_id: String, path: String)
+    -> Result<crate::storage::GroupMessage, String> {
+    let store = Arc::clone(&state.store);
+    let sender = state.identity.fingerprint();
+    tauri::async_runtime::spawn_blocking(move || {
+        if path.len() > 4096 { return Err("文件路径无效".to_owned()); }
+        let source = std::path::PathBuf::from(&path);
+        let name = source.file_name().and_then(|name| name.to_str()).ok_or_else(|| "无法读取文件名".to_owned())?.to_owned();
+        let size = crate::files::file_size(&source).map_err(|_| "无法读取文件：请确认它是本地普通文件".to_owned())?;
+        if size == 0 { return Err("暂不支持空文件".to_owned()); }
+        if size > crate::protocol::MAX_FILE_BYTES { return Err("文件超过 512 MiB 限制".to_owned()); }
+        let sha256 = crate::files::sha256_file(&source).map_err(|_| "无法计算文件校验值".to_owned())?;
+        let created_at = unix_now()?;
+        store.lock().map_err(|_| "本地存储不可用".to_owned())?
+            .queue_group_file(&sender, &group_id, &name, size, &sha256, &source, created_at)
+            .map_err(|_| "群不存在、你不是活跃成员，或文件名、大小无效".to_owned())
+    }).await.map_err(|_| "文件入队任务异常".to_owned())?
+}
+
+#[tauri::command]
+pub fn v1_group_file_progress(state: tauri::State<'_, AppState>, group_id: String)
+    -> Result<Vec<crate::storage::GroupFileProgress>, String> {
+    let self_id = state.identity.fingerprint();
+    state.store.lock().map_err(|_| "本地存储不可用".to_owned())?
+        .group_file_progress(&group_id, &self_id).map_err(|_| "无法读取群文件状态".to_owned())
+}
+
+/// Opens one completed group attachment in the file panel or file manager.
+#[tauri::command]
+pub fn v1_group_attachment_path(state: tauri::State<'_, AppState>, group_id: String, message_id: String)
+    -> Result<String, String> {
+    let self_id = state.identity.fingerprint();
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    let progress = store.group_file_transfer(&message_id).map_err(|_| "无法读取文件记录".to_owned())?
+        .ok_or_else(|| "文件记录不存在".to_owned())?;
+    if progress.status != "completed" { return Err("文件尚未接收完成".into()); }
+    let member = store.group_file_progress(&group_id, &self_id).map_err(|_| "无法读取群文件状态".to_owned())?;
+    if !member.iter().any(|item| item.message_id == message_id) { return Err("无权访问该群文件".into()); }
+    progress.target_path.ok_or_else(|| "本地附件路径缺失".to_owned())
 }
 
 #[tauri::command]
