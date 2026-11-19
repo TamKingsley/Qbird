@@ -62,6 +62,9 @@ let joinNotice = '';
 type FileAcceptMode = { confirm: boolean };
 let fileAccept: FileAcceptMode = { confirm: false };
 let fileAcceptNotice = '';
+let team = { name: '', has_logo: false };
+let teamLogoUrl: string | null = null;
+let teamNotice = '';
 const COMMON_EMOJIS = ['😀', '😁', '😂', '🤣', '😊', '😍', '😘', '😜', '🤔', '😅', '😭', '😡', '👍', '👎', '👏', '🙏', '💪', '🎉', '❤️', '💔', '🔥', '✨', '⭐', '🌹', '🍀', '☕', '🍰', '🐱', '🐶', '🌙', '☀️', '💡', '✅', '❌', '⚠️', '📌', '📎', '🚀', '🎯', '💬', '🙌', '🤝', '😴', '😎', '🥳', '🤩', '😢', '😤'];
 let stickers: string[] = [];
 let stickersLoaded = false;
@@ -661,6 +664,14 @@ function workspaceSettingsHtml(): string {
       <p id="composer-notice" role="status">${composerNotice}</p>
       <small>发送方式对单聊、群聊和自聊一致生效；输入区高度只影响本机界面，不随消息发送。</small>
     </div>
+    <div class="probe-box"><h3>团队与品牌</h3>
+      <p>团队名称 ${team.name ? `<strong>${escapeText(team.name)}</strong>` : '未设置（显示 Qbird 青鸟）'}；团队 Logo：${team.has_logo ? '已设置' : '未设置'}。</p>
+      <label for="team-name">团队名称（1–64 字符，留空恢复产品名）</label>
+      <div class="probe-row"><input id="team-name" type="text" maxlength="64" value="${escapeText(team.name)}"><button class="outline" data-action="save-team-name">保存名称</button></div>
+      <div class="probe-row"><button class="outline" data-action="choose-team-logo">选择 Logo…</button><button class="outline" data-action="clear-team-logo" ${team.has_logo ? '' : 'disabled'}>移除 Logo</button></div>
+      <p id="team-notice" role="status">${teamNotice}</p>
+      <small>团队名称与 Logo 只保存在本机侧栏与设置页，不随消息或群组发送。</small>
+    </div>
     <div class="probe-box"><h3>表情</h3>
       <p>常用表情和本地表情收藏在聊天输入区的“表情”按钮中管理；收藏的表情按图片文件发送给已确认联系人。</p>
       <small>本地收藏最多 64 个，单个不超过 512 KiB，支持 PNG、JPEG、GIF 与 WebP。</small>
@@ -897,6 +908,53 @@ async function loadGroupAvatarIcon(groupId: string, icon: HTMLImageElement): Pro
   } catch { icon.hidden = true; }
 }
 
+async function refreshTeam(): Promise<void> {
+  if (!isTauri()) return;
+  try { team = await invoke<{ name: string; has_logo: boolean }>('v1_team_profile'); }
+  catch { teamNotice = '无法读取团队设置'; return; }
+  try {
+    const bytes = await invoke<number[] | null>('v1_team_logo');
+    setTeamLogo(bytes && bytes.length ? new Uint8Array(bytes) : null);
+  } catch { setTeamLogo(null); }
+}
+
+function setTeamLogo(bytes: Uint8Array | null): void {
+  if (teamLogoUrl) { URL.revokeObjectURL(teamLogoUrl); teamLogoUrl = null; }
+  teamLogoUrl = bytes && bytes.length ? URL.createObjectURL(new Blob([toArrayBuffer(bytes)], { type: 'image/png' })) : null;
+}
+
+async function saveTeamName(): Promise<void> {
+  if (!isTauri()) return;
+  const name = app.querySelector<HTMLInputElement>('#team-name')?.value ?? '';
+  try {
+    team = await invoke<{ name: string; has_logo: boolean }>('v1_set_team_name', { name });
+    teamNotice = team.name ? '团队名称已保存。' : '已恢复默认名称。';
+  } catch (error) { teamNotice = displayError(error); }
+  render();
+}
+
+async function chooseTeamLogo(): Promise<void> {
+  if (!isTauri()) return;
+  try {
+    const picked = await openFileDialog({ multiple: false, filters: [{ name: '图片', extensions: ['png', 'jpg', 'jpeg'] }] });
+    if (!picked || typeof picked !== 'string') return;
+    const source = new Uint8Array(await invoke<number[]>('v1_read_image_file', { path: picked }));
+    const cropped = await cropSquare(source, 256);
+    await invoke('v1_set_team_logo', { bytes: Array.from(cropped) });
+    team.has_logo = true; setTeamLogo(cropped); teamNotice = '团队 Logo 已保存。';
+  } catch (error) { teamNotice = displayError(error); }
+  render();
+}
+
+async function clearTeamLogo(): Promise<void> {
+  if (!isTauri()) return;
+  try {
+    await invoke('v1_clear_team_logo');
+    team.has_logo = false; setTeamLogo(null); teamNotice = '团队 Logo 已移除。';
+  } catch (error) { teamNotice = displayError(error); }
+  render();
+}
+
 /// Owner-only; the crop keeps the PNG small enough for the 96 KiB wire and storage cap.
 async function chooseGroupAvatar(): Promise<void> {
   if (!isTauri() || !groupChat.groupId) return;
@@ -1035,6 +1093,12 @@ async function refreshContacts(): Promise<void> {
     await refreshJoinRequests();
     for (const contact of contacts) {
       const item = document.createElement('li');
+      item.className = 'contact-row';
+      item.draggable = true;
+      item.dataset.fingerprint = contact.fingerprint;
+      item.dataset.name = contact.display_name;
+      item.dataset.trust = contact.trust_state;
+      item.title = '拖到“我的群聊”中的群即可邀请入群';
       const title = document.createElement('span');
       title.className = 'contact-title';
       title.textContent = `${contact.remark ? `${contact.remark}（${contact.display_name}）` : contact.display_name} · ${contact.trust_state === 'verified' ? '已确认' : '待确认'}${contact.category ? ` · ${contact.category}` : ''} · ${contact.fingerprint}`;
@@ -1072,6 +1136,14 @@ function paintGroups(contacts: Contact[]): void {
     }
     for (const group of groups) {
       const item = document.createElement('li');
+      item.dataset.groupDrop = group.id;
+      item.addEventListener('dragover', (event) => { event.preventDefault(); item.classList.add('drop-target'); });
+      item.addEventListener('dragleave', () => item.classList.remove('drop-target'));
+      item.addEventListener('drop', (event) => {
+        event.preventDefault(); item.classList.remove('drop-target');
+        const fingerprint = event.dataTransfer?.getData('text/plain') ?? '';
+        if (fingerprint) void addDroppedMember(group.id, fingerprint);
+      });
       const icon = document.createElement('img'); icon.className = 'group-list-avatar'; icon.alt = '';
       void loadGroupAvatarIcon(group.id, icon);
       item.append(icon);
@@ -1096,6 +1168,17 @@ function paintGroups(contacts: Contact[]): void {
       pick.append(label);
     }
   }
+}
+
+/// Drag-and-drop invite from the contact list; the backend still enforces owner-only.
+async function addDroppedMember(groupId: string, fingerprint: string): Promise<void> {
+  if (!isTauri()) return;
+  const status = app.querySelector<HTMLElement>('#group-create-status');
+  try {
+    await invoke('v1_add_group_member', { groupId, member: fingerprint });
+    if (status) status.textContent = '已邀请该联系人入群，正在通知成员。';
+    await refreshContacts();
+  } catch (error) { if (status) status.textContent = displayError(error); }
 }
 
 async function createGroup(): Promise<void> {
@@ -1135,7 +1218,7 @@ function render(): void {
       </aside>
       ${menuOpen ? '<div class="menu" role="menu"><button data-page="settings" role="menuitem">设置</button><button data-page="about" role="menuitem">关于</button><span>备份与还原 · 待实现</span></div>' : ''}
       <aside class="sidebar">
-        <div class="team"><span class="team-mark">${icon('spark')}</span><div><strong>Qbird 青鸟</strong><small>LOCAL NETWORK MESSENGER</small></div></div>
+        <div class="team"><span class="team-mark">${teamLogoUrl ? `<img class="team-logo" src="${teamLogoUrl}" alt="团队 Logo">` : icon('spark')}</span><div><strong>${team.name ? escapeText(team.name) : 'Qbird 青鸟'}</strong><small>LOCAL NETWORK MESSENGER</small></div></div>
         <div class="side-heading"><div><span class="eyebrow">${current.eyebrow}</span><h1>${current.title}</h1></div></div>
         ${page === 'settings' || page === 'about' ? `<div class="settings-links">${SETTINGS_TABS.map((tab) => `<button data-settings-tab="${tab.id}" class="${page === 'settings' && settingsTab === tab.id ? 'selected' : ''}">${tab.label}</button>`).join('')}<button data-page="about" class="${page === 'about' ? 'selected' : ''}">关于</button></div>` : page === 'messages' ? `<div class="side-search"><input id="global-search" type="search" maxlength="200" placeholder="搜索全部消息" aria-label="搜索全部消息" value="${searchQuery.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;')}"></div><div id="search-results" class="search-hits" hidden></div><div id="conversation-list" class="conversation-list">正在读取…</div>` : '<div class="side-empty">暂无内容</div>'}
         <div class="side-foot"><span class="dot"></span>开发中 · 本地桌面版</div>
@@ -1433,6 +1516,46 @@ async function exportChat(kind: 'self' | 'direct' | 'group'): Promise<void> {
   } catch (error) { report(typeof error === 'string' ? error : '导出失败'); }
 }
 
+function contactTooltip(): HTMLElement {
+  let tip = document.getElementById('contact-tip');
+  if (!tip) {
+    tip = document.createElement('div');
+    tip.id = 'contact-tip'; tip.className = 'contact-tip'; tip.hidden = true;
+    document.body.append(tip);
+  }
+  return tip;
+}
+
+/// Shows the full contact details on hover; the fingerprint is never truncated here.
+function showContactTip(row: HTMLElement): void {
+  const tip = contactTooltip();
+  const fingerprint = row.dataset.fingerprint ?? '';
+  const name = row.dataset.name ?? '';
+  const remark = row.querySelector<HTMLInputElement>('input[data-remark-for]')?.value.trim() ?? '';
+  const category = row.querySelector<HTMLInputElement>('input[data-category-for]')?.value.trim() ?? '';
+  const trust = row.dataset.trust === 'verified' ? '已确认' : '待确认';
+  tip.replaceChildren();
+  const head = document.createElement('strong'); head.textContent = remark ? `${remark}（${name}）` : name;
+  const meta = document.createElement('span'); meta.textContent = `${trust}${category ? ` · ${category}` : ''}`;
+  const code = document.createElement('code'); code.textContent = fingerprint;
+  tip.append(head, meta, code);
+  const box = row.getBoundingClientRect();
+  tip.style.left = `${Math.min(box.left, window.innerWidth - 380)}px`;
+  tip.style.top = `${Math.min(box.bottom + 6, window.innerHeight - 120)}px`;
+  tip.hidden = false;
+  if (!fingerprint) return;
+  void invoke<string | null>('v1_contact_address', { peer: fingerprint }).then((address) => {
+    if (tip.hidden || tip.dataset.fingerprint !== fingerprint) return;
+    const line = document.createElement('span'); line.textContent = `地址：${address ?? '未记录'}`;
+    tip.append(line);
+  }).catch(() => {});
+  tip.dataset.fingerprint = fingerprint;
+}
+
+function escapeText(value: string): string {
+  return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
 function displayError(error: unknown): string {
   return typeof error === 'string' && error.length <= 200 ? error : '操作失败，请检查网络后重试';
 }
@@ -1578,6 +1701,9 @@ app.addEventListener('click', (event) => {
   if (action?.dataset.action === 'add-group-member') { void groupChat.addMember(); return; }
   if (action?.dataset.action === 'remove-group-member' && action.dataset.member) { void groupChat.removeMember(action.dataset.member); return; }
   if (action?.dataset.action === 'create-group') { void createGroup(); return; }
+  if (action?.dataset.action === 'save-team-name') { void saveTeamName(); return; }
+  if (action?.dataset.action === 'choose-team-logo') { void chooseTeamLogo(); return; }
+  if (action?.dataset.action === 'clear-team-logo') { void clearTeamLogo(); return; }
   if (action?.dataset.action === 'choose-group-avatar') { void chooseGroupAvatar(); return; }
   if (action?.dataset.action === 'clear-group-avatar') { void clearGroupAvatar(); return; }
   if (action?.dataset.action === 'search-groups') { void searchGroups(); return; }
@@ -1643,9 +1769,28 @@ void refreshNetwork().then(() => { if (!lockState.locked) render(); });
 void refreshScanState().then(() => { if (!lockState.locked) render(); });
 void refreshExperiments().then(() => { if (!lockState.locked) render(); });
 void refreshFileAccept().then(() => { if (!lockState.locked) render(); });
+void refreshTeam().then(() => { if (!lockState.locked) render(); });
 for (const type of ['pointerdown', 'keydown', 'wheel', 'mousemove'] as const) {
   window.addEventListener(type, () => { lastActivity = Date.now(); }, { passive: true });
 }
+// Drag a contact row onto a group to invite it; hovering shows the full details.
+document.addEventListener('dragstart', (event) => {
+  const row = (event.target as HTMLElement | null)?.closest<HTMLElement>('.contact-row');
+  if (!row?.dataset.fingerprint || !event.dataTransfer) return;
+  event.dataTransfer.setData('text/plain', row.dataset.fingerprint);
+  event.dataTransfer.effectAllowed = 'link';
+});
+document.addEventListener('mouseover', (event) => {
+  const row = (event.target as HTMLElement | null)?.closest<HTMLElement>('.contact-row');
+  if (row) showContactTip(row);
+});
+document.addEventListener('mouseout', (event) => {
+  const row = (event.target as HTMLElement | null)?.closest<HTMLElement>('.contact-row');
+  if (!row) return;
+  const next = event.relatedTarget as HTMLElement | null;
+  if (next && row.contains(next)) return;
+  contactTooltip().hidden = true;
+});
 window.setInterval(() => { void checkIdleLock(); }, 15_000);
 app.addEventListener('conversations-changed', () => { void refreshConversations(); });
 window.setInterval(() => {

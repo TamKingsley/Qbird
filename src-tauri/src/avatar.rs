@@ -20,6 +20,11 @@ pub fn avatar_path(dir: &Path) -> PathBuf {
     dir.join(FILE_NAME)
 }
 
+/// Named image in the app data directory, used for the local team logo.
+pub fn named_path(dir: &Path, name: &str) -> PathBuf {
+    dir.join(name)
+}
+
 fn png_edge(bytes: &[u8]) -> Option<u32> {
     if bytes.len() < 24 || bytes[..8] != PNG_SIGNATURE || &bytes[12..16] != b"IHDR" {
         return None;
@@ -49,6 +54,31 @@ pub fn save(dir: &Path, bytes: &[u8]) -> Result<(), String> {
     let temp = dir.join("avatar.png.tmp");
     fs::write(&temp, bytes).map_err(|_| "无法写入头像".to_owned())?;
     fs::rename(&temp, avatar_path(dir)).map_err(|_| "无法写入头像".to_owned())
+}
+
+pub fn save_named(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), String> {
+    validate(bytes)?;
+    fs::create_dir_all(dir).map_err(|_| "无法写入图片".to_owned())?;
+    let temp = named_path(dir, &format!("{name}.tmp"));
+    fs::write(&temp, bytes).map_err(|_| "无法写入图片".to_owned())?;
+    fs::rename(&temp, named_path(dir, name)).map_err(|_| "无法写入图片".to_owned())
+}
+
+pub fn load_named(dir: &Path, name: &str) -> Result<Option<Vec<u8>>, String> {
+    match fs::read(named_path(dir, name)) {
+        Ok(bytes) if validate(&bytes).is_ok() => Ok(Some(bytes)),
+        Ok(_) => Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err("无法读取图片".to_owned()),
+    }
+}
+
+pub fn remove_named(dir: &Path, name: &str) -> Result<(), String> {
+    match fs::remove_file(named_path(dir, name)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err("无法移除图片".to_owned()),
+    }
 }
 
 /// A corrupt or oversized file is treated as "no avatar" rather than an error.
@@ -124,6 +154,17 @@ mod tests {
         // Removing twice stays idempotent.
         remove(&dir).unwrap();
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn named_images_roundtrip_independently_of_the_avatar() {
+        let dir = temp_dir("named");
+        assert!(load_named(&dir, "team-logo.png").unwrap().is_none());
+        assert!(save_named(&dir, "team-logo.png", &png(256)).is_ok());
+        assert!(load_named(&dir, "team-logo.png").unwrap().is_some());
+        assert!(load(&dir).unwrap().is_none());
+        assert!(remove_named(&dir, "team-logo.png").is_ok());
+        assert!(load_named(&dir, "team-logo.png").unwrap().is_none());
     }
 
     #[test]

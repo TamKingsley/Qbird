@@ -660,6 +660,56 @@ pub fn v1_avatar(state: tauri::State<'_, AppState>) -> Result<Option<Vec<u8>>, S
 }
 
 /// Replaces the avatar with a cropped square PNG produced by the front end.
+const TEAM_NAME_KEY: &str = "team_name";
+const TEAM_LOGO_FILE: &str = "team-logo.png";
+
+#[derive(serde::Serialize)]
+pub struct TeamProfile {
+    pub name: String,
+    pub has_logo: bool,
+}
+
+/// Local branding only: the team name and logo never leave this device.
+#[tauri::command]
+pub fn v1_team_profile(state: tauri::State<'_, AppState>) -> Result<TeamProfile, String> {
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    let name = store.get_setting(TEAM_NAME_KEY).map_err(|_| "无法读取团队名称".to_owned())?.unwrap_or_default();
+    drop(store);
+    Ok(TeamProfile { name, has_logo: crate::avatar::load_named(&state.data_dir, TEAM_LOGO_FILE)
+        .map_err(|_| "无法读取团队 Logo".to_owned())?.is_some() })
+}
+
+/// Empty input clears the name and restores the product name.
+#[tauri::command]
+pub fn v1_set_team_name(state: tauri::State<'_, AppState>, name: String) -> Result<TeamProfile, String> {
+    let trimmed = name.trim();
+    if trimmed.chars().count() > 64 || trimmed.chars().any(char::is_control) {
+        return Err("团队名称需为 1–64 个字符".into());
+    }
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    store.set_setting(TEAM_NAME_KEY, if trimmed.is_empty() { None } else { Some(trimmed) })
+        .map_err(|_| "无法保存团队名称".to_owned())?;
+    let saved = store.get_setting(TEAM_NAME_KEY).map_err(|_| "无法读取团队名称".to_owned())?.unwrap_or_default();
+    drop(store);
+    Ok(TeamProfile { name: saved, has_logo: crate::avatar::load_named(&state.data_dir, TEAM_LOGO_FILE)
+        .map_err(|_| "无法读取团队 Logo".to_owned())?.is_some() })
+}
+
+#[tauri::command]
+pub fn v1_team_logo(state: tauri::State<'_, AppState>) -> Result<Option<Vec<u8>>, String> {
+    crate::avatar::load_named(&state.data_dir, TEAM_LOGO_FILE)
+}
+
+#[tauri::command]
+pub fn v1_set_team_logo(state: tauri::State<'_, AppState>, bytes: Vec<u8>) -> Result<(), String> {
+    crate::avatar::save_named(&state.data_dir, TEAM_LOGO_FILE, &bytes)
+}
+
+#[tauri::command]
+pub fn v1_clear_team_logo(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    crate::avatar::remove_named(&state.data_dir, TEAM_LOGO_FILE)
+}
+
 #[tauri::command]
 pub fn v1_set_avatar(state: tauri::State<'_, AppState>, bytes: Vec<u8>) -> Result<(), String> {
     crate::avatar::save(&state.data_dir, &bytes)
