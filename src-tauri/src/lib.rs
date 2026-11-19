@@ -100,6 +100,8 @@ pub fn run() {
             app_state::v1_file_progress,
             app_state::v1_read_attachment,
             app_state::v1_read_text_attachment,
+            app_state::v1_open_attachment,
+            app_state::v1_open_group_attachment,
             app_state::v1_reveal_attachment,
             app_state::v1_storage_usage,
             app_state::v1_create_backup,

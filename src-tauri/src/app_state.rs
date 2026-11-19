@@ -204,6 +204,53 @@ fn reveal_path(path: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Opens a completed attachment with the system default program. The path always
+/// comes from the local database, never from UI input.
+fn open_path(path: &std::path::Path) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        std::process::Command::new("cmd")
+            .args(["/C", "start", ""])
+            .arg(path)
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .map_err(|_| "无法用默认程序打开文件".to_owned())?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open").arg(path).spawn().map_err(|_| "无法用默认程序打开文件".to_owned())?;
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open").arg(path).spawn().map_err(|_| "无法用默认程序打开文件".to_owned())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn v1_open_attachment(state: tauri::State<'_, AppState>, message_id: String) -> Result<(), String> {
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    let Some((_, path)) = store.attachment_path(&message_id).map_err(|_| "无法读取附件".to_owned())? else {
+        return Err("文件尚未接收完成或已被移动".into());
+    };
+    drop(store);
+    open_path(&path)
+}
+
+#[tauri::command]
+pub fn v1_open_group_attachment(state: tauri::State<'_, AppState>, group_id: String, message_id: String) -> Result<(), String> {
+    let self_id = state.identity.fingerprint();
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    let Some((_, path)) = store.group_attachment_path(&group_id, &self_id, &message_id)
+        .map_err(|_| "无法读取群文件".to_owned())? else {
+        return Err("文件尚未接收完成或已被移动".into());
+    };
+    drop(store);
+    open_path(&path)
+}
+
 #[tauri::command]
 pub fn v1_storage_usage(state: tauri::State<'_, AppState>) -> Result<crate::storage::StorageUsage, String> {
     state.store.lock().map_err(|_| "本地存储不可用".to_owned())?

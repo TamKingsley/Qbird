@@ -2,6 +2,7 @@ import { invoke, isTauri } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
 import { showImage } from './image_viewer';
 import { base64ToBytes, createPluginFrame } from './plugin_view';
+import { showContextMenu } from './context_menu';
 
 type DirectMessage = {
   id: string; peer: string; sender: string; body: string; created_at: number; logical: number;
@@ -232,6 +233,22 @@ export class DirectChat {
       this.paintPanel(typeof error === 'string' ? error : '插件预览失败');
       return true;
     }
+  }
+
+  /// Right-click on a file bubble: open with the default app, reveal it, or preview it.
+  private fileMenu(event: MouseEvent, message: DirectMessage): void {
+    const name = message.file_name ?? message.body;
+    if (message.file_status !== 'completed') {
+      showContextMenu(event, [{ label: '文件尚未接收完成', run: () => {} }]);
+      return;
+    }
+    showContextMenu(event, [
+      { label: '用默认程序打开', run: () => { void invoke('v1_open_attachment', { messageId: message.id })
+        .catch((error) => this.status('#direct-file-status', typeof error === 'string' ? error : '无法打开文件')); } },
+      { label: '打开所在目录', run: () => { void this.reveal(message.id); } },
+      { label: '预览', run: () => { void this.openPreview(message); } },
+      { label: '复制文件名', run: () => { void navigator.clipboard?.writeText(name).catch(() => {}); } },
+    ]);
   }
 
   get panelId(): string { return this.panel?.id ?? ''; }
@@ -514,6 +531,7 @@ export class DirectChat {
         const grid = document.createElement('div'); grid.className = 'batch-grid';
         for (const item of this.messages.filter(candidate => this.batches.get(candidate.id) === batch)) {
           const cell = document.createElement('div'); cell.className = 'batch-item';
+          cell.addEventListener('contextmenu', (event) => this.fileMenu(event, item));
           const preview = document.createElement('div'); preview.className = 'file-preview'; preview.dataset.preview = item.id;
           const meta = document.createElement('small'); meta.className = 'file-meta';
           meta.textContent = item.file_status === 'completed' ? formatSize(item.file_size ?? 0) : fileStatus(item);
@@ -531,6 +549,7 @@ export class DirectChat {
         bubble.append(preview);
         const meta = document.createElement('small'); meta.className = 'file-meta'; meta.textContent = fileMeta(message, incoming);
         bubble.append(meta);
+        bubble.addEventListener('contextmenu', (event) => this.fileMenu(event, message));
         if (message.file_status === 'completed') {
           const actions = document.createElement('div'); actions.className = 'file-actions';
           const preview = document.createElement('button');

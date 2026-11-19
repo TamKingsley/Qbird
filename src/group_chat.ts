@@ -2,6 +2,7 @@ import { invoke, isTauri } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
 import { showImage } from './image_viewer';
 import { base64ToBytes, createPluginFrame } from './plugin_view';
+import { showContextMenu } from './context_menu';
 
 type GroupMessage = {
   id: string; group_id: string; sender: string; sender_name: string; body: string;
@@ -648,6 +649,27 @@ export class GroupChat {
     }
   }
 
+  /// Right-click on a file bubble: open with the default app, reveal it, or preview it.
+  private fileMenu(event: MouseEvent, message: GroupMessage): void {
+    const name = message.file_name ?? message.body;
+    if (message.file_status !== 'completed') {
+      showContextMenu(event, [{ label: '文件尚未接收完成', run: () => {} }]);
+      return;
+    }
+    showContextMenu(event, [
+      { label: '用默认程序打开', run: () => {
+        void invoke('v1_open_group_attachment', { groupId: this.groupId, messageId: message.id })
+          .catch((error) => this.status('#group-file-status', typeof error === 'string' ? error : '无法打开文件'));
+      } },
+      { label: '打开所在目录', run: () => {
+        void invoke('v1_reveal_group_attachment', { groupId: this.groupId, messageId: message.id })
+          .catch((error) => this.status('#group-error', typeof error === 'string' ? error : '无法打开所在目录'));
+      } },
+      { label: '预览', run: () => { void this.openPreview(message); } },
+      { label: '复制文件名', run: () => { void navigator.clipboard?.writeText(name).catch(() => {}); } },
+    ]);
+  }
+
   get panelId(): string { return this.panel?.id ?? ''; }
 
   openPreviewById(id: string): void {
@@ -746,6 +768,7 @@ export class GroupChat {
         const grid = document.createElement('div'); grid.className = 'batch-grid';
         for (const item of this.messages.filter(candidate => this.batches.get(candidate.id) === batch)) {
           const cell = document.createElement('div'); cell.className = 'batch-item';
+          cell.addEventListener('contextmenu', (event) => this.fileMenu(event, item));
           if (this.thumbs.has(item.id)) {
             const image = document.createElement('img'); image.className = 'file-thumb'; image.src = this.thumbs.get(item.id) ?? '';
             image.alt = item.file_name ?? '图片';
@@ -765,6 +788,7 @@ export class GroupChat {
         bubble.append(grid);
       } else if (message.kind === 'file') {
         const card = document.createElement('div'); card.className = 'file-card';
+        card.addEventListener('contextmenu', (event) => this.fileMenu(event, message));
         if (this.isImageMessage(message) && this.thumbs.has(message.id)) {
           const image = document.createElement('img'); image.className = 'file-thumb'; image.src = this.thumbs.get(message.id) ?? '';
           image.alt = message.file_name ?? '图片';
