@@ -54,6 +54,33 @@ pub struct Profile {
     pub email: String,
 }
 
+/// One message matched by the cross-conversation search.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct SearchHit {
+    /// "self", "direct" or "group".
+    pub conversation_kind: String,
+    /// "self", the peer fingerprint or the group id.
+    pub conversation_id: String,
+    pub conversation_name: String,
+    pub message_id: String,
+    /// Fingerprint of the author; self messages use the local fingerprint.
+    pub sender: String,
+    pub sender_name: String,
+    pub body: String,
+    pub created_at: i64,
+    pub logical: i64,
+    /// "text" or "file" (self and group messages are text only for now).
+    pub kind: String,
+}
+
+/// A plain-text conversation export. The file itself is written by the caller.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct ChatExport {
+    pub conversation_name: String,
+    pub message_count: u64,
+    pub text: String,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct PendingDelivery {
     pub peer: String,
@@ -1573,6 +1600,128 @@ impl Store {
         rows.collect()
     }
 
+    /// Cross-conversation substring search. Only conversations the user can see are
+    /// included: the local self chat, direct chats with verified contacts, and groups
+    /// where the local identity is an active member.
+    pub fn search_all(&self, self_id: &str, query: &str, category: &str, limit: u32) -> Result<Vec<SearchHit>> {
+        if !valid_fingerprint(self_id) || !valid_search(query, category, limit, 0) {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        let pattern = like_pattern(query);
+        let mut statement = self.connection.prepare(
+            "SELECT 'self' AS ck, 'self' AS cid, '自聊' AS cname, m.id, m.sender, '我', m.body, m.created_at, m.logical, 'text'
+             FROM local_messages m
+             WHERE m.conversation_id = 'self' AND ?3 IN ('all', 'text') AND (?1 = '' OR m.body LIKE ?2 ESCAPE '\\')
+             UNION ALL
+             SELECT 'direct', m.peer, COALESCE(c.display_name, substr(m.peer, 1, 8)), m.id, m.sender,
+                    CASE WHEN m.sender = ?4 THEN '我' ELSE COALESCE(c.display_name, substr(m.peer, 1, 8)) END,
+                    m.body, m.created_at, m.logical, m.kind
+             FROM direct_messages m JOIN contacts c ON c.fingerprint = m.peer AND c.trust_state = 'verified'
+             WHERE (?1 = '' OR m.body LIKE ?2 ESCAPE '\\' OR COALESCE(m.file_name, '') LIKE ?2 ESCAPE '\\')
+               AND ((?3 IN ('all', 'text') AND m.kind = 'text')
+                 OR (?3 = 'file' AND m.kind = 'file')
+                 OR (?3 = 'image' AND m.kind = 'file' AND (lower(m.file_name) LIKE '%.png' OR lower(m.file_name) LIKE '%.jpg'
+                    OR lower(m.file_name) LIKE '%.jpeg' OR lower(m.file_name) LIKE '%.gif' OR lower(m.file_name) LIKE '%.webp'
+                    OR lower(m.file_name) LIKE '%.bmp')))
+             UNION ALL
+             SELECT 'group', g.id, g.name, m.id, m.sender, COALESCE(c.display_name, substr(m.sender, 1, 8)),
+                    m.body, m.created_at, m.logical, 'text'
+             FROM group_messages m
+             JOIN groups g ON g.id = m.group_id
+             JOIN group_members gm ON gm.group_id = g.id AND gm.member = ?4 AND gm.active = 1
+             LEFT JOIN contacts c ON c.fingerprint = m.sender
+             WHERE ?3 IN ('all', 'text') AND (?1 = '' OR m.body LIKE ?2 ESCAPE '\\')
+             ORDER BY created_at DESC, logical DESC, id DESC LIMIT ?5"
+        )?;
+        let rows = statement.query_map(params![query, pattern, category, self_id, limit], |row| Ok(SearchHit {
+            conversation_kind: row.get(0)?, conversation_id: row.get(1)?, conversation_name: row.get(2)?,
+            message_id: row.get(3)?, sender: row.get(4)?, sender_name: row.get(5)?, body: row.get(6)?,
+            created_at: row.get(7)?, logical: row.get(8)?, kind: row.get(9)?,
+        }))?;
+        rows.collect()
+    }
+
+    /// Plain-text export of one visible conversation in logical order. Direct chats and
+    /// groups are refused unless the local user may still read them.
+    /// `kind` is "self", "direct" or "group"; `id` is the peer fingerprint or group id.
+    pub fn export_conversation(&self, self_id: &str, kind: &str, id: &str) -> Result<ChatExport> {
+        if !valid_fingerprint(self_id) { return Err(rusqlite::Error::InvalidQuery); }
+        const MAX_EXPORT_MESSAGES: usize = 50_000;
+        let (name, rows): (String, Vec<(String, String, String)>) = match kind {
+            "self" => {
+                let rows = self.connection.prepare(
+                    "SELECT COALESCE(datetime(created_at, 'unixepoch', 'localtime'), ''), '我', body
+                     FROM local_messages WHERE conversation_id = 'self'
+                     ORDER BY logical, id LIMIT 50001")?
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?.collect::<Result<Vec<_>>>()?;
+                ("自聊".to_owned(), rows)
+            }
+            "direct" => {
+                if !valid_fingerprint(id) { return Err(rusqlite::Error::InvalidQuery); }
+                let name: Option<String> = self.connection.query_row(
+                    "SELECT display_name FROM contacts WHERE fingerprint = ?1 AND trust_state = 'verified'",
+                    [id], |row| row.get(0)).optional()?;
+                let Some(name) = name else { return Err(rusqlite::Error::InvalidQuery); };
+                let rows = self.connection.prepare(
+                    "SELECT COALESCE(datetime(created_at, 'unixepoch', 'localtime'), ''),
+                            CASE WHEN sender = ?3 THEN '我' ELSE ?2 END,
+                            CASE WHEN kind = 'file' AND file_name IS NOT NULL THEN '[文件] ' || file_name ELSE body END
+                     FROM direct_messages WHERE peer = ?1
+                     ORDER BY logical, sender, id LIMIT 50001")?
+                    .query_map(params![id, name, self_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?.collect::<Result<Vec<_>>>()?;
+                (name, rows)
+            }
+            "group" => {
+                if !valid_group_id(id) { return Err(rusqlite::Error::InvalidQuery); }
+                let name: Option<String> = self.connection.query_row(
+                    "SELECT g.name FROM groups g JOIN group_members gm ON gm.group_id = g.id
+                     WHERE g.id = ?1 AND gm.member = ?2 AND gm.active = 1",
+                    params![id, self_id], |row| row.get(0)).optional()?;
+                let Some(name) = name else { return Err(rusqlite::Error::InvalidQuery); };
+                let rows = self.connection.prepare(
+                    "SELECT COALESCE(datetime(m.created_at, 'unixepoch', 'localtime'), ''),
+                            CASE WHEN m.sender = ?2 THEN '我' ELSE COALESCE(c.display_name, substr(m.sender, 1, 8)) END,
+                            m.body
+                     FROM group_messages m LEFT JOIN contacts c ON c.fingerprint = m.sender
+                     WHERE m.group_id = ?1
+                     ORDER BY m.logical, m.sender, m.id LIMIT 50001")?
+                    .query_map(params![id, self_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?.collect::<Result<Vec<_>>>()?;
+                (name, rows)
+            }
+            _ => return Err(rusqlite::Error::InvalidQuery),
+        };
+        if rows.len() > MAX_EXPORT_MESSAGES { return Err(rusqlite::Error::InvalidQuery); }
+        let exported_at: String = self.connection.query_row(
+            "SELECT COALESCE(datetime('now', 'localtime'), '')", [], |row| row.get(0))?;
+        let kind_label = match kind { "self" => "自聊", "direct" => "单聊", _ => "群聊" };
+        let mut text = format!(
+            "Qbird 青鸟聊天记录\n会话：{name}（{kind_label}）\n导出时间：{exported_at}\n消息数：{}\n说明：纯文本导出未加密，请妥善保管。\n\n",
+            rows.len());
+        for (time, sender, body) in &rows {
+            text.push_str(&format!("[{time}] {sender}：{body}\n"));
+        }
+        Ok(ChatExport { conversation_name: name, message_count: rows.len() as u64, text })
+    }
+
+    /// Generic settings access used by small, explicit key/value features.
+    pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
+        if key.is_empty() || key.len() > 64 { return Err(rusqlite::Error::InvalidQuery); }
+        self.connection.query_row("SELECT value FROM settings WHERE key = ?1", [key], |row| row.get(0)).optional()
+    }
+
+    /// Writes or deletes one setting; `None` removes the row.
+    pub fn set_setting(&self, key: &str, value: Option<&str>) -> Result<bool> {
+        if key.is_empty() || key.len() > 64 || value.is_some_and(|text| text.len() > 4096) {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        match value {
+            Some(text) => Ok(self.connection.execute(
+                "INSERT INTO settings(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![key, text])? == 1),
+            None => { self.connection.execute("DELETE FROM settings WHERE key = ?1", [key])?; Ok(true) }
+        }
+    }
+
     /// Substring search within one group, newest first. Category `file`/`image` is
     /// reserved for group files and returns nothing until those exist.
     pub fn search_group_messages(&self, group_id: &str, query: &str, category: &str,
@@ -2899,5 +3048,57 @@ mod tests {
         assert_eq!(store.search_contacts("", 20).unwrap().len(), 1);
         assert!(store.search_contacts("x", 0).is_err());
     }
-}
 
+    #[test]
+    fn global_search_and_text_export_cover_visible_conversations() {
+        let store = memory_store();
+        let me = "a".repeat(64);
+        let peer = "b".repeat(64);
+        store.add_candidate(&peer, "Bob").unwrap();
+        store.confirm_candidate(&peer).unwrap();
+        store.queue_direct(&me, &peer, "单聊 里程碑", 10).unwrap();
+        store.receive_direct(&peer, "d2", "回复 里程碑", 11, 5).unwrap();
+        store.send_self(&me, "自聊 里程碑", 12).unwrap();
+        let (group_id, _, _) = group_with_two_members(&store, &me);
+        store.queue_group(&me, &group_id, "群聊 里程碑", None, &[], 13).unwrap();
+
+        let hits = store.search_all(&me, "里程碑", "all", 100).unwrap();
+        assert_eq!(hits.len(), 4);
+        assert!(hits.iter().any(|hit| hit.conversation_kind == "self"));
+        assert!(hits.iter().any(|hit| hit.conversation_kind == "direct" && hit.conversation_name == "Bob"));
+        assert!(hits.iter().any(|hit| hit.conversation_kind == "group" && hit.conversation_name == "Team"));
+        assert_eq!(hits[0].created_at, 13);
+        assert!(store.search_all(&me, "里程碑", "file", 100).unwrap().is_empty());
+        assert!(store.search_all(&me, "missing", "all", 100).unwrap().is_empty());
+        assert!(store.search_all(&me, "", "text", 100).unwrap().len() >= 4);
+        assert!(store.search_all(&me, "x", "all", 0).is_err());
+        assert!(store.search_all("bad", "x", "all", 10).is_err());
+
+        let direct = store.export_conversation(&me, "direct", &peer).unwrap();
+        assert_eq!(direct.conversation_name, "Bob");
+        assert_eq!(direct.message_count, 2);
+        assert!(direct.text.contains("里程碑") && direct.text.contains("我：单聊 里程碑"));
+        let own = store.export_conversation(&me, "self", "self").unwrap();
+        assert_eq!(own.message_count, 1);
+        let group = store.export_conversation(&me, "group", &group_id).unwrap();
+        assert_eq!(group.conversation_name, "Team");
+        assert_eq!(group.message_count, 1);
+        assert!(store.export_conversation(&me, "group", &"f".repeat(32)).is_err());
+        assert!(store.export_conversation(&me, "direct", &"d".repeat(64)).is_err());
+        assert!(store.export_conversation(&me, "unknown", "self").is_err());
+    }
+
+    #[test]
+    fn generic_settings_roundtrip_and_delete() {
+        let store = memory_store();
+        assert_eq!(store.get_setting("lock_hash").unwrap(), None);
+        assert!(store.set_setting("lock_hash", Some("abc")).unwrap());
+        assert_eq!(store.get_setting("lock_hash").unwrap().as_deref(), Some("abc"));
+        assert!(store.set_setting("lock_hash", Some("def")).unwrap());
+        assert_eq!(store.get_setting("lock_hash").unwrap().as_deref(), Some("def"));
+        assert!(store.set_setting("lock_hash", None).unwrap());
+        assert_eq!(store.get_setting("lock_hash").unwrap(), None);
+        assert!(store.set_setting("", Some("x")).is_err());
+        assert!(store.get_setting(&"k".repeat(65)).is_err());
+    }
+}

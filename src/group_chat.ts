@@ -48,7 +48,7 @@ export class GroupChat {
 
   view(): string {
     return `<section class="self-chat" aria-label="群聊">
-      <header class="chat-header"><div><strong id="group-name"></strong><small id="group-subtitle">群聊</small></div><div class="group-actions"><button class="outline" data-action="toggle-group-search">搜索</button><button class="outline" data-action="toggle-group-members">成员</button><button class="outline" data-action="hide-group">不显示此会话</button><button class="outline" data-action="leave-group">退出群聊</button></div></header>
+      <header class="chat-header"><div><strong id="group-name"></strong><small id="group-subtitle">群聊</small></div><div class="group-actions"><button class="outline" data-action="export-text" data-kind="group">导出文本</button><button class="outline" data-action="toggle-group-search">搜索</button><button class="outline" data-action="toggle-group-members">成员</button><button class="outline" data-action="hide-group">不显示此会话</button><button class="outline" data-action="leave-group">退出群聊</button></div></header>
       <div class="group-search" id="group-search" hidden>
         <div class="search-row">
           <input id="group-search-query" type="search" maxlength="200" placeholder="搜索聊天记录" aria-label="搜索聊天记录">

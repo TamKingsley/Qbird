@@ -52,6 +52,23 @@ let backupPath = '';
 let backupInfo: BackupInfo | null = null;
 let backupNotice = '';
 let backupBusy = false;
+type SearchHit = {
+  conversation_kind: 'self' | 'direct' | 'group'; conversation_id: string; conversation_name: string;
+  message_id: string; sender: string; sender_name: string; body: string;
+  created_at: number; logical: number; kind: string;
+};
+let searchHits: SearchHit[] = [];
+let searchQuery = '';
+let searchBusy = false;
+let searchError = '';
+let searchSeq = 0;
+let searchTimer: number | null = null;
+type LockStatus = { has_password: boolean; locked: boolean; idle_minutes: number };
+let lockState: LockStatus = { has_password: false, locked: false, idle_minutes: 0 };
+let lockNotice = '';
+let lockBusy = false;
+let lockInitialized = false;
+let lastActivity = Date.now();
 const direct = new DirectChat(app, () => { groupChat.clear(); selfOpen = false; page = 'messages'; menuOpen = false; render(); });
 const groupChat = new GroupChat(app, () => { direct.clear(); selfOpen = false; page = 'messages'; menuOpen = false; render(); });
 
@@ -154,7 +171,7 @@ function paintSelfMessages(scroll: 'bottom' | 'preserve'): void {
   const previousHeight = history.scrollHeight, previousTop = history.scrollTop;
   list.replaceChildren();
   for (const message of selfMessages) {
-    const row = document.createElement('div'); row.className = 'message-row';
+    const row = document.createElement('div'); row.className = 'message-row'; row.dataset.id = message.id;
     const body = document.createElement('div'); body.className = 'message-bubble'; body.textContent = message.body;
     row.append(body); list.append(row);
   }
@@ -176,7 +193,7 @@ async function loadSelfMessages(older: boolean): Promise<void> {
 
 function selfChatView(): string {
   return `<section class="self-chat" aria-label="自聊">
-    <header class="chat-header"><div><strong>自己</strong><small>仅保存在本机</small></div><button class="outline" data-action="hide-self">不显示此会话</button></header>
+    <header class="chat-header"><div><strong>自己</strong><small>仅保存在本机</small></div><div class="group-actions"><button class="outline" data-action="export-text" data-kind="self">导出文本</button><button class="outline" data-action="hide-self">不显示此会话</button></div></header>
     <div class="chat-history" id="self-history" aria-label="自聊记录"><button class="load-older" data-action="self-older" hidden>加载更早消息</button><div id="self-messages"></div></div>
     <div class="chat-compose"><label for="self-input">消息</label><textarea id="self-input" rows="3" maxlength="32768" placeholder="写点什么…"></textarea><div class="compose-footer"><span>Enter 发送 · Shift+Enter 换行</span><button data-action="self-send">发送</button></div><p id="self-error" role="status"></p></div>
   </section>`;
@@ -187,7 +204,7 @@ const pages: Record<PlaceholderPage, { title: string; eyebrow: string; heading: 
   messages: { title: '消息', eyebrow: 'MESSAGES', heading: '还没有会话', copy: '从联系人打开自聊或已确认的单聊。' },
   contacts: { title: '联系人', eyebrow: 'CONTACTS', heading: '联系人', copy: '可搜索联系人、编辑本机备注与分组。' },
   discover: { title: '发现', eyebrow: 'DISCOVERY', heading: '局域网发现', copy: '仅浏览同网段 IPv4 mDNS 服务；发现结果未经身份验证，不代表可信联系人。' },
-  settings: { title: '设置', eyebrow: 'PREFERENCES', heading: '设置', copy: '存储配额与备份恢复已开放；应用锁等将在后续阶段提供。' },
+  settings: { title: '设置', eyebrow: 'PREFERENCES', heading: '设置', copy: '存储配额、备份恢复与应用锁已开放；插件与更多设置将在后续阶段提供。' },
   about: { title: '设置', eyebrow: 'ABOUT', heading: 'Qbird 青鸟', copy: '本地优先的局域网聊天工具。' },
   profile: { title: '我的资料', eyebrow: 'PROFILE', heading: '个人资料', copy: '昵称与邮箱仅保存在本机。' }
 };
@@ -244,7 +261,7 @@ function settingsView(): string {
   const quotaMib = storageInfo ? Math.round(storageInfo.quota / (1024 * 1024)) : '';
   return `<section class="card settings-card">
     <span class="eyebrow">SETTINGS / 设置</span><h2>常规与网络</h2>
-    <p>消息列表、联系人、发现与聊天功能已开放；备份、应用锁和插件尚未接入。</p>
+    <p>消息列表、联系人、发现与聊天功能已开放；备份与应用锁已接入，插件尚未实现。</p>
     <div class="probe-box"><h3>存储配额</h3>
       <p>已接收附件占用 <strong id="storage-used">${used}</strong>，上限 <strong id="storage-quota">${quota}</strong>。</p>
       <label for="storage-quota-mib">配额上限（MiB，256–65536）</label>
@@ -262,6 +279,18 @@ function settingsView(): string {
       <div class="probe-row"><button class="outline" data-action="backup-restore-merge" ${backupBusy || !backupPath ? 'disabled' : ''}>合并恢复</button><button class="outline danger" data-action="backup-restore-overwrite" ${backupBusy || !backupPath ? 'disabled' : ''}>覆盖恢复</button></div>
       <p id="backup-notice" role="status">${backupNotice}</p>
       <small>备份不包含身份私钥与附件文件；在新设备恢复会使用新身份，附件需另行拷贝。恢复不会改动本机存储配额。密码丢失后备份无法解密。</small>
+    </div>
+    <div class="probe-box"><h3>应用锁</h3>
+      <p>当前状态：${lockState.has_password ? '已设置密码' : '未设置密码（锁定只隐藏界面，任何人都能直接解锁）'}；空闲自动锁定：${lockState.idle_minutes ? `${lockState.idle_minutes} 分钟（按系统无键鼠输入计算）` : '关闭'}。</p>
+      <label for="lock-current">当前应用锁密码${lockState.has_password ? '' : '（尚未设置，可留空）'}</label>
+      <input id="lock-current" type="password" maxlength="128" autocomplete="current-password">
+      <label for="lock-new">新密码（6–128 字符；留空并保存可移除密码）</label>
+      <input id="lock-new" type="password" maxlength="128" autocomplete="new-password">
+      <div class="probe-row"><button class="outline" data-action="save-lock-password" ${lockBusy ? 'disabled' : ''}>保存应用锁密码</button></div>
+      <label for="lock-idle">空闲自动锁定（分钟，0 表示关闭，最大 240）</label>
+      <div class="probe-row"><input id="lock-idle" type="number" min="0" max="240" value="${lockState.idle_minutes}" ${lockBusy ? 'disabled' : ''}><button class="outline" data-action="save-lock-idle" ${lockBusy ? 'disabled' : ''}>保存空闲设置</button></div>
+      <p id="lock-notice" role="status">${lockNotice}</p>
+      <small>应用锁只隐藏界面，不加密本地 SQLite 数据库；备份密码与应用锁密码相互独立。忘记应用锁密码时目前只能在本机设置中移除后重设；Windows 身份验证重置尚未实现。</small>
     </div>
     <p>本机身份指纹（SHA-256）：<br><code class="fingerprint">${fingerprint}</code></p>
     <button data-page="about" class="outline">关于 Qbird</button>
@@ -516,6 +545,7 @@ async function createGroup(): Promise<void> {
 }
 
 function render(): void {
+  if (lockState.locked) { app.innerHTML = lockView(); return; }
   const current = pages[page];
   app.innerHTML = `
     <div class="shell">
@@ -527,14 +557,14 @@ function render(): void {
           <button data-page="discover" class="${page === 'discover' ? 'active' : ''}" aria-label="发现" title="发现">${icon('discover')}</button>
         </nav>
         <span class="rail-brand">Qbird</span>
-        <button class="rail-bottom" disabled aria-label="临时离开锁定（待实现）" title="临时离开锁定（待实现）">${icon('lock')}</button>
+        <button class="rail-bottom" data-action="lock-now" aria-label="临时离开锁定" title="临时离开锁定">${icon('lock')}</button>
         <button class="rail-bottom" data-action="menu" aria-label="更多" aria-expanded="${menuOpen}" title="更多">${icon('menu')}</button>
       </aside>
       ${menuOpen ? '<div class="menu" role="menu"><button data-page="settings" role="menuitem">设置</button><button data-page="about" role="menuitem">关于</button><span>备份与还原 · 待实现</span></div>' : ''}
       <aside class="sidebar">
         <div class="team"><span class="team-mark">${icon('spark')}</span><div><strong>Qbird 青鸟</strong><small>LOCAL NETWORK MESSENGER</small></div></div>
         <div class="side-heading"><div><span class="eyebrow">${current.eyebrow}</span><h1>${current.title}</h1></div></div>
-        ${page === 'settings' || page === 'about' ? `<div class="settings-links"><button data-page="settings" class="${page === 'settings' ? 'selected' : ''}">常规与网络</button><button data-page="about" class="${page === 'about' ? 'selected' : ''}">关于</button></div>` : page === 'messages' ? '<div id="conversation-list" class="conversation-list">正在读取…</div>' : '<div class="side-empty">暂无内容</div>'}
+        ${page === 'settings' || page === 'about' ? `<div class="settings-links"><button data-page="settings" class="${page === 'settings' ? 'selected' : ''}">常规与网络</button><button data-page="about" class="${page === 'about' ? 'selected' : ''}">关于</button></div>` : page === 'messages' ? `<div class="side-search"><input id="global-search" type="search" maxlength="200" placeholder="搜索全部消息" aria-label="搜索全部消息" value="${searchQuery.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;')}"></div><div id="search-results" class="search-hits" hidden></div><div id="conversation-list" class="conversation-list">正在读取…</div>` : '<div class="side-empty">暂无内容</div>'}
         <div class="side-foot"><span class="dot"></span>开发中 · 本地桌面版</div>
       </aside>
       <main class="workspace">
@@ -546,6 +576,7 @@ function render(): void {
   if (page === 'profile') void refreshProfile();
   if (page === 'messages') {
     void refreshConversations();
+    paintSearchList();
     if (direct.peer) direct.render();
     if (selfOpen) {
       const input = app.querySelector<HTMLTextAreaElement>('#self-input'); if (input) input.value = selfDraft;
@@ -640,6 +671,193 @@ async function refreshProbeStatus(): Promise<void> {
   if (page === 'discover') paintDiscovery();
 }
 
+function lockView(): string {
+  return `<div class="lock-screen"><section class="card lock-card" aria-label="应用已锁定">
+    <span class="eyebrow">LOCKED / 已锁定</span><h2>Qbird 青鸟</h2>
+    ${lockState.has_password
+      ? '<label for="lock-password">应用锁密码</label><input id="lock-password" type="password" maxlength="128" autocomplete="current-password">'
+      : '<p>此应用锁未设置密码，点击下方按钮返回。</p>'}
+    <div class="probe-row"><button data-action="unlock" ${lockBusy ? 'disabled' : ''}>解锁</button></div>
+    <p id="lock-status" role="status">${lockNotice}</p>
+    <small>应用锁只隐藏界面，不加密本地数据库。</small>
+  </section></div>`;
+}
+
+async function initLock(): Promise<void> {
+  if (!isTauri()) { lockInitialized = true; return; }
+  try { lockState = await invoke<LockStatus>('v1_lock_status'); }
+  catch { lockNotice = '无法读取应用锁状态'; }
+  lockInitialized = true;
+  if (lockState.locked) render();
+}
+
+async function lockNow(): Promise<void> {
+  if (!isTauri()) return;
+  try { lockState = await invoke<LockStatus>('v1_lock_now'); lockNotice = ''; render(); }
+  catch { /* Keep the current screen when the backend is unavailable. */ }
+}
+
+/// Automatic locking prefers OS idle time, so Qbird still locks while unfocused or
+/// minimized; the local activity clock is only a fallback when the system cannot report.
+async function checkIdleLock(): Promise<void> {
+  if (!lockInitialized || lockState.locked || lockState.idle_minutes <= 0) return;
+  let idleSeconds: number | null = null;
+  if (isTauri()) {
+    try { idleSeconds = await invoke<number | null>('v1_system_idle_seconds'); } catch { idleSeconds = null; }
+  }
+  const idle = idleSeconds ?? (Date.now() - lastActivity) / 1000;
+  if (idle >= lockState.idle_minutes * 60) void lockNow();
+}
+
+async function unlockApp(): Promise<void> {
+  if (!isTauri() || lockBusy) return;
+  const password = app.querySelector<HTMLInputElement>('#lock-password')?.value ?? '';
+  lockBusy = true;
+  try {
+    lockState = await invoke<LockStatus>('v1_unlock', { password: password || null });
+    lockNotice = ''; lastActivity = Date.now();
+  } catch (error) { lockNotice = typeof error === 'string' ? error : '解锁失败'; }
+  finally { lockBusy = false; render(); }
+}
+
+async function saveLockPassword(): Promise<void> {
+  if (!isTauri() || lockBusy) return;
+  const current = app.querySelector<HTMLInputElement>('#lock-current')?.value ?? '';
+  const next = app.querySelector<HTMLInputElement>('#lock-new')?.value ?? '';
+  lockBusy = true;
+  try {
+    lockState = await invoke<LockStatus>('v1_set_lock_password', { current: current || null, next });
+    lockNotice = next ? '应用锁密码已保存；下次启动或临时锁定时需要输入。' : '应用锁密码已移除。';
+  } catch (error) { lockNotice = typeof error === 'string' ? error : '无法保存应用锁密码'; }
+  finally { lockBusy = false; if (page === 'settings') render(); }
+}
+
+async function saveLockIdle(): Promise<void> {
+  if (!isTauri() || lockBusy) return;
+  const input = app.querySelector<HTMLInputElement>('#lock-idle');
+  const minutes = Number(input?.value ?? '0');
+  if (!Number.isInteger(minutes) || minutes < 0 || minutes > 240) { lockNotice = '请输入 0–240 之间的整数分钟'; if (page === 'settings') render(); return; }
+  lockBusy = true;
+  try {
+    lockState = await invoke<LockStatus>('v1_set_lock_idle', { minutes });
+    lockNotice = minutes ? `无操作 ${minutes} 分钟后将自动锁定。` : '空闲自动锁定已关闭。';
+  } catch (error) { lockNotice = typeof error === 'string' ? error : '无法保存空闲锁定设置'; }
+  finally { lockBusy = false; if (page === 'settings') render(); }
+}
+
+function scheduleSearch(): void {
+  paintSearchList();
+  if (searchTimer !== null) window.clearTimeout(searchTimer);
+  if (!searchQuery.trim()) { searchHits = []; searchBusy = false; searchError = ''; paintSearchList(); return; }
+  searchTimer = window.setTimeout(() => { void runSearch(); }, 300);
+}
+
+async function runSearch(): Promise<void> {
+  if (!isTauri()) return;
+  const query = searchQuery.trim();
+  if (!query) return;
+  const sequence = ++searchSeq;
+  searchBusy = true; searchError = ''; paintSearchList();
+  try {
+    const hits = await invoke<SearchHit[]>('v1_search_all', { query, category: 'all', limit: 100 });
+    if (sequence === searchSeq) searchHits = hits;
+  } catch {
+    if (sequence === searchSeq) { searchHits = []; searchError = '搜索失败，请稍后重试'; }
+  } finally {
+    if (sequence === searchSeq) { searchBusy = false; paintSearchList(); }
+  }
+}
+
+function paintSearchList(): void {
+  const results = app.querySelector<HTMLElement>('#search-results');
+  const list = app.querySelector<HTMLElement>('#conversation-list');
+  if (!results || !list) return;
+  const active = searchQuery.trim().length > 0;
+  results.hidden = !active;
+  list.hidden = active;
+  results.replaceChildren();
+  if (!active) return;
+  if (searchBusy) { results.textContent = '正在搜索…'; return; }
+  if (searchError) { results.textContent = searchError; return; }
+  if (!searchHits.length) { results.textContent = '没有匹配的消息'; return; }
+  for (const hit of searchHits) {
+    const button = document.createElement('button');
+    button.className = 'search-hit';
+    button.dataset.action = 'open-hit';
+    button.dataset.kind = hit.conversation_kind;
+    button.dataset.id = hit.conversation_id;
+    button.dataset.message = hit.message_id;
+    button.dataset.name = hit.conversation_name;
+    const head = document.createElement('strong');
+    const kindLabel = hit.conversation_kind === 'self' ? '自聊' : hit.conversation_kind === 'direct' ? '单聊' : '群聊';
+    head.textContent = `${kindLabel} · ${hit.conversation_name}`;
+    const body = document.createElement('span');
+    body.textContent = `${hit.sender_name || ''}：${hit.body}`;
+    const time = document.createElement('small');
+    time.textContent = new Date(hit.created_at * 1000).toLocaleString();
+    button.append(head, body, time);
+    results.append(button);
+  }
+}
+
+async function openSearchHit(kind: string, id: string, messageId: string, name: string): Promise<void> {
+  if (!isTauri()) return;
+  searchQuery = ''; searchHits = []; searchBusy = false; searchError = '';
+  if (kind === 'self') {
+    await openSelf();
+    await jumpSelf(messageId);
+    return;
+  }
+  if (kind === 'direct') {
+    direct.clear(); groupChat.clear(); selfOpen = false; page = 'messages';
+    await direct.open(id, name || id.slice(0, 8));
+    await direct.jumpTo(messageId);
+    return;
+  }
+  if (kind === 'group') {
+    direct.clear(); selfOpen = false; page = 'messages';
+    await groupChat.open(id, name || '群聊');
+    await groupChat.jumpTo(messageId);
+  }
+}
+
+async function jumpSelf(messageId: string): Promise<void> {
+  const found = () => selfMessages.some(message => message.id === messageId);
+  for (let page = 0; page < 20 && !found() && selfHasOlder; page += 1) {
+    const before = selfMessages.length;
+    await loadSelfMessages(true);
+    if (selfMessages.length === before) break;
+  }
+  const node = app.querySelector<HTMLElement>(`#self-messages [data-id="${messageId}"]`);
+  if (!node) { const status = app.querySelector<HTMLElement>('#self-error'); if (status) status.textContent = '该消息暂不在本机记录中'; return; }
+  node.scrollIntoView({ block: 'center' });
+  node.classList.add('jump-target');
+  window.setTimeout(() => node.classList.remove('jump-target'), 1600);
+}
+
+type ExportResult = { conversation_name: string; message_count: number; path: string };
+
+async function exportChat(kind: 'self' | 'direct' | 'group'): Promise<void> {
+  if (!isTauri()) return;
+  const id = kind === 'self' ? 'self' : kind === 'direct' ? direct.peer : groupChat.groupId;
+  const status = kind === 'self' ? '#self-error' : kind === 'direct' ? '#direct-file-status' : '#group-error';
+  if (!id) return;
+  if (!window.confirm('导出的纯文本未加密，任何能打开该文件的人都能读到内容。确认导出？')) return;
+  const date = new Date();
+  const stamp = `${date.getFullYear()}${String(date.getMonth() + 1).padStart(2, '0')}${String(date.getDate()).padStart(2, '0')}`;
+  const target = await saveFileDialog({
+    title: '导出聊天记录',
+    defaultPath: `qbird-chat-${stamp}.txt`,
+    filters: [{ name: '纯文本', extensions: ['txt'] }],
+  }).catch(() => null);
+  if (!target) return;
+  const report = (value: string) => { const node = app.querySelector<HTMLElement>(status); if (node) node.textContent = value; };
+  try {
+    const result = await invoke<ExportResult>('v1_export_chat', { kind, id, path: target });
+    report(`已导出 ${result.message_count} 条消息到 ${result.path}`);
+  } catch (error) { report(typeof error === 'string' ? error : '导出失败'); }
+}
+
 function displayError(error: unknown): string {
   return typeof error === 'string' && error.length <= 200 ? error : '操作失败，请检查网络后重试';
 }
@@ -688,6 +906,7 @@ app.addEventListener('input', (event) => {
   if (target.id === 'group-search-category') { groupChat.searchDraft('category', target.value); return; }
   if (target.id === 'backup-password') { backupPassword = target.value; return; }
   if (target.id === 'contact-search') { contactQuery = target.value; void refreshContacts(); return; }
+  if (target.id === 'global-search') { searchQuery = target.value; scheduleSearch(); return; }
 });
 app.addEventListener('keydown', (event) => {
   if (event.target instanceof HTMLTextAreaElement && event.target.id === 'direct-input' && event.key === 'Enter' && !event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey && !event.isComposing) {
@@ -753,6 +972,15 @@ app.addEventListener('click', (event) => {
   if (action?.dataset.action === 'self-send') { void sendSelf(); return; }
   if (action?.dataset.action === 'self-older') { void loadSelfMessages(true); return; }
   if (action?.dataset.action === 'menu') { menuOpen = !menuOpen; render(); return; }
+  if (action?.dataset.action === 'lock-now') { void lockNow(); return; }
+  if (action?.dataset.action === 'unlock') { void unlockApp(); return; }
+  if (action?.dataset.action === 'save-lock-password') { void saveLockPassword(); return; }
+  if (action?.dataset.action === 'save-lock-idle') { void saveLockIdle(); return; }
+  if (action?.dataset.action === 'export-text' && action.dataset.kind) { void exportChat(action.dataset.kind as 'self' | 'direct' | 'group'); return; }
+  if (action?.dataset.action === 'open-hit' && action.dataset.kind && action.dataset.id && action.dataset.message) {
+    void openSearchHit(action.dataset.kind, action.dataset.id, action.dataset.message, action.dataset.name || '');
+    return;
+  }
   if (action?.dataset.action === 'probe-start') { void setProbeService(true); return; }
   if (action?.dataset.action === 'probe-stop') { void setProbeService(false); return; }
   if (action?.dataset.action === 'probe-manual') { void probePeer(manualAddress); return; }
@@ -780,6 +1008,11 @@ app.addEventListener('click', (event) => {
   }
 });
 render();
+void initLock();
+for (const type of ['pointerdown', 'keydown', 'wheel', 'mousemove'] as const) {
+  window.addEventListener(type, () => { lastActivity = Date.now(); }, { passive: true });
+}
+window.setInterval(() => { void checkIdleLock(); }, 15_000);
 app.addEventListener('conversations-changed', () => { void refreshConversations(); });
 window.setInterval(() => {
   void refreshDiscovery(); void refreshProbeStatus();

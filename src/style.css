@@ -114,3 +114,20 @@
 .settings-card label{display:block;font-size:12px;color:#6f6257;margin-top:10px}
 .settings-card input[type=text],.settings-card input[type=password]{display:block;width:100%;padding:8px;margin:4px 0 10px;border:1px solid #ddcbbb;border-radius:8px;background:#fffdfa;color:#3f352f}
 .settings-card input[type=search]{width:100%;padding:8px;margin:4px 0 10px;border:1px solid #ddcbbb;border-radius:8px;background:#fffdfa}
+/* Global message search */
+.side-search{padding:0 14px 8px}
+.side-search input{width:100%;padding:8px 10px;border:1px solid #ddcbbb;border-radius:9px;background:#fffdfa;color:#3f352f;font:inherit;font-size:12px}
+.search-hits{padding:6px 10px;overflow:auto;min-height:0}
+.search-hit{display:grid;gap:2px;width:100%;margin:4px 0;padding:8px 10px;border:1px solid transparent;border-radius:9px;background:#f6efe7;color:#4a3d34;text-align:left;font-size:12px}
+.search-hit:hover{border-color:#dcd0c2;background:#efe4d8}
+.search-hit strong{font-size:11px;color:#8b6a52}
+.search-hit span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.search-hit small{color:#a29181;font-size:10px}
+
+/* Application lock */
+.lock-screen{display:grid;place-items:center;min-height:100vh;background:#f4eee7}
+.lock-card{max-width:360px}
+.lock-card h2{margin:4px 0 16px}
+.lock-card label{display:block;font-size:12px;color:#6f6257}
+.lock-card input{display:block;width:100%;padding:9px;margin:4px 0 12px;border:1px solid #ddcbbb;border-radius:8px;background:#fffdfa;color:#3f352f}
+.lock-card p{font-size:12px;color:#877668;line-height:1.7}

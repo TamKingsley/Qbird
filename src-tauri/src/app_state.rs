@@ -13,6 +13,8 @@ pub struct AppState {
     outbound_probe: Arc<AtomicBool>,
     outbound_chat: Arc<AtomicBool>,
     last_outbound_fingerprint: Arc<Mutex<Option<String>>>,
+    /// Application lock state; set at startup when a lock password exists.
+    locked: AtomicBool,
 }
 
 #[tauri::command]
@@ -347,7 +349,9 @@ impl AppState {
         }
         let identity = Arc::new(Identity::load_or_create(&identity_path)?);
         let store = Store::open(&database_path)?;
-        Ok(Self { identity, store: Arc::new(Mutex::new(store)), discovery: Mutex::new(None), probe_service: Mutex::new(None), retry_queue: Mutex::new(None), outbound_probe: Arc::new(AtomicBool::new(false)), outbound_chat: Arc::new(AtomicBool::new(false)), last_outbound_fingerprint: Arc::new(Mutex::new(None)) })
+        // A configured lock always starts locked, even after a crash.
+        let locked = crate::lock::is_configured(&store).unwrap_or(false);
+        Ok(Self { identity, store: Arc::new(Mutex::new(store)), discovery: Mutex::new(None), probe_service: Mutex::new(None), retry_queue: Mutex::new(None), outbound_probe: Arc::new(AtomicBool::new(false)), outbound_chat: Arc::new(AtomicBool::new(false)), last_outbound_fingerprint: Arc::new(Mutex::new(None)), locked: AtomicBool::new(locked) })
     }
 }
 
@@ -424,6 +428,117 @@ pub fn v1_send_self(state: tauri::State<'_, AppState>, body: String) -> Result<c
     let created_at = i64::try_from(now).map_err(|_| "系统时间无效".to_owned())?;
     state.store.lock().map_err(|_| "本地存储不可用".to_owned())?.send_self(&state.identity.fingerprint(), &body, created_at)
         .map_err(|_| "消息为空、过长或无法保存".to_owned())
+}
+
+/// One row of the cross-conversation search.
+#[tauri::command]
+pub fn v1_search_all(state: tauri::State<'_, AppState>, query: String, category: String, limit: u32)
+    -> Result<Vec<crate::storage::SearchHit>, String> {
+    state.store.lock().map_err(|_| "本地存储不可用".to_owned())?
+        .search_all(&state.identity.fingerprint(), &query, &category, limit)
+        .map_err(|_| "搜索条件无效".to_owned())
+}
+
+#[derive(serde::Serialize)]
+pub struct ExportResult {
+    pub conversation_name: String,
+    pub message_count: u64,
+    pub path: String,
+}
+
+/// Writes a plain-text transcript chosen by the user. The text is unencrypted,
+/// so the UI must ask before exporting and mention that in its confirmation.
+#[tauri::command]
+pub fn v1_export_chat(state: tauri::State<'_, AppState>, kind: String, id: String, path: String)
+    -> Result<ExportResult, String> {
+    if path.is_empty() || path.len() > 4096 || path.contains('\0') {
+        return Err("导出路径无效".into());
+    }
+    let export = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?
+        .export_conversation(&state.identity.fingerprint(), &kind, &id)
+        .map_err(|_| "会话不可导出：可能不存在、已退出该群或消息数量过多".to_owned())?;
+    if export.text.len() > 64 * 1024 * 1024 {
+        return Err("聊天记录过大，暂不支持一次导出".into());
+    }
+    std::fs::write(&path, export.text.as_bytes()).map_err(|_| "无法写入导出文件".to_owned())?;
+    Ok(ExportResult { conversation_name: export.conversation_name, message_count: export.message_count, path })
+}
+
+#[derive(serde::Serialize)]
+pub struct LockStatus {
+    pub has_password: bool,
+    pub locked: bool,
+    pub idle_minutes: u32,
+}
+
+fn lock_status(state: &tauri::State<'_, AppState>) -> Result<LockStatus, String> {
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    Ok(LockStatus {
+        has_password: crate::lock::is_configured(&store)?,
+        locked: state.locked.load(Ordering::Acquire),
+        idle_minutes: crate::lock::idle_minutes(&store)?,
+    })
+}
+
+/// Raw OS idle time in seconds; the UI uses it so automatic locking also works
+/// when Qbird is unfocused or minimized.
+#[tauri::command]
+pub fn v1_system_idle_seconds() -> Option<u64> {
+    crate::lock::system_idle_seconds()
+}
+#[tauri::command]
+pub fn v1_lock_status(state: tauri::State<'_, AppState>) -> Result<LockStatus, String> {
+    lock_status(&state)
+}
+
+#[tauri::command]
+pub fn v1_lock_now(state: tauri::State<'_, AppState>) -> Result<LockStatus, String> {
+    state.locked.store(true, Ordering::Release);
+    lock_status(&state)
+}
+
+/// Requires the current password when one exists. An empty `next` removes the lock.
+#[tauri::command]
+pub fn v1_set_lock_password(state: tauri::State<'_, AppState>, current: Option<String>, next: String)
+    -> Result<LockStatus, String> {
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    if crate::lock::is_configured(&store)? {
+        let Some(current) = current.filter(|value| !value.is_empty()) else {
+            return Err("请输入当前应用锁密码".into());
+        };
+        if !crate::lock::verify(&store, &current)? { return Err("当前应用锁密码错误".into()); }
+    }
+    if next.is_empty() {
+        crate::lock::remove_password(&store)?;
+        state.locked.store(false, Ordering::Release);
+    } else {
+        crate::lock::set_password(&store, &next)?;
+    }
+    drop(store);
+    lock_status(&state)
+}
+
+/// Unlocking without a configured password is allowed; the lock then only hides the UI.
+#[tauri::command]
+pub fn v1_unlock(state: tauri::State<'_, AppState>, password: Option<String>) -> Result<LockStatus, String> {
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    if crate::lock::is_configured(&store)? {
+        let password = password.unwrap_or_default();
+        if !crate::lock::verify(&store, &password)? { return Err("应用锁密码错误".into()); }
+    }
+    drop(store);
+    state.locked.store(false, Ordering::Release);
+    lock_status(&state)
+}
+
+#[tauri::command]
+pub fn v1_set_lock_idle(state: tauri::State<'_, AppState>, minutes: u32) -> Result<LockStatus, String> {
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    if !crate::lock::set_idle_minutes(&store, minutes)? {
+        return Err(format!("空闲锁定时间需为 0–{} 分钟（0 表示关闭）", crate::lock::MAX_IDLE_MINUTES));
+    }
+    drop(store);
+    lock_status(&state)
 }
 
 fn unix_now() -> Result<i64, String> {

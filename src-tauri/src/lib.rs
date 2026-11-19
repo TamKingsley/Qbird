@@ -7,6 +7,7 @@ pub mod chat_transport;
 pub mod discovery;
 pub mod files;
 pub mod identity;
+pub mod lock;
 pub mod probe;
 pub mod probe_service;
 pub mod protocol;
@@ -75,6 +76,14 @@ pub fn run() {
             app_state::v1_dissolve_group,
             app_state::v1_search_direct,
             app_state::v1_search_group,
+            app_state::v1_search_all,
+            app_state::v1_export_chat,
+            app_state::v1_system_idle_seconds,
+            app_state::v1_lock_status,
+            app_state::v1_lock_now,
+            app_state::v1_set_lock_password,
+            app_state::v1_set_lock_idle,
+            app_state::v1_unlock,
             app_state::v1_list_group,
             app_state::v1_add_group_member,
             app_state::v1_remove_group_member,

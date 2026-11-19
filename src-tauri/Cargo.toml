@@ -1,6 +1,6 @@
 [package]
 name = "qbird"
-version = "0.1.8"
+version = "0.1.9"
 edition = "2021"
 description = "Local-first LAN chat"
 license = "Apache-2.0"
@@ -27,7 +27,7 @@ rustls = { version = "=0.23.46", default-features = false, features = ["ring", "
 x509-parser = "=0.18.1"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_System_SystemInformation", "Win32_UI_Input_KeyboardAndMouse"] }
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]
