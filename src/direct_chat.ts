@@ -1,5 +1,6 @@
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
+import { showImage } from './image_viewer';
 
 type DirectMessage = {
   id: string; peer: string; sender: string; body: string; created_at: number; logical: number;
@@ -44,13 +45,12 @@ export class DirectChat {
     return `<section class="self-chat" aria-label="单聊">
       <header class="chat-header"><div><strong id="direct-name"></strong><small>端到端加密 · 指纹已确认</small></div><div class="group-actions"><button class="outline" data-action="export-text" data-kind="direct">导出文本</button><button class="outline" data-action="hide-direct">不显示此会话</button></div></header>
       <div class="chat-history" id="direct-history" aria-label="单聊记录"><div class="direct-address"><label for="direct-address">联系人地址（仅连接提示）</label><div class="probe-row"><input id="direct-address" type="text" placeholder="192.168.1.8:42853"><button class="outline" data-action="save-direct-address">保存地址</button></div><small>地址不代表身份，连接时仍核对指纹。请在发现页面启动聊天服务；离线消息与文件须双方同时在线才能补发或续传。</small><p id="direct-address-status" role="status"></p></div><button class="load-older" data-action="direct-older" hidden>加载更早消息</button><div id="direct-messages"></div></div>
-      <div class="chat-compose"><label for="direct-input">消息</label><textarea id="direct-input" rows="3" maxlength="32768" placeholder="写点什么，或把文件/图片拖进窗口…"></textarea><div class="compose-footer"><span>Enter 发送 · Shift+Enter 换行</span><div class="compose-actions"><button class="outline" data-action="direct-image">发送图片</button><button class="outline" data-action="direct-file">发送文件</button><button data-action="direct-send">发送</button></div></div><p id="direct-file-status" role="status"></p><p id="direct-error" role="status"></p></div>
+      <div class="chat-compose"><label for="direct-input">消息</label><textarea id="direct-input" rows="3" maxlength="32768" placeholder="写点什么，或把文件/图片拖进窗口…"></textarea><div class="compose-footer"><span>Enter 发送 · Shift+Enter 换行</span><div class="compose-actions"><button class="outline" data-action="direct-image">发送图片</button><button class="outline" data-action="direct-file">发送文件</button><button class="outline" data-action="direct-screenshot">截图</button><button data-action="direct-send">发送</button></div></div><p id="direct-file-status" role="status"></p><p id="direct-error" role="status"></p></div>
       <aside class="file-panel" id="direct-panel" hidden aria-label="文件预览">
         <div class="panel-resizer" data-role="panel-resizer" aria-hidden="true"></div>
         <header class="panel-header"><strong id="panel-title"></strong><div class="panel-actions"><button class="outline" data-action="panel-reveal">打开所在目录</button><button class="outline" data-action="panel-close">关闭</button></div></header>
         <div class="panel-body" id="panel-body"></div>
       </aside>
-      <div class="lightbox" id="direct-lightbox" hidden></div>
     </section>`;
   }
 
@@ -356,18 +356,8 @@ export class DirectChat {
     if (!url || !holder || holder.firstChild) return;
     const image = document.createElement('img');
     image.src = url; image.alt = '聊天图片'; image.className = 'message-image';
-    image.addEventListener('click', () => this.openLightbox(url));
+    image.addEventListener('click', () => showImage(url, '聊天图片'));
     holder.append(image);
-  }
-
-  private openLightbox(url: string): void {
-    const box = this.root.querySelector<HTMLElement>('#direct-lightbox');
-    if (!box) return;
-    box.replaceChildren();
-    const image = document.createElement('img'); image.src = url; image.alt = '图片预览';
-    box.append(image);
-    box.hidden = false;
-    box.onclick = () => { box.hidden = true; box.replaceChildren(); };
   }
 
   private paint(mode: 'bottom' | 'preserve' | 'auto'): void {

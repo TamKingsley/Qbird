@@ -412,6 +412,44 @@ pub fn v1_set_profile(state: tauri::State<'_, AppState>, nickname: String, email
     store.get_profile().map_err(|_| "无法读取个人资料".to_owned())
 }
 
+#[derive(serde::Serialize)]
+pub struct ScreenCaptureResult {
+    pub data_url: String,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Captures the primary screen; the UI crops a region and sends it back as an image.
+#[tauri::command]
+pub async fn v1_capture_screen() -> Result<ScreenCaptureResult, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        crate::capture::capture().map(|capture| ScreenCaptureResult {
+            data_url: capture.data_url, width: capture.width, height: capture.height,
+        })
+    }).await.map_err(|_| "截图任务异常".to_owned())?
+}
+
+/// Saves a cropped PNG/BMP into the app temp folder and returns its path.
+#[tauri::command]
+pub fn v1_save_temp_image(state: tauri::State<'_, AppState>, bytes: Vec<u8>, extension: String) -> Result<String, String> {
+    if bytes.is_empty() || bytes.len() > 16 * 1024 * 1024 { return Err("图片大小无效".into()); }
+    let is_png = bytes.len() > 8 && bytes[..8] == [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    let is_bmp = bytes.len() > 2 && &bytes[..2] == b"BM";
+    let extension = match extension.as_str() {
+        "png" if is_png => "png",
+        "bmp" if is_bmp => "bmp",
+        _ => return Err("图片内容与格式不符".into()),
+    };
+    let dir = state.data_dir.join("temp");
+    std::fs::create_dir_all(&dir).map_err(|_| "无法创建临时目录".to_owned())?;
+    let now = unix_now()?;
+    let name = format!("shot-{}-{}-{}.{}", std::process::id(), now,
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0), extension);
+    let path = dir.join(name);
+    std::fs::write(&path, &bytes).map_err(|_| "无法保存截图".to_owned())?;
+    path.to_str().map(str::to_owned).ok_or_else(|| "截图路径无效".to_owned())
+}
+
 /// Experimental switches; each defaults to off and is stored as "0"/"1".
 #[derive(serde::Serialize)]
 pub struct ExperimentSettings {

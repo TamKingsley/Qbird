@@ -4,6 +4,7 @@ pub mod avatar;
 pub mod backup;
 mod auto_address;
 pub mod certificate;
+pub mod capture;
 pub mod chat_transport;
 pub mod discovery;
 pub mod files;
@@ -38,6 +39,8 @@ pub fn run() {
             app_state::v1_profile,
             app_state::v1_set_profile,
             app_state::v1_network_settings,
+            app_state::v1_capture_screen,
+            app_state::v1_save_temp_image,
             app_state::v1_experiment_settings,
             app_state::v1_set_experiment_settings,
             app_state::v1_scan_blacklist,

@@ -1,5 +1,6 @@
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
+import { showImage } from './image_viewer';
 
 type GroupMessage = {
   id: string; group_id: string; sender: string; sender_name: string; body: string;
@@ -72,7 +73,7 @@ export class GroupChat {
         <label for="group-input">消息</label>
         <textarea id="group-input" rows="3" maxlength="32768" placeholder="发消息给群里的人…输入 @ 可选择成员"></textarea>
         <div class="mention-picker" id="mention-picker" hidden></div>
-        <div class="compose-footer"><span>Enter 发送 · Shift+Enter 换行</span><div class="compose-actions"><button class="outline" data-action="group-image">发送图片</button><button class="outline" data-action="group-file">发送文件</button><button data-action="group-send">发送</button></div></div>
+        <div class="compose-footer"><span>Enter 发送 · Shift+Enter 换行</span><div class="compose-actions"><button class="outline" data-action="group-image">发送图片</button><button class="outline" data-action="group-file">发送文件</button><button class="outline" data-action="group-screenshot">截图</button><button data-action="group-send">发送</button></div></div>
         <p id="group-file-status" role="status"></p>
         <p id="group-error" role="status"></p>
       </div>
@@ -583,7 +584,9 @@ export class GroupChat {
         const card = document.createElement('div'); card.className = 'file-card';
         if (this.isImageMessage(message) && this.thumbs.has(message.id)) {
           const image = document.createElement('img'); image.className = 'file-thumb'; image.src = this.thumbs.get(message.id) ?? '';
-          image.alt = message.file_name ?? '图片'; card.append(image);
+          image.alt = message.file_name ?? '图片';
+          image.addEventListener('click', () => showImage(image.src, message.file_name ?? '图片'));
+          card.append(image);
           this.loadThumbnail(message.id);
         } else if (this.isImageMessage(message) && message.file_status === 'completed') {
           this.loadThumbnail(message.id);

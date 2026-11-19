@@ -5,6 +5,7 @@ import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { version as appVersion } from '../package.json';
 import { DirectChat } from './direct_chat';
 import { GroupChat } from './group_chat';
+import { captureRegion } from './screenshot';
 
 type Page = 'messages' | 'contacts' | 'discover' | 'settings' | 'about' | 'profile';
 const root = document.querySelector<HTMLDivElement>('#app');
@@ -661,6 +662,17 @@ function experimentalSettingsHtml(): string {
       <p id="experiment-notice" role="status">${experimentNotice}</p>
       <small>插件接口与 Agent 能力仍未实现，不会显示为可操作开关。</small>
     </div>`;
+}
+
+async function takeScreenshot(): Promise<void> {
+  if (!isTauri()) return;
+  try {
+    const path = await captureRegion();
+    if (!path) return;
+    if (direct.peer) await direct.queuePaths([path]);
+    else if (groupChat.groupId) await groupChat.queuePaths([path]);
+    else groupChat.notify('请先打开一个单聊或群聊再截图。');
+  } catch (error) { groupChat.notify(displayError(error)); }
 }
 
 async function refreshExperiments(): Promise<void> {
@@ -1383,6 +1395,7 @@ app.addEventListener('click', (event) => {
   if (action?.dataset.action === 'save-direct-address') { void direct.saveAddress(); return; }
   if (action?.dataset.action === 'group-send') { void groupChat.send(); return; }
   if (action?.dataset.action === 'group-image') { void groupChat.pick('image'); return; }
+  if (action?.dataset.action === 'direct-screenshot' || action?.dataset.action === 'group-screenshot') { void takeScreenshot(); return; }
   if (action?.dataset.action === 'group-file') { void groupChat.pick('file'); return; }
   if (action?.dataset.action === 'group-reveal-file' && action.dataset.id) {
     void invoke('v1_reveal_group_attachment', { groupId: groupChat.groupId, messageId: action.dataset.id })
