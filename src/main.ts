@@ -1,6 +1,8 @@
 import './style.css';
 import { invoke, isTauri } from '@tauri-apps/api/core';
+import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { version as appVersion } from '../package.json';
+import { DirectChat } from './direct_chat';
 
 type Page = 'messages' | 'contacts' | 'discover' | 'settings' | 'about';
 const root = document.querySelector<HTMLDivElement>('#app');
@@ -32,6 +34,7 @@ let selfMessages: LocalMessage[] = [];
 let selfHasOlder = false;
 let selfBusy = false;
 let selfDraft = '';
+const direct = new DirectChat(app, () => { selfOpen = false; page = 'messages'; menuOpen = false; render(); });
 
 const icons = {
   messages: '<path d="M4 5.75A2.75 2.75 0 0 1 6.75 3h10.5A2.75 2.75 0 0 1 20 5.75v7.5A2.75 2.75 0 0 1 17.25 16H10l-4.5 3v-3.25A2.75 2.75 0 0 1 4 13.25z"/>',
@@ -51,6 +54,7 @@ async function openSelf(): Promise<void> {
   if (!isTauri() || selfBusy) return;
   try {
     await invoke('v1_open_self');
+    direct.clear();
     selfOpen = true; page = 'messages'; menuOpen = false; selfMessages = []; selfHasOlder = false;
     render();
     await loadSelfMessages(false);
@@ -89,16 +93,18 @@ async function refreshConversations(): Promise<void> {
   if (!list) return;
   if (!isTauri()) { list.textContent = '请在桌面应用中查看会话'; return; }
   try {
-    const conversations = await invoke<Conversation[]>('v1_list_conversations');
+    const [conversations, contacts] = await Promise.all([invoke<Conversation[]>('v1_list_conversations'), invoke<Contact[]>('v1_list_contacts')]);
     if (!list.isConnected) return;
     list.replaceChildren();
     if (!conversations.length) { list.textContent = '暂无会话'; return; }
     for (const conversation of conversations) {
-      if (conversation.id !== 'self') continue;
+      const contact = contacts.find(item => item.fingerprint === conversation.id && item.trust_state === 'verified');
+      if (conversation.id !== 'self' && !contact) continue;
       const button = document.createElement('button');
-      button.className = `conversation-row${selfOpen ? ' selected' : ''}`;
-      button.dataset.action = 'open-self';
-      const name = document.createElement('strong'); name.textContent = '自己';
+      button.className = `conversation-row${conversation.id === 'self' ? (selfOpen ? ' selected' : '') : (direct.peer === conversation.id ? ' selected' : '')}`;
+      button.dataset.action = conversation.id === 'self' ? 'open-self' : 'open-direct';
+      if (contact) { button.dataset.peer = contact.fingerprint; button.dataset.name = contact.display_name; }
+      const name = document.createElement('strong'); name.textContent = contact?.display_name ?? '自己';
       const preview = document.createElement('span'); preview.textContent = conversation.last_body;
       button.append(name, preview); list.append(button);
     }
@@ -142,7 +148,7 @@ function selfChatView(): string {
 }
 
 const pages: Record<Page, { title: string; eyebrow: string; heading: string; copy: string }> = {
-  messages: { title: '消息', eyebrow: 'MESSAGES', heading: '还没有会话', copy: '可信联系人和加密单聊正在开发中。' },
+  messages: { title: '消息', eyebrow: 'MESSAGES', heading: '还没有会话', copy: '从联系人打开自聊或已确认的单聊。' },
   contacts: { title: '联系人', eyebrow: 'CONTACTS', heading: '联系人', copy: '联系人管理功能正在开发中。' },
   discover: { title: '发现', eyebrow: 'DISCOVERY', heading: '局域网发现', copy: '仅浏览同网段 IPv4 mDNS 服务；发现结果未经身份验证，不代表可信联系人。' },
   settings: { title: '设置', eyebrow: 'PREFERENCES', heading: '设置', copy: '网络、隐私、备份和应用锁功能将在后续阶段开放。' },
@@ -152,9 +158,9 @@ const pages: Record<Page, { title: string; eyebrow: string; heading: string; cop
 function discoveryView(): string {
   return `<section class="discovery-panel card">
     <span class="eyebrow">DISCOVERY / 发现</span><h2>局域网身份探测</h2>
-    <p>探测仅证明对方持有密钥，不会自动建立信任。双方须分别通过独立可靠渠道核对完整指纹；聊天仍待实现。</p>
-    <div class="probe-box"><label for="probe-port">本机监听端口</label><div class="probe-row"><input id="probe-port" type="number" min="1" max="65535" aria-label="本机监听端口"><button class="outline" data-action="probe-start">启动探测服务</button><button class="outline" data-action="probe-stop">停止</button></div>
-    <p id="probe-status" aria-live="polite"></p><small>仅本次生效；启动后才发布 mDNS 探测服务，不提供聊天。</small></div>
+    <p>探测仅证明对方持有密钥，不会自动建立信任。双方须分别通过独立可靠渠道核对完整指纹。</p>
+    <div class="probe-box"><label for="probe-port">本机监听端口</label><div class="probe-row"><input id="probe-port" type="number" min="1" max="65535" aria-label="本机监听端口"><button class="outline" data-action="probe-start">启动聊天和探测</button><button class="outline" data-action="probe-stop">停止</button></div>
+    <p id="probe-status" aria-live="polite"></p><small>端口仅本次生效；启动后提供探测、聊天及待发消息重试。停止后待发消息保留在本机。</small></div>
     <div class="probe-box"><label for="probe-address">手动地址</label><div class="probe-row"><input id="probe-address" type="text" placeholder="192.168.1.8:42853" aria-label="手动地址"><button class="outline" data-action="probe-manual">探测指纹</button></div><p id="probe-message" aria-live="polite"></p>
     <p>本机指纹：<br><code id="local-fingerprint" class="fingerprint"></code></p><p>对方指纹（未确认）：<br><span id="remote-target"></span><br><code id="remote-fingerprint" class="fingerprint"></code></p><button class="outline" data-action="select-outbound">选择此指纹核对</button></div>
     <p id="discovery-status" aria-live="polite"></p><ul id="discovery-results" class="discovery-results"></ul>
@@ -192,7 +198,7 @@ async function confirmContact(): Promise<void> {
   if (button) button.disabled = true;
   try {
     await invoke('v1_confirm_contact', { fingerprint: selectedFingerprint, checkedFingerprint: checked, displayName: name });
-    message.textContent = '联系人已在本机确认；对方仍须单独确认你的指纹。聊天待实现。';
+    message.textContent = '联系人已在本机确认；对方仍须单独确认你的指纹。';
   } catch (error) { message.textContent = displayError(error); }
   finally { if (button) button.disabled = false; }
 }
@@ -210,6 +216,11 @@ async function refreshContacts(): Promise<void> {
     for (const contact of contacts) {
       const item = document.createElement('li');
       item.textContent = `${contact.display_name} · ${contact.trust_state === 'verified' ? '已确认' : '待确认'} · ${contact.fingerprint}`;
+      if (contact.trust_state === 'verified') {
+        const button = document.createElement('button'); button.className = 'outline'; button.textContent = '打开单聊';
+        button.dataset.action = 'open-direct'; button.dataset.peer = contact.fingerprint; button.dataset.name = contact.display_name;
+        item.append(button);
+      }
       list.append(item);
     }
   } catch { if (status.isConnected) status.textContent = '无法读取联系人'; }
@@ -238,12 +249,13 @@ function render(): void {
         <div class="side-foot"><span class="dot"></span>开发中 · 本地桌面版</div>
       </aside>
       <main class="workspace">
-        ${page === 'messages' && selfOpen ? selfChatView() : page === 'discover' ? discoveryView() : page === 'contacts' ? `<section class="discovery-panel card"><h2>联系人</h2><button class="self-contact" data-action="open-self" ${isTauri() ? '' : 'disabled'}><strong>自己</strong><span>打开本地自聊</span></button><p>已确认的联系人保存在本机；与他人聊天待实现。</p><p id="contacts-status" aria-live="polite"></p><ul id="contacts-list" class="discovery-results"></ul></section>` : page === 'about' ? `<section class="card about"><span class="eyebrow">ABOUT / 关于</span><h2>Qbird 青鸟</h2><p>面向局域网的本地优先聊天与文件交流工具。</p><dl><div><dt>当前阶段</dt><dd>Windows 开发版 ${appVersion}</dd></div><div><dt>许可证</dt><dd>Apache License 2.0</dd></div><div><dt>平台规划</dt><dd>Windows 首发 · 后续 Linux / macOS</dd></div></dl><p class="notice">身份须经独立可靠渠道核对；与他人聊天尚未接入。本地数据库未加密。</p></section>` : `<section class="empty"><div class="empty-mark">${icon(page === 'settings' ? 'settings' : 'spark')}</div><h2>${current.heading}</h2><p>${current.copy}</p>${page === 'settings' ? `<p>本机身份指纹（SHA-256）：<br><code class="fingerprint">${fingerprint}</code></p><button data-page="about" class="outline">关于 Qbird</button>` : ''}</section>`}
+        ${page === 'messages' && direct.peer ? direct.view() : page === 'messages' && selfOpen ? selfChatView() : page === 'discover' ? discoveryView() : page === 'contacts' ? `<section class="discovery-panel card"><h2>联系人</h2><button class="self-contact" data-action="open-self" ${isTauri() ? '' : 'disabled'}><strong>自己</strong><span>打开本地自聊</span></button><p>已确认的联系人保存在本机；双方须各自核对指纹后才能聊天。</p><p id="contacts-status" aria-live="polite"></p><ul id="contacts-list" class="discovery-results"></ul></section>` : page === 'about' ? `<section class="card about"><span class="eyebrow">ABOUT / 关于</span><h2>Qbird 青鸟</h2><p>面向局域网的本地优先聊天与文件交流工具。</p><dl><div><dt>当前阶段</dt><dd>Windows 开发版 ${appVersion}</dd></div><div><dt>许可证</dt><dd>Apache License 2.0</dd></div><div><dt>平台规划</dt><dd>Windows 首发 · 后续 Linux / macOS</dd></div></dl><p class="notice">开发版未经安全审计，本地数据库未加密。</p></section>` : `<section class="empty"><div class="empty-mark">${icon(page === 'settings' ? 'settings' : 'spark')}</div><h2>${current.heading}</h2><p>${current.copy}</p>${page === 'settings' ? `<p>本机身份指纹（SHA-256）：<br><code class="fingerprint">${fingerprint}</code></p><button data-page="about" class="outline">关于 Qbird</button>` : ''}</section>`}
       </main>
     </div>`;
   if (page === 'discover') paintDiscovery();
   if (page === 'messages') {
     void refreshConversations();
+    if (direct.peer) direct.render();
     if (selfOpen) {
       const input = app.querySelector<HTMLTextAreaElement>('#self-input'); if (input) input.value = selfDraft;
       paintSelfMessages('bottom');
@@ -332,7 +344,7 @@ async function refreshProbeStatus(): Promise<void> {
   if (!isTauri() || page !== 'discover') return;
   try {
     probeStatus = await invoke<ProbeStatus>('v1_probe_status');
-    probeNotice = probeStatus.running ? `探测监听中：TCP ${probeStatus.port}` : probeStatus.port !== null ? '监听异常停止，请先停止再重试' : '探测服务未启动';
+    probeNotice = probeStatus.running ? `聊天与探测监听中：TCP ${probeStatus.port}` : probeStatus.port !== null ? '监听异常停止，请先停止再重试' : '聊天与探测服务未启动';
   } catch { probeNotice = '无法读取探测服务状态'; }
   if (page === 'discover') paintDiscovery();
 }
@@ -349,7 +361,7 @@ async function setProbeService(start: boolean): Promise<void> {
   }
   probeBusy = true; probeMessage = ''; paintDiscovery();
   try {
-    if (start) await invoke('v1_start_probe_service', { port });
+    if (start) await invoke('v1_start_chat_service', { port });
     else await invoke('v1_stop_probe_service');
     await refreshProbeStatus();
   } catch (error) { probeMessage = displayError(error); }
@@ -373,12 +385,17 @@ async function probePeer(address: string): Promise<void> {
 
 app.addEventListener('input', (event) => {
   const target = event.target;
+  if (target instanceof HTMLTextAreaElement && target.id === 'direct-input') { direct.draft(target.value); return; }
   if (target instanceof HTMLTextAreaElement && target.id === 'self-input') { selfDraft = target.value; return; }
   if (!(target instanceof HTMLInputElement)) return;
+  if (target.id === 'direct-address') { direct.addressDraft(target.value); return; }
   if (target.id === 'probe-port') probePort = target.value;
   if (target.id === 'probe-address') { manualAddress = target.value; remoteFingerprint = ''; observedAddress = ''; paintDiscovery(); }
 });
 app.addEventListener('keydown', (event) => {
+  if (event.target instanceof HTMLTextAreaElement && event.target.id === 'direct-input' && event.key === 'Enter' && !event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey && !event.isComposing) {
+    event.preventDefault(); void direct.send(); return;
+  }
   if (event.target instanceof HTMLTextAreaElement && event.target.id === 'self-input' && event.key === 'Enter' && !event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey && !event.isComposing) {
     event.preventDefault(); void sendSelf();
   }
@@ -387,6 +404,17 @@ app.addEventListener('click', (event) => {
   const target = event.target;
   if (!(target instanceof Element)) return;
   const action = target.closest<HTMLButtonElement>('button[data-action]');
+  if (action?.dataset.action === 'open-direct' && action.dataset.peer) {
+    void direct.open(action.dataset.peer, action.dataset.name || action.dataset.peer).catch(error => {
+      const status = app.querySelector<HTMLElement>('#contacts-status'); if (status) status.textContent = displayError(error);
+    }); return;
+  }
+  if (action?.dataset.action === 'hide-direct') { void direct.hide(); return; }
+  if (action?.dataset.action === 'direct-send') { void direct.send(); return; }
+  if (action?.dataset.action === 'direct-image') { void direct.pick('image'); return; }
+  if (action?.dataset.action === 'direct-file') { void direct.pick('file'); return; }
+  if (action?.dataset.action === 'direct-older') { void direct.load(true); return; }
+  if (action?.dataset.action === 'save-direct-address') { void direct.saveAddress(); return; }
   if (action?.dataset.action === 'open-self') { void openSelf(); return; }
   if (action?.dataset.action === 'hide-self') { void hideSelf(); return; }
   if (action?.dataset.action === 'self-send') { void sendSelf(); return; }
@@ -409,8 +437,18 @@ app.addEventListener('click', (event) => {
   }
 });
 render();
-window.setInterval(() => { void refreshDiscovery(); void refreshProbeStatus(); }, 4000);
+app.addEventListener('conversations-changed', () => { void refreshConversations(); });
+window.setInterval(() => {
+  void refreshDiscovery(); void refreshProbeStatus();
+  if (page === 'messages') { void refreshConversations(); }
+}, 4000);
 if (isTauri()) {
+  // Dragging files onto the window provides real local paths, so no extra permission is needed.
+  void getCurrentWebview().onDragDropEvent((event) => {
+    if (event.payload.type !== 'drop' || !direct.peer) return;
+    const paths = event.payload.paths.filter(path => path.length <= 4096);
+    if (paths.length) void direct.queuePaths(paths);
+  }).catch(() => undefined);
   invoke<string>('identity_fingerprint').then((value) => {
     fingerprint = /^[0-9a-f]{64}$/.test(value) ? value : '无法读取';
     if (page === 'settings') render(); else if (page === 'discover') paintDiscovery();

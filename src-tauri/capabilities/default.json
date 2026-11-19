@@ -3,5 +3,5 @@
   "identifier": "main",
   "description": "Qbird main window base permissions",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": ["core:default", "dialog:default"]
 }

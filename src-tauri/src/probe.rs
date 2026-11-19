@@ -13,6 +13,7 @@ use rustls::{
 use crate::{address::is_unicast, certificate, identity::Identity};
 
 const ALPN: &[u8] = b"qbird-probe/1";
+const AUTO_ALPN: &[u8] = b"qbird-auto-probe/1";
 const TIMEOUT: Duration = Duration::from_secs(5);
 type ProbeResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -60,14 +61,14 @@ fn credentials(identity: &Identity) -> ProbeResult<(Vec<CertificateDer<'static>>
     Ok((vec![cert], key.into()))
 }
 
-fn client_config(identity: &Identity) -> ProbeResult<ClientConfig> {
+fn client_config(identity: &Identity, automatic: bool) -> ProbeResult<ClientConfig> {
     let (cert, key) = credentials(identity)?;
     let mut config = ClientConfig::builder_with_provider(Arc::new(default_provider()))
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .dangerous().with_custom_certificate_verifier(Arc::new(ProbeVerifier))
         .with_client_auth_cert(cert, key)?;
     config.resumption = rustls::client::Resumption::disabled();
-    config.alpn_protocols = vec![ALPN.to_vec()];
+    config.alpn_protocols = vec![if automatic { AUTO_ALPN } else { ALPN }.to_vec()];
     Ok(config)
 }
 
@@ -76,13 +77,13 @@ fn server_config(identity: &Identity) -> ProbeResult<ServerConfig> {
     let mut config = ServerConfig::builder_with_provider(Arc::new(default_provider()))
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_client_cert_verifier(Arc::new(ProbeVerifier)).with_single_cert(cert, key)?;
-    config.alpn_protocols = vec![ALPN.to_vec()];
+    config.alpn_protocols = vec![ALPN.to_vec(), AUTO_ALPN.to_vec()];
     config.send_tls13_tickets = 0;
     Ok(config)
 }
 
 fn fingerprint(chain: Option<&[CertificateDer<'_>]>, alpn: Option<&[u8]>) -> ProbeResult<String> {
-    if alpn != Some(ALPN) { return Err(io::Error::new(io::ErrorKind::InvalidData, "unexpected probe protocol").into()); }
+    if alpn != Some(ALPN) && alpn != Some(AUTO_ALPN) { return Err(io::Error::new(io::ErrorKind::InvalidData, "unexpected probe protocol").into()); }
     let chain = chain.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "peer certificate missing"))?;
     if chain.len() != 1 { return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid peer certificate chain").into()); }
     certificate::fingerprint(chain[0].as_ref()).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e).into())
@@ -129,10 +130,18 @@ fn handshake(connection: &mut rustls::Connection, stream: &mut TcpStream) -> io:
 
 /// Returns an untrusted fingerprint for display only; it does not confirm a contact.
 pub fn connect(identity: &Identity, address: SocketAddr) -> ProbeResult<String> {
+    connect_inner(identity, address, false)
+}
+
+pub(crate) fn connect_auto(identity: &Identity, address: SocketAddr) -> ProbeResult<String> {
+    connect_inner(identity, address, true)
+}
+
+fn connect_inner(identity: &Identity, address: SocketAddr, automatic: bool) -> ProbeResult<String> {
     if address.port() == 0 || !is_unicast(address.ip()) { return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid address").into()); }
     let mut stream = TcpStream::connect_timeout(&address, TIMEOUT)?;
     prepare(&stream)?;
-    let mut connection = rustls::Connection::Client(ClientConnection::new(Arc::new(client_config(identity)?), ServerName::try_from("qbird.invalid")?.to_owned())?);
+    let mut connection = rustls::Connection::Client(ClientConnection::new(Arc::new(client_config(identity, automatic)?), ServerName::try_from("qbird.invalid")?.to_owned())?);
     handshake(&mut connection, &mut stream)?;
     fingerprint(connection.peer_certificates(), connection.alpn_protocol())
 }
@@ -179,8 +188,13 @@ mod tests {
 
 /// Handles one probe only; the caller must enforce a bounded number of concurrent probes.
 pub fn accept(identity: &Identity, mut stream: TcpStream) -> ProbeResult<String> {
-    prepare(&stream)?;
+    accept_classified(identity, &mut stream).map(|(fingerprint, _)| fingerprint)
+}
+
+pub(crate) fn accept_classified(identity: &Identity, stream: &mut TcpStream) -> ProbeResult<(String, bool)> {
+    prepare(stream)?;
     let mut connection = rustls::Connection::Server(ServerConnection::new(Arc::new(server_config(identity)?))?);
-    handshake(&mut connection, &mut stream)?;
-    fingerprint(connection.peer_certificates(), connection.alpn_protocol())
+    handshake(&mut connection, stream)?;
+    let fingerprint = fingerprint(connection.peer_certificates(), connection.alpn_protocol())?;
+    Ok((fingerprint, connection.alpn_protocol() == Some(AUTO_ALPN)))
 }

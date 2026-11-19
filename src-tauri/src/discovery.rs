@@ -17,6 +17,43 @@ pub struct Candidate {
 
 type CandidateMap = BTreeMap<String, Candidate>;
 
+#[derive(Clone)]
+pub(crate) struct CandidateView {
+    entries: Arc<Mutex<CandidateMap>>,
+    own_name: Option<String>,
+}
+
+impl CandidateView {
+    #[cfg(test)]
+    pub(crate) fn test_view() -> Self {
+        Self { entries: Arc::new(Mutex::new(BTreeMap::new())), own_name: None }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_set(&self, name: &str, address: Option<SocketAddr>) {
+        let mut entries = self.entries.lock().unwrap();
+        match address {
+            Some(address) => update_candidate(&mut entries, name, address.port(), std::iter::once(address.ip())),
+            None => { entries.remove(&name.to_ascii_lowercase()); },
+        }
+    }
+
+    pub fn candidates(&self) -> Result<Vec<Candidate>, &'static str> {
+        Ok(self.entries.lock().map_err(|_| "discovery unavailable")?.iter()
+            .filter(|(name, _)| Some(name.as_str()) != self.own_name.as_deref())
+            .map(|(_, candidate)| candidate.clone()).collect())
+    }
+
+    /// Keep the discovery lock while applying the result so removal cannot race the check.
+    pub fn while_current<T>(&self, name: &str, address: &str, apply: impl FnOnce() -> T) -> Option<T> {
+        let entries = self.entries.lock().ok()?;
+        let key = name.to_ascii_lowercase();
+        if Some(key.as_str()) == self.own_name.as_deref() { return None; }
+        if !entries.get(&key).is_some_and(|entry| entry.addresses.iter().any(|a| a == address)) { return None; }
+        Some(apply())
+    }
+}
+
 pub struct Discovery {
     daemon: ServiceDaemon,
     entries: Arc<Mutex<CandidateMap>>,
@@ -73,6 +110,10 @@ impl Discovery {
 
     pub fn candidates(&self) -> Result<Vec<Candidate>, &'static str> {
         Ok(self.entries.lock().map_err(|_| "discovery unavailable")?.values().cloned().collect())
+    }
+
+    pub(crate) fn candidate_view(&self) -> CandidateView {
+        CandidateView { entries: Arc::clone(&self.entries), own_name: self.registered_name.as_ref().map(|name| name.to_ascii_lowercase()) }
     }
 }
 

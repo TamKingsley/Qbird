@@ -5,6 +5,9 @@ use serde::{Deserialize, Serialize};
 const VERSION: u8 = 1;
 const MAX_FRAME: usize = 200_000;
 const MAX_BODY: usize = 32_768;
+/// Upper bound shared by the offer, the stored transfer and the wire metadata.
+pub const MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
+pub const MAX_FILE_NAME: usize = 200;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", deny_unknown_fields)]
@@ -12,6 +15,11 @@ pub enum Payload {
     Ready {},
     Text { id: String, body: String, created_at: i64, logical: i64 },
     Ack { id: String },
+    /// Metadata only; the bytes follow as raw chunk frames after an accepted offer.
+    FileOffer { id: String, name: String, size: u64, sha256: String, created_at: i64, logical: i64 },
+    FileAccept { id: String, offset: u64 },
+    FileReject { id: String, reason: String },
+    FileComplete { id: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -23,12 +31,32 @@ struct Frame {
 
 fn invalid(reason: &'static str) -> io::Error { io::Error::new(io::ErrorKind::InvalidData, reason) }
 
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+fn valid_file_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_FILE_NAME
+        && !name.chars().any(|c| c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|'))
+}
+
+/// Reasons are fixed codes so a peer cannot inject display text into diagnostics.
+pub fn valid_reject_reason(reason: &str) -> bool {
+    matches!(reason, "untrusted" | "conflict" | "too_large" | "invalid" | "no_space")
+}
+
 fn validate(payload: &Payload) -> io::Result<()> {
     let valid_id = |id: &str| !id.is_empty() && id.len() <= 128 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
     match payload {
         Payload::Ready {} => Ok(()),
         Payload::Text { id, body, logical, .. } if valid_id(id) && !body.is_empty() && body.len() <= MAX_BODY && *logical > 0 => Ok(()),
         Payload::Ack { id } if valid_id(id) => Ok(()),
+        Payload::FileOffer { id, name, size, sha256, logical, .. }
+            if valid_id(id) && valid_file_name(name) && *size > 0 && *size <= MAX_FILE_BYTES && valid_sha256(sha256) && *logical > 0 => Ok(()),
+        Payload::FileAccept { id, offset } if valid_id(id) && *offset <= MAX_FILE_BYTES => Ok(()),
+        Payload::FileReject { id, reason } if valid_id(id) && valid_reject_reason(reason) => Ok(()),
+        Payload::FileComplete { id } if valid_id(id) => Ok(()),
         _ => Err(invalid("invalid message payload")),
     }
 }
@@ -111,6 +139,27 @@ mod tests {
         assert!(write_frame(Vec::new(), &Payload::Text { id: "1".into(), body: "x".repeat(MAX_BODY + 1), created_at: 1, logical: 1 }).is_err());
         assert!(write_frame(Vec::new(), &Payload::Text { id: "1".into(), body: "hello".into(), created_at: 1, logical: 0 }).is_err());
         assert!(write_frame(Vec::new(), &Payload::Ack { id: "bad id".into() }).is_err());
+    }
+
+    #[test]
+    fn file_frames_enforce_metadata_bounds() {
+        let offer = Payload::FileOffer {
+            id: "m1".into(), name: "报告.pdf".into(), size: 1024, sha256: "a".repeat(64), created_at: 1, logical: 1,
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &offer).unwrap();
+        assert_eq!(read_frame(Cursor::new(&bytes)).unwrap(), offer);
+        let invalid_offers = [
+            Payload::FileOffer { id: "m1".into(), name: "../etc".into(), size: 1, sha256: "a".repeat(64), created_at: 1, logical: 1 },
+            Payload::FileOffer { id: "m1".into(), name: "a".into(), size: 0, sha256: "a".repeat(64), created_at: 1, logical: 1 },
+            Payload::FileOffer { id: "m1".into(), name: "a".into(), size: MAX_FILE_BYTES + 1, sha256: "a".repeat(64), created_at: 1, logical: 1 },
+            Payload::FileOffer { id: "m1".into(), name: "a".into(), size: 1, sha256: "g".repeat(64), created_at: 1, logical: 1 },
+            Payload::FileOffer { id: "m1".into(), name: "a".into(), size: 1, sha256: "a".repeat(64), created_at: 1, logical: 0 },
+        ];
+        for payload in invalid_offers { assert!(write_frame(Vec::new(), &payload).is_err()); }
+        assert!(write_frame(Vec::new(), &Payload::FileAccept { id: "m1".into(), offset: MAX_FILE_BYTES + 1 }).is_err());
+        assert!(write_frame(Vec::new(), &Payload::FileReject { id: "m1".into(), reason: "crafted text".into() }).is_err());
+        assert!(write_frame(Vec::new(), &Payload::FileReject { id: "m1".into(), reason: "no_space".into() }).is_ok());
     }
 
     #[test]
