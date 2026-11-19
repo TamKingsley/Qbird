@@ -52,6 +52,13 @@ let experiments: ExperimentSettings = { group_file_quote: false };
 let experimentNotice = '';
 let composer: ComposerSettings = { send_shortcut: 'enter', rows: 3 };
 let composerNotice = '';
+type GroupSearchHit = { group_id: string; name: string; owner: string; member_count: number; reported_by: string; owner_known: boolean };
+type JoinRequest = { id: string; group_id: string; group_name: string; owner: string; applicant: string; applicant_name: string; created_at: number; status: string };
+let groupSearchHits: GroupSearchHit[] = [];
+let groupSearchStatus = '';
+let groupSearchBusy = false;
+let joinRequests: { incoming: JoinRequest[]; outgoing: JoinRequest[] } = { incoming: [], outgoing: [] };
+let joinNotice = '';
 type FileAcceptMode = { confirm: boolean };
 let fileAccept: FileAcceptMode = { confirm: false };
 let fileAcceptNotice = '';
@@ -882,6 +889,102 @@ async function saveContactProfile(peer: string): Promise<void> {
   } catch (error) { if (status) status.textContent = typeof error === 'string' ? error : '无法保存备注或分组'; }
 }
 
+async function searchGroups(): Promise<void> {
+  if (!isTauri()) return;
+  const query = app.querySelector<HTMLInputElement>('#group-search-name')?.value.trim() ?? '';
+  if (!query) { groupSearchStatus = '请输入群名关键词'; groupSearchHits = []; paintGroupSearch(); return; }
+  groupSearchBusy = true; groupSearchHits = []; groupSearchStatus = '正在向已确认联系人查询…'; paintGroupSearch();
+  try {
+    groupSearchHits = await invoke<GroupSearchHit[]>('v1_search_groups', { query });
+    groupSearchStatus = groupSearchHits.length ? `找到 ${groupSearchHits.length} 个群` : '没有找到匹配的群；需要联系人同时在线。';
+  } catch (error) { groupSearchStatus = displayError(error); }
+  groupSearchBusy = false; paintGroupSearch();
+}
+
+async function requestJoin(groupId: string, name: string, owner: string): Promise<void> {
+  if (!isTauri()) return;
+  try {
+    await invoke('v1_request_join_group', { groupId, name, owner });
+    joinNotice = `已向群主提交加入「${name}」的申请。`;
+  } catch (error) { joinNotice = displayError(error); }
+  await refreshJoinRequests();
+}
+
+async function refreshJoinRequests(): Promise<void> {
+  if (!isTauri()) return;
+  try { joinRequests = await invoke<{ incoming: JoinRequest[]; outgoing: JoinRequest[] }>('v1_join_requests', {}); }
+  catch { joinNotice = '无法读取入群申请'; }
+  paintJoinRequests();
+}
+
+async function resolveJoin(id: string, accept: boolean): Promise<void> {
+  if (!isTauri()) return;
+  try {
+    await invoke('v1_resolve_join_request', { id, accept });
+    joinNotice = accept ? '已同意加入，正在通知群成员。' : '已拒绝该申请。';
+  } catch (error) { joinNotice = displayError(error); }
+  await refreshJoinRequests();
+  await refreshContacts();
+}
+
+function paintJoinRequests(): void {
+  const box = app.querySelector<HTMLElement>('#join-requests');
+  if (!box) return;
+  box.replaceChildren();
+  if (!joinRequests.incoming.length && !joinRequests.outgoing.length && !joinNotice) { box.hidden = true; return; }
+  box.hidden = false;
+  const heading = (text: string): HTMLElement => { const node = document.createElement('p'); node.className = 'file-meta'; node.textContent = text; return node; };
+  if (joinRequests.incoming.length) {
+    box.append(heading('待处理的入群申请'));
+    for (const request of joinRequests.incoming) {
+      const row = document.createElement('div'); row.className = 'offer-card';
+      const text = document.createElement('div'); text.className = 'offer-text';
+      const title = document.createElement('div'); title.className = 'file-title';
+      title.textContent = `${request.applicant_name || request.applicant.slice(0, 12)} 申请加入「${request.group_name}」`;
+      const meta = document.createElement('small'); meta.className = 'file-meta'; meta.textContent = new Date(request.created_at * 1000).toLocaleString();
+      text.append(title, meta);
+      const actions = document.createElement('div'); actions.className = 'file-actions';
+      const accept = document.createElement('button'); accept.className = 'outline'; accept.textContent = '同意';
+      accept.dataset.action = 'accept-join'; accept.dataset.id = request.id;
+      const reject = document.createElement('button'); reject.className = 'linkish'; reject.textContent = '拒绝';
+      reject.dataset.action = 'reject-join'; reject.dataset.id = request.id;
+      actions.append(accept, reject); row.append(text, actions); box.append(row);
+    }
+  }
+  if (joinRequests.outgoing.length) {
+    box.append(heading('我提交的申请'));
+    for (const request of joinRequests.outgoing) {
+      const row = document.createElement('div'); row.className = 'offer-card';
+      const title = document.createElement('div'); title.className = 'file-title';
+      title.textContent = `${request.group_name} · 等待群主处理`;
+      row.append(title); box.append(row);
+    }
+  }
+  if (joinNotice) { const note = document.createElement('p'); note.setAttribute('role', 'status'); note.textContent = joinNotice; box.append(note); }
+}
+
+function paintGroupSearch(): void {
+  const status = app.querySelector<HTMLElement>('#group-search-status');
+  const list = app.querySelector<HTMLUListElement>('#group-search-results');
+  if (status) status.textContent = groupSearchStatus;
+  if (!list) return;
+  list.replaceChildren();
+  for (const hit of groupSearchHits) {
+    const item = document.createElement('li');
+    const title = document.createElement('span');
+    title.className = 'contact-title';
+    title.textContent = `${hit.name} · ${hit.member_count} 人 · 群主 ${hit.owner.slice(0, 12)}…`;
+    item.append(title);
+    const actions = document.createElement('div'); actions.className = 'contact-actions';
+    const button = document.createElement('button'); button.className = 'outline'; button.textContent = '申请加入';
+    button.dataset.action = 'join-group';
+    button.dataset.group = hit.group_id; button.dataset.name = hit.name; button.dataset.owner = hit.owner;
+    button.disabled = !hit.owner_known;
+    button.title = hit.owner_known ? '向群主发送加入申请' : '群主不在本机已确认联系人中，无法直接申请';
+    actions.append(button); item.append(actions); list.append(item);
+  }
+}
+
 async function refreshContacts(): Promise<void> {
   const status = app.querySelector<HTMLElement>('#contacts-status');
   const list = app.querySelector<HTMLUListElement>('#contacts-list');
@@ -899,6 +1002,8 @@ async function refreshContacts(): Promise<void> {
       ? (contacts.length ? `匹配 ${contacts.length} 位联系人` : '没有匹配的联系人')
       : (contacts.length ? `其他联系人：${contacts.length}` : '暂无其他联系人，可前往发现页面核对指纹。');
     paintGroups(contacts);
+    paintGroupSearch();
+    await refreshJoinRequests();
     for (const contact of contacts) {
       const item = document.createElement('li');
       const title = document.createElement('span');
@@ -1002,7 +1107,7 @@ function render(): void {
         <div class="side-foot"><span class="dot"></span>开发中 · 本地桌面版</div>
       </aside>
       <main class="workspace">
-        ${page === 'messages' && groupChat.groupId ? groupChat.view() : page === 'messages' && direct.peer ? direct.view() : page === 'messages' && selfOpen ? selfChatView() : page === 'discover' ? discoveryView() : page === 'settings' ? settingsView() : page === 'profile' ? profileView() : page === 'contacts' ? `<section class="discovery-panel card"><h2>联系人</h2><button class="self-contact" data-action="open-self" ${isTauri() ? '' : 'disabled'}><strong>自己</strong><span>打开本地自聊</span></button><p>已确认的联系人保存在本机；双方须各自核对指纹后才能聊天。</p><label for="contact-search">搜索联系人</label><input id="contact-search" type="search" maxlength="64" placeholder="名称、备注、分组或指纹" value="${contactQuery.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;')}"><p id="contacts-status" aria-live="polite"></p><ul id="contacts-list" class="discovery-results"></ul><div class="probe-box"><h3>我的群聊</h3><ul id="groups-list" class="discovery-results"></ul><label for="group-name">新建群聊名称</label><input id="group-name" type="text" maxlength="128" placeholder="例如：项目组"><div id="group-members-pick" class="group-pick"></div><button class="outline" data-action="create-group">创建群聊</button><p id="group-create-status" aria-live="polite"></p><small>只能邀请已确认的联系人；新成员只能看到加入之后的消息。</small></div></section>` : page === 'about' ? `<section class="card about"><span class="eyebrow">ABOUT / 关于</span><h2>Qbird 青鸟</h2><p>面向局域网的本地优先聊天与文件交流工具。</p><dl><div><dt>当前阶段</dt><dd>Windows 开发版 ${appVersion}</dd></div><div><dt>许可证</dt><dd>Apache License 2.0</dd></div><div><dt>平台规划</dt><dd>Windows 首发 · 后续 Linux / macOS</dd></div></dl><p class="notice">开发版未经安全审计，本地数据库未加密。</p></section>` : `<section class="empty"><div class="empty-mark">${icon('spark')}</div><h2>${current.heading}</h2><p>${current.copy}</p></section>`}
+        ${page === 'messages' && groupChat.groupId ? groupChat.view() : page === 'messages' && direct.peer ? direct.view() : page === 'messages' && selfOpen ? selfChatView() : page === 'discover' ? discoveryView() : page === 'settings' ? settingsView() : page === 'profile' ? profileView() : page === 'contacts' ? `<section class="discovery-panel card"><h2>联系人</h2><button class="self-contact" data-action="open-self" ${isTauri() ? '' : 'disabled'}><strong>自己</strong><span>打开本地自聊</span></button><p>已确认的联系人保存在本机；双方须各自核对指纹后才能聊天。</p><label for="contact-search">搜索联系人</label><input id="contact-search" type="search" maxlength="64" placeholder="名称、备注、分组或指纹" value="${contactQuery.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;')}"><p id="contacts-status" aria-live="polite"></p><ul id="contacts-list" class="discovery-results"></ul><div class="probe-box"><h3>我的群聊</h3><ul id="groups-list" class="discovery-results"></ul><div id="join-requests"></div><label for="group-search-name">按群名搜索并申请加入</label><div class="probe-row"><input id="group-search-name" type="text" maxlength="64" placeholder="群名关键词"><button class="outline" data-action="search-groups" ${groupSearchBusy ? 'disabled' : ''}>搜索</button></div><p id="group-search-status" role="status">${groupSearchStatus}</p><ul id="group-search-results" class="discovery-results"></ul><small>只会向已确认且有地址的联系人查询；申请直接发给群主，因此群主须是本机已确认联系人。对方离线时不保证送达。</small></div><div class="probe-box"><h3>新建群聊</h3><label for="group-name">新建群聊名称</label><input id="group-name" type="text" maxlength="128" placeholder="例如：项目组"><div id="group-members-pick" class="group-pick"></div><button class="outline" data-action="create-group">创建群聊</button><p id="group-create-status" aria-live="polite"></p><small>只能邀请已确认的联系人；新成员只能看到加入之后的消息。</small></div></section>` : page === 'about' ? `<section class="card about"><span class="eyebrow">ABOUT / 关于</span><h2>Qbird 青鸟</h2><p>面向局域网的本地优先聊天与文件交流工具。</p><dl><div><dt>当前阶段</dt><dd>Windows 开发版 ${appVersion}</dd></div><div><dt>许可证</dt><dd>Apache License 2.0</dd></div><div><dt>平台规划</dt><dd>Windows 首发 · 后续 Linux / macOS</dd></div></dl><p class="notice">开发版未经安全审计，本地数据库未加密。</p></section>` : `<section class="empty"><div class="empty-mark">${icon('spark')}</div><h2>${current.heading}</h2><p>${current.copy}</p></section>`}
       </main>
     </div>`;
   if (page === 'discover') paintDiscovery();
@@ -1439,6 +1544,12 @@ app.addEventListener('click', (event) => {
   if (action?.dataset.action === 'add-group-member') { void groupChat.addMember(); return; }
   if (action?.dataset.action === 'remove-group-member' && action.dataset.member) { void groupChat.removeMember(action.dataset.member); return; }
   if (action?.dataset.action === 'create-group') { void createGroup(); return; }
+  if (action?.dataset.action === 'search-groups') { void searchGroups(); return; }
+  if (action?.dataset.action === 'join-group' && action.dataset.group) {
+    void requestJoin(action.dataset.group, action.dataset.name ?? '', action.dataset.owner ?? ''); return;
+  }
+  if (action?.dataset.action === 'accept-join' && action.dataset.id) { void resolveJoin(action.dataset.id, true); return; }
+  if (action?.dataset.action === 'reject-join' && action.dataset.id) { void resolveJoin(action.dataset.id, false); return; }
   if (action?.dataset.action === 'open-self') { void openSelf(); return; }
   if (action?.dataset.action === 'hide-self') { void hideSelf(); return; }
   if (action?.dataset.action === 'self-send') { void sendSelf(); return; }

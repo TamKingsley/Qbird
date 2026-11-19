@@ -185,6 +185,31 @@ pub fn accept_one(identity: &Identity, store: &Mutex<Store>, socket: TcpStream) 
                 }
                 acknowledge(&mut stream, &mut gate, &id)?;
             }
+            // Search replies are acknowledged by the caller; a stray ack is harmless.
+            Payload::Ack { .. } => {}
+            Payload::GroupSearch { id, query } => {
+                let groups = store.lock().map_err(|_| invalid("store unavailable"))?
+                    .search_known_groups(&self_id, &query)?;
+                let result = Payload::GroupSearchResult { id, groups };
+                gate.outbound(&result)?;
+                protocol::write_frame(&mut stream, &result)?;
+            }
+            Payload::GroupJoinRequest { id, group_id, name } => {
+                let recorded = store.lock().map_err(|_| invalid("store unavailable"))?
+                    .record_join_request(&self_id, &peer, &group_id, &name, unix_now())?;
+                if recorded {
+                    acknowledge(&mut stream, &mut gate, &id)?;
+                } else {
+                    let again = Payload::GroupJoinReject { id: id.clone(), group_id };
+                    gate.outbound(&again)?;
+                    protocol::write_frame(&mut stream, &again)?;
+                }
+            }
+            Payload::GroupJoinReject { id, group_id } => {
+                store.lock().map_err(|_| invalid("store unavailable"))?
+                    .reject_out_join_request(&self_id, &group_id)?;
+                acknowledge(&mut stream, &mut gate, &id)?;
+            }
             _ => return Err(invalid("unexpected payload").into()),
         }
     }
@@ -555,6 +580,12 @@ pub fn send_control_one(identity: &Identity, store: &Mutex<Store>, target: &str,
         }
         "dissolve" => Payload::GroupDissolve { id: task.id.clone(), group_id: task.group_id.clone() },
         "remove" => Payload::GroupRemove { id: task.id.clone(), group_id: task.group_id.clone() },
+        "join" => {
+            let value: serde_json::Value = serde_json::from_str(&task.payload)?;
+            let name = value.get("name").and_then(|v| v.as_str()).ok_or_else(|| invalid("invalid control payload"))?.to_owned();
+            Payload::GroupJoinRequest { id: task.id.clone(), group_id: task.group_id.clone(), name }
+        }
+        "join_reject" => Payload::GroupJoinReject { id: task.id.clone(), group_id: task.group_id.clone() },
         "leave" => {
             let value: serde_json::Value = serde_json::from_str(&task.payload)?;
             let member = value.get("member").and_then(|v| v.as_str()).ok_or_else(|| invalid("invalid control payload"))?.to_owned();
@@ -567,11 +598,57 @@ pub fn send_control_one(identity: &Identity, store: &Mutex<Store>, target: &str,
     protocol::write_frame(&mut stream, &payload)?;
     let reply = protocol::read_frame(&mut stream)?;
     gate.inbound(&reply)?;
+    // A refused application is a terminal answer, not a transport failure: stop retrying
+    // and tell the local UI the owner declined.
+    if let Payload::GroupJoinReject { id, group_id } = &reply {
+        if *id != task.id || *group_id != task.group_id { return Err(invalid("invalid join rejection").into()); }
+        let self_id = identity.fingerprint();
+        store.lock().map_err(|_| invalid("store unavailable"))?.reject_out_join_request(&self_id, &task.group_id)?;
+        if !store.lock().map_err(|_| invalid("store unavailable"))?.ack_control(&task.id)? {
+            return Err(invalid("control state changed").into());
+        }
+        return Ok(());
+    }
     if reply != (Payload::Ack { id: task.id.clone() }) { return Err(invalid("invalid control acknowledgement").into()); }
     if !store.lock().map_err(|_| invalid("store unavailable"))?.ack_control(&task.id)? {
         return Err(invalid("control state changed").into());
     }
     Ok(())
+}
+
+/// Ask each confirmed contact which of its groups match `query`. Best effort: a peer
+/// that is offline or answers badly simply contributes nothing.
+pub fn search_groups(identity: &Identity, targets: &[(String, SocketAddr)], query: &str)
+    -> Vec<(String, crate::protocol::GroupDigest)> {
+    let mut hits = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for (index, (peer, address)) in targets.iter().enumerate() {
+        if address.port() == 0 || !crate::address::is_unicast(address.ip()) { continue; }
+        let id = format!("search-{}-{index}", std::process::id());
+        let request = Payload::GroupSearch { id: id.clone(), query: query.to_owned() };
+        let groups = (|| -> ChatResult<Vec<crate::protocol::GroupDigest>> {
+            let (mut stream, mut gate) = connect(identity, peer, *address)?;
+            gate.outbound(&request)?;
+            protocol::write_frame(&mut stream, &request)?;
+            let reply = protocol::read_frame(&mut stream)?;
+            gate.inbound(&reply)?;
+            match reply {
+                Payload::GroupSearchResult { id: echoed, groups } if echoed == id => {
+                    let ack = Payload::Ack { id };
+                    gate.outbound(&ack)?;
+                    protocol::write_frame(&mut stream, &ack)?;
+                    Ok(groups)
+                }
+                _ => Err(invalid("invalid search reply").into()),
+            }
+        })();
+        if let Ok(groups) = groups {
+            for group in groups {
+                if seen.insert(group.id.clone()) { hits.push((peer.clone(), group)); }
+            }
+        }
+    }
+    hits
 }
 
 /// Send one persisted pending message; a lost acknowledgement leaves it retryable.

@@ -47,6 +47,24 @@ pub enum Payload {
     GroupRemove { id: String, group_id: String },
     /// A member left voluntarily and tells the owner.
     GroupLeave { id: String, group_id: String, member: String },
+    /// Ask a confirmed contact which of its groups match a name query.
+    GroupSearch { id: String, query: String },
+    /// Answer to `GroupSearch`; the same `id` is echoed back.
+    GroupSearchResult { id: String, groups: Vec<GroupDigest> },
+    /// Ask the owner (a confirmed contact) to join one group.
+    GroupJoinRequest { id: String, group_id: String, name: String },
+    /// The owner refused the request; terminal for the applicant.
+    GroupJoinReject { id: String, group_id: String },
+}
+
+/// What one peer claims about a group it belongs to. Never a trust signal by itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GroupDigest {
+    pub id: String,
+    pub name: String,
+    pub owner: String,
+    pub member_count: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,6 +106,13 @@ pub fn valid_reject_reason(reason: &str) -> bool {
     matches!(reason, "untrusted" | "conflict" | "too_large" | "invalid" | "no_space" | "defer" | "declined")
 }
 
+pub const MAX_SEARCH_QUERY: usize = 64;
+pub const MAX_SEARCH_RESULTS: usize = 64;
+
+fn valid_group_name(name: &str) -> bool {
+    !name.trim().is_empty() && name.len() <= 128 && !name.chars().any(char::is_control)
+}
+
 fn validate(payload: &Payload) -> io::Result<()> {
     let valid_id = |id: &str| !id.is_empty() && id.len() <= 128 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
     match payload {
@@ -123,6 +148,18 @@ fn validate(payload: &Payload) -> io::Result<()> {
         Payload::GroupLeave { id, group_id, member }
             if valid_id(id) && valid_group_id(group_id)
                 && member.len() == 64 && member.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) => Ok(()),
+        Payload::GroupSearch { id, query }
+            if valid_id(id) && !query.trim().is_empty() && query.len() <= MAX_SEARCH_QUERY
+                && !query.chars().any(char::is_control) => Ok(()),
+        Payload::GroupSearchResult { id, groups }
+            if valid_id(id) && groups.len() <= MAX_SEARCH_RESULTS && groups.iter().all(|group| {
+                valid_group_id(&group.id) && valid_group_name(&group.name)
+                    && group.owner.len() == 64 && group.owner.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                    && group.member_count <= MAX_GROUP_MEMBERS as u32
+            }) => Ok(()),
+        Payload::GroupJoinRequest { id, group_id, name }
+            if valid_id(id) && valid_group_id(group_id) && valid_group_name(name) => Ok(()),
+        Payload::GroupJoinReject { id, group_id } if valid_id(id) && valid_group_id(group_id) => Ok(()),
         _ => Err(invalid("invalid message payload")),
     }
 }
@@ -258,6 +295,38 @@ mod tests {
         let mut bad_name = offer.clone();
         if let Payload::GroupFileOffer { file_name, .. } = &mut bad_name { *file_name = "../x".into(); }
         assert!(write_frame(Vec::new(), &bad_name).is_err());
+    }
+
+    #[test]
+    fn group_search_and_join_frames_roundtrip_and_validate() {
+        let search = Payload::GroupSearch { id: "search-1".into(), query: "小".into() };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &search).unwrap();
+        assert_eq!(read_frame(Cursor::new(&bytes)).unwrap(), search);
+        assert!(write_frame(Vec::new(), &Payload::GroupSearch { id: "search-1".into(), query: "  ".into() }).is_err());
+        assert!(write_frame(Vec::new(), &Payload::GroupSearch { id: "search-1".into(), query: "x".repeat(MAX_SEARCH_QUERY + 1) }).is_err());
+
+        let digest = GroupDigest { id: "1".repeat(32), name: "团队".into(), owner: "a".repeat(64), member_count: 3 };
+        let result = Payload::GroupSearchResult { id: "search-1".into(), groups: vec![digest.clone()] };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &result).unwrap();
+        assert_eq!(read_frame(Cursor::new(&bytes)).unwrap(), result);
+        let mut bad_digest = digest.clone();
+        bad_digest.owner = "short".into();
+        assert!(write_frame(Vec::new(), &Payload::GroupSearchResult { id: "search-1".into(), groups: vec![bad_digest] }).is_err());
+        let too_many: Vec<GroupDigest> = (0..=MAX_SEARCH_RESULTS).map(|_| digest.clone()).collect();
+        assert!(write_frame(Vec::new(), &Payload::GroupSearchResult { id: "search-1".into(), groups: too_many }).is_err());
+
+        let request = Payload::GroupJoinRequest { id: "join-1".into(), group_id: "2".repeat(32), name: "团队".into() };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &request).unwrap();
+        assert_eq!(read_frame(Cursor::new(&bytes)).unwrap(), request);
+        assert!(write_frame(Vec::new(), &Payload::GroupJoinRequest { id: "join-1".into(), group_id: "short".into(), name: "团队".into() }).is_err());
+        assert!(write_frame(Vec::new(), &Payload::GroupJoinRequest { id: "join-1".into(), group_id: "2".repeat(32), name: "  ".into() }).is_err());
+        let reject = Payload::GroupJoinReject { id: "join-1".into(), group_id: "2".repeat(32) };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &reject).unwrap();
+        assert_eq!(read_frame(Cursor::new(&bytes)).unwrap(), reject);
     }
 
     #[test]

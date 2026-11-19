@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::{params, Connection, OptionalExtension, Result};
 use serde::Serialize;
 
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 13;
 
 /// Default cap for locally received attachments; the user may change it in settings.
 pub const DEFAULT_STORAGE_QUOTA: u64 = 2 * 1024 * 1024 * 1024;
@@ -251,6 +251,19 @@ pub struct FileOfferRequest {
     pub peer: String,
     pub name: String,
     pub total: i64,
+    pub created_at: i64,
+    pub status: String,
+}
+
+/// One join application, either received (incoming) or sent by this device.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct JoinRequest {
+    pub id: String,
+    pub group_id: String,
+    pub group_name: String,
+    pub owner: String,
+    pub applicant: String,
+    pub applicant_name: String,
     pub created_at: i64,
     pub status: String,
 }
@@ -598,6 +611,40 @@ impl Store {
                  );
                  CREATE INDEX IF NOT EXISTS group_file_transfers_by_peer ON group_file_transfers(peer, status);
                  PRAGMA user_version = 11;",
+            )?;
+            transaction.commit()?;
+        }
+        if version < 13 {
+            let transaction = connection.transaction()?;
+            // Join/refuse notices are queued like any other owner control message, so the
+            // CHECK constraint has to accept the two new kinds.
+            transaction.execute_batch(
+                "CREATE TABLE group_control_v13 (
+                    id TEXT PRIMARY KEY NOT NULL CHECK(length(id) = 32),
+                    group_id TEXT NOT NULL,
+                    target TEXT NOT NULL CHECK(length(target) = 64),
+                    kind TEXT NOT NULL CHECK(kind IN ('invite', 'members', 'remove', 'leave', 'transfer', 'dissolve', 'join', 'join_reject')),
+                    payload TEXT NOT NULL CHECK(length(payload) <= 65536),
+                    status TEXT NOT NULL CHECK(status IN ('pending', 'delivered')),
+                    created_at INTEGER NOT NULL
+                );
+                INSERT INTO group_control_v13(id, group_id, target, kind, payload, status, created_at)
+                    SELECT id, group_id, target, kind, payload, status, created_at FROM group_control;
+                DROP TABLE group_control;
+                ALTER TABLE group_control_v13 RENAME TO group_control;
+                CREATE INDEX IF NOT EXISTS group_control_pending ON group_control(target, status);
+                CREATE TABLE IF NOT EXISTS group_join_requests (
+                    id TEXT PRIMARY KEY NOT NULL CHECK(length(id) = 32),
+                    group_id TEXT NOT NULL CHECK(length(group_id) = 32),
+                    group_name TEXT NOT NULL CHECK(length(group_name) > 0 AND length(group_name) <= 128),
+                    owner TEXT NOT NULL CHECK(length(owner) = 64),
+                    applicant TEXT NOT NULL CHECK(length(applicant) = 64),
+                    created_at INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'accepted', 'rejected'))
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS group_join_requests_unique ON group_join_requests(group_id, applicant);
+                CREATE INDEX IF NOT EXISTS group_join_requests_by_owner ON group_join_requests(owner, status);
+                PRAGMA user_version = 13;",
             )?;
             transaction.commit()?;
         }
@@ -2329,6 +2376,155 @@ impl Store {
         Ok(self.connection.execute("UPDATE group_control SET status = 'delivered' WHERE id = ?1 AND status = 'pending'", [id])? == 1)
     }
 
+    /// Groups this device belongs to whose name matches `query`; reported on request.
+    pub fn search_known_groups(&self, self_id: &str, query: &str) -> Result<Vec<crate::protocol::GroupDigest>> {
+        if !valid_fingerprint(self_id) || query.trim().is_empty() || query.len() > crate::protocol::MAX_SEARCH_QUERY {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT g.id, g.name, g.owner,
+                    (SELECT COUNT(*) FROM group_members m2 WHERE m2.group_id = g.id AND m2.active = 1)
+             FROM groups g JOIN group_members m ON m.group_id = g.id AND m.member = ?1 AND m.active = 1
+             WHERE g.name LIKE ?2 ESCAPE '\\'
+             ORDER BY g.created_at DESC LIMIT ?3")?;
+        let rows = statement.query_map(params![self_id, like_pattern(query), crate::protocol::MAX_SEARCH_RESULTS as i64], |row| {
+            Ok(crate::protocol::GroupDigest {
+                id: row.get(0)?, name: row.get(1)?, owner: row.get(2)?, member_count: row.get::<_, i64>(3)? as u32,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Records an inbound join application; only the group owner may hold one.
+    pub fn record_join_request(&self, self_id: &str, applicant: &str, group_id: &str, name: &str, now: i64) -> Result<bool> {
+        if !valid_fingerprint(self_id) || !valid_fingerprint(applicant) || !valid_group_id(group_id)
+            || name.is_empty() || name.len() > 128 {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        let tx = self.connection.unchecked_transaction()?;
+        let owner: Option<String> = tx.query_row("SELECT owner FROM groups WHERE id = ?1", [group_id], |row| row.get(0)).optional()?;
+        if owner.as_deref() != Some(self_id) || applicant == self_id { return Ok(false); }
+        let verified: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM contacts WHERE fingerprint = ?1 AND trust_state = 'verified')",
+            [applicant], |row| row.get(0))?;
+        if !verified { return Ok(false); }
+        let member: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM group_members WHERE group_id = ?1 AND member = ?2 AND active = 1)",
+            params![group_id, applicant], |row| row.get(0))?;
+        if member { return Ok(false); }
+        let id: String = tx.query_row("SELECT lower(hex(randomblob(16)))", [], |row| row.get(0))?;
+        tx.execute(
+            "INSERT INTO group_join_requests(id, group_id, group_name, owner, applicant, created_at, status)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending')
+             ON CONFLICT(group_id, applicant) DO UPDATE SET created_at = excluded.created_at, status = 'pending'",
+            params![id, group_id, name, self_id, applicant, now])?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Queues an outbound application and remembers it locally; the request is not a member yet.
+    pub fn queue_join_request(&self, self_id: &str, group_id: &str, name: &str, owner: &str, now: i64) -> Result<JoinRequest> {
+        if !valid_fingerprint(self_id) || !valid_group_id(group_id) || !valid_fingerprint(owner) || owner == self_id
+            || name.trim().is_empty() || name.len() > 128 {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        let tx = self.connection.unchecked_transaction()?;
+        let verified: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM contacts WHERE fingerprint = ?1 AND trust_state = 'verified')",
+            [owner], |row| row.get(0))?;
+        if !verified { return Err(rusqlite::Error::InvalidQuery); }
+        let member: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM group_members WHERE group_id = ?1 AND member = ?2 AND active = 1)",
+            params![group_id, self_id], |row| row.get(0))?;
+        if member { return Err(rusqlite::Error::InvalidQuery); }
+        let id: String = tx.query_row("SELECT lower(hex(randomblob(16)))", [], |row| row.get(0))?;
+        tx.execute(
+            "INSERT INTO group_join_requests(id, group_id, group_name, owner, applicant, created_at, status)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending')
+             ON CONFLICT(group_id, applicant) DO UPDATE SET created_at = excluded.created_at, status = 'pending'",
+            params![id, group_id, name.trim(), owner, self_id, now])?;
+        tx.execute(
+            "INSERT INTO group_control(id, group_id, target, kind, payload, status, created_at)
+             VALUES (?1, ?2, ?3, 'join', ?4, 'pending', ?5)",
+            params![id, group_id, owner, serde_json::json!({ "name": name.trim() }).to_string(), now])?;
+        tx.commit()?;
+        Ok(JoinRequest {
+            id, group_id: group_id.into(), group_name: name.trim().into(), owner: owner.into(),
+            applicant: self_id.into(), applicant_name: String::new(), created_at: now, status: "pending".into(),
+        })
+    }
+
+    pub fn list_join_requests(&self, self_id: &str, group_id: Option<&str>) -> Result<Vec<JoinRequest>> {
+        if !valid_fingerprint(self_id) { return Err(rusqlite::Error::InvalidQuery); }
+        let mut statement = self.connection.prepare(
+            "SELECT r.id, r.group_id, r.group_name, r.owner, r.applicant, COALESCE(c.remark, c.display_name, ''), r.created_at, r.status
+             FROM group_join_requests r
+             LEFT JOIN contacts c ON c.fingerprint = r.applicant
+             WHERE r.owner = ?1 AND r.applicant != ?1 AND r.status = 'pending'
+               AND (?2 IS NULL OR r.group_id = ?2)
+             ORDER BY r.created_at DESC LIMIT 200")?;
+        let rows = statement.query_map(params![self_id, group_id], |row| Ok(JoinRequest {
+            id: row.get(0)?, group_id: row.get(1)?, group_name: row.get(2)?, owner: row.get(3)?,
+            applicant: row.get(4)?, applicant_name: row.get(5)?, created_at: row.get(6)?, status: row.get(7)?,
+        }))?;
+        rows.collect()
+    }
+
+    pub fn list_out_join_requests(&self, self_id: &str) -> Result<Vec<JoinRequest>> {
+        if !valid_fingerprint(self_id) { return Err(rusqlite::Error::InvalidQuery); }
+        let mut statement = self.connection.prepare(
+            "SELECT id, group_id, group_name, owner, applicant, '', created_at, status
+             FROM group_join_requests WHERE applicant = ?1 AND status = 'pending'
+             ORDER BY created_at DESC LIMIT 200")?;
+        let rows = statement.query_map([self_id], |row| Ok(JoinRequest {
+            id: row.get(0)?, group_id: row.get(1)?, group_name: row.get(2)?, owner: row.get(3)?,
+            applicant: row.get(4)?, applicant_name: row.get(5)?, created_at: row.get(6)?, status: row.get(7)?,
+        }))?;
+        rows.collect()
+    }
+
+    /// Owner decision; returns the group and applicant so the caller can queue the roster update.
+    pub fn resolve_join_request(&self, self_id: &str, id: &str, accept: bool) -> Result<Option<(String, String)>> {
+        if !valid_fingerprint(self_id) || !valid_message_id(id) { return Err(rusqlite::Error::InvalidQuery); }
+        let tx = self.connection.unchecked_transaction()?;
+        let row: Option<(String, String, String)> = tx.query_row(
+            "SELECT group_id, applicant, owner FROM group_join_requests WHERE id = ?1 AND status = 'pending'",
+            [id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).optional()?;
+        let Some((group_id, applicant, owner)) = row else { return Ok(None); };
+        if owner != self_id { return Ok(None); }
+        tx.execute("UPDATE group_join_requests SET status = ?2 WHERE id = ?1",
+            params![id, if accept { "accepted" } else { "rejected" }])?;
+        tx.commit()?;
+        Ok(Some((group_id, applicant)))
+    }
+
+    /// Queues the refusal notice so the applicant's UI stops waiting.
+    pub fn queue_join_reject(&self, self_id: &str, group_id: &str, applicant: &str, now: i64) -> Result<bool> {
+        if !valid_fingerprint(self_id) || !valid_fingerprint(applicant) || !valid_group_id(group_id) {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        let owner: Option<String> = self.connection.query_row("SELECT owner FROM groups WHERE id = ?1", [group_id], |row| row.get(0)).optional()?;
+        if owner.as_deref() != Some(self_id) { return Ok(false); }
+        let verified: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM contacts WHERE fingerprint = ?1 AND trust_state = 'verified')",
+            [applicant], |row| row.get(0))?;
+        if !verified { return Ok(false); }
+        let id: String = self.connection.query_row("SELECT lower(hex(randomblob(16)))", [], |row| row.get(0))?;
+        self.connection.execute(
+            "INSERT INTO group_control(id, group_id, target, kind, payload, status, created_at)
+             VALUES (?1, ?2, ?3, 'join_reject', '{}', 'pending', ?4)",
+            params![id, group_id, applicant, now])?;
+        Ok(true)
+    }
+
+    /// The owner refused; the applicant stops waiting.
+    pub fn reject_out_join_request(&self, self_id: &str, group_id: &str) -> Result<bool> {
+        if !valid_fingerprint(self_id) || !valid_group_id(group_id) { return Err(rusqlite::Error::InvalidQuery); }
+        Ok(self.connection.execute(
+            "UPDATE group_join_requests SET status = 'rejected' WHERE applicant = ?1 AND group_id = ?2 AND status = 'pending'",
+            params![self_id, group_id])? > 0)
+    }
+
     /// Applies an inbound invite / member update / removal / leave notice.
     pub fn receive_group_control(&self, self_id: &str, peer: &str, kind: &str, group_id: &str, payload: &str, now: i64) -> Result<IncomingResult> {
         if !valid_fingerprint(self_id) || !valid_fingerprint(peer) || !valid_group_id(group_id)
@@ -2382,6 +2578,10 @@ impl Store {
                             params![group_id, member])?;
                     }
                 }
+                // An invite that includes us settles any application we had pending.
+                tx.execute(
+                    "UPDATE group_join_requests SET status = 'accepted' WHERE applicant = ?1 AND group_id = ?2 AND status = 'pending'",
+                    params![self_id, group_id])?;
                 tx.commit()?;
                 Ok(IncomingResult::Inserted)
             }
@@ -3273,6 +3473,91 @@ mod tests {
         );
         assert_eq!(store.list_group_members(&gid).unwrap().iter().filter(|member| member.active).count(), 2);
         assert_eq!(store.list_group_messages(&gid, 10, None).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn group_join_requests_are_queued_approved_and_refused() {
+        let store = memory_store();
+        let owner = "b".repeat(64);
+        let alice = "a".repeat(64);
+        let bob = "c".repeat(64);
+        for (index, peer) in [&alice, &owner, &bob].into_iter().enumerate() {
+            store.add_candidate(peer, "P").unwrap();
+            store.confirm_candidate(peer).unwrap();
+            store.set_contact_address(peer, &format!("127.0.0.1:{}", 7000 + index)).unwrap();
+        }
+        let group = store.create_group(&owner, "研发一组", &[alice.clone()], 1).unwrap();
+        let other = store.create_group(&owner, "市场组", &[alice.clone()], 1).unwrap();
+
+        // Only groups the local device is a member of are reported, filtered by name.
+        let found = store.search_known_groups(&owner, "研发").unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, group.id);
+        assert_eq!(found[0].member_count, 2);
+        assert!(store.search_known_groups(&alice, "不存在").unwrap().is_empty());
+
+        // Bob is not a member: his application is stored once and repeated notices upsert.
+        assert!(store.record_join_request(&owner, &bob, &group.id, "研发一组", 10).unwrap());
+        assert!(store.record_join_request(&owner, &bob, &group.id, "研发一组", 11).unwrap());
+        assert_eq!(store.list_join_requests(&owner, None).unwrap().len(), 1);
+        // A member cannot apply again, nor can a non-owner record a request.
+        assert!(!store.record_join_request(&owner, &alice, &group.id, "研发一组", 12).unwrap());
+        assert!(!store.record_join_request(&bob, &alice, &group.id, "研发一组", 13).unwrap());
+        let incoming = store.list_join_requests(&owner, None).unwrap();
+        assert_eq!(incoming.len(), 1);
+        assert_eq!(incoming[0].applicant, bob);
+        assert_eq!(store.list_join_requests(&owner, Some(&other.id)).unwrap().len(), 0);
+
+        // Approving adds the member and queues the roster update for everyone.
+        let (gid, applicant) = store.resolve_join_request(&owner, &incoming[0].id, true).unwrap().unwrap();
+        assert_eq!((gid.as_str(), applicant.as_str()), (group.id.as_str(), bob.as_str()));
+        assert!(store.add_group_member(&group.id, &owner, &bob, 14).unwrap());
+        assert_eq!(store.list_group_members(&group.id).unwrap().iter().filter(|m| m.active).count(), 3);
+        assert!(store.resolve_join_request(&owner, &incoming[0].id, true).unwrap().is_none());
+
+        // Refusing queues a paired outbound notice and settles the applicant's own row.
+        let carol = "d".repeat(64);
+        store.add_candidate(&carol, "Carol").unwrap();
+        store.confirm_candidate(&carol).unwrap();
+        store.set_contact_address(&carol, "127.0.0.1:7010").unwrap();
+        assert!(store.record_join_request(&owner, &carol, &group.id, "研发一组", 15).unwrap());
+        let pending = store.list_join_requests(&owner, Some(&group.id)).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(store.queue_join_reject(&owner, &group.id, &carol, 16).unwrap());
+        let mut cursor: Option<String> = None;
+        let mut rejection = None;
+        while let Some(task) = store.next_pending_control(cursor.as_deref()).unwrap() {
+            cursor = Some(task.target.clone());
+            if task.kind == "join_reject" { rejection = Some(task); break; }
+        }
+        let rejection = rejection.expect("queued rejection");
+        assert_eq!(rejection.target, carol);
+    }
+
+    #[test]
+    fn outbound_join_request_is_tracked_and_settled_by_invite() {
+        let store = memory_store();
+        let owner = "b".repeat(64);
+        let me = "a".repeat(64);
+        for (index, peer) in [&owner, &me].into_iter().enumerate() {
+            store.add_candidate(peer, "P").unwrap();
+            store.confirm_candidate(peer).unwrap();
+            store.set_contact_address(peer, &format!("127.0.0.1:{}", 7100 + index)).unwrap();
+        }
+        let group = store.create_group(&owner, "Team", &[], 1).unwrap();
+        store.queue_join_request(&me, &group.id, "Team", &owner, 2).unwrap();
+        // A second click re-queues the same application instead of failing.
+        store.queue_join_request(&me, &group.id, "Team", &owner, 4).unwrap();
+        assert_eq!(store.list_out_join_requests(&me).unwrap().len(), 1);
+        assert_eq!(store.list_out_join_requests(&me).unwrap().len(), 1);
+        let control = store.next_pending_control(None).unwrap().unwrap();
+        assert_eq!(control.kind, "join");
+        assert_eq!(control.target, owner);
+
+        // Receiving the roster update settles the pending application.
+        store.receive_group_control(&me, &owner, "invite", &group.id,
+            &serde_json::json!({ "name": "Team", "owner": owner, "members": [owner.clone(), me.clone()] }).to_string(), 5).unwrap();
+        assert!(store.list_out_join_requests(&me).unwrap().is_empty());
     }
 
     #[test]

@@ -988,6 +988,105 @@ pub fn v1_add_group_member(state: tauri::State<'_, AppState>, group_id: String, 
     if added { Ok(()) } else { Err("只有群主可以添加，且该联系人须已确认、尚未在群中".into()) }
 }
 
+#[derive(serde::Serialize)]
+pub struct GroupSearchHit {
+    pub group_id: String,
+    pub name: String,
+    pub owner: String,
+    pub member_count: u32,
+    pub reported_by: String,
+    pub owner_known: bool,
+}
+
+/// LAN search asks confirmed contacts that already have a saved address. Calls are
+/// best effort and bounded: offline peers simply contribute no results.
+#[tauri::command]
+pub async fn v1_search_groups(state: tauri::State<'_, AppState>, query: String)
+    -> Result<Vec<GroupSearchHit>, String> {
+    let query = query.trim().to_owned();
+    if query.is_empty() || query.len() > crate::protocol::MAX_SEARCH_QUERY {
+        return Err(format!("请输入 1–{} 个字符的群名关键词", crate::protocol::MAX_SEARCH_QUERY));
+    }
+    let store = Arc::clone(&state.store);
+    let identity = Arc::clone(&state.identity);
+    tauri::async_runtime::spawn_blocking(move || {
+        let self_id = identity.fingerprint();
+        let mut joined = std::collections::BTreeSet::new();
+        let mut known = std::collections::BTreeSet::new();
+        let mut targets = Vec::new();
+        {
+            let store = store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+            for group in store.list_groups(&self_id).map_err(|_| "无法读取群聊".to_owned())? {
+                joined.insert(group.id);
+            }
+            for contact in store.list_contacts().map_err(|_| "无法读取联系人".to_owned())? {
+                if contact.trust_state != "verified" { continue; }
+                known.insert(contact.fingerprint.clone());
+                if targets.len() >= 16 { continue; }
+                if let Ok(Some(address)) = store.contact_address(&contact.fingerprint) {
+                    if let Ok(parsed) = crate::address::parse_manual_address(&address) {
+                        targets.push((contact.fingerprint, parsed));
+                    }
+                }
+            }
+        }
+        let hits = crate::chat_transport::search_groups(&identity, &targets, &query);
+        Ok(hits.into_iter().filter(|(_, group)| !joined.contains(&group.id)).map(|(reported_by, group)| GroupSearchHit {
+            owner_known: known.contains(&group.owner),
+            reported_by,
+            group_id: group.id,
+            name: group.name,
+            owner: group.owner,
+            member_count: group.member_count,
+        }).collect())
+    }).await.map_err(|_| "群名搜索任务异常".to_owned())?
+}
+
+#[tauri::command]
+pub fn v1_request_join_group(state: tauri::State<'_, AppState>, group_id: String, name: String, owner: String)
+    -> Result<crate::storage::JoinRequest, String> {
+    let self_id = state.identity.fingerprint();
+    let now = unix_now()?;
+    state.store.lock().map_err(|_| "本地存储不可用".to_owned())?
+        .queue_join_request(&self_id, &group_id, &name, &owner, now)
+        .map_err(|_| "群主须为本机已确认联系人，且你尚未在该群中".to_owned())
+}
+
+#[derive(serde::Serialize)]
+pub struct JoinRequests {
+    pub incoming: Vec<crate::storage::JoinRequest>,
+    pub outgoing: Vec<crate::storage::JoinRequest>,
+}
+
+#[tauri::command]
+pub fn v1_join_requests(state: tauri::State<'_, AppState>, group_id: Option<String>) -> Result<JoinRequests, String> {
+    let self_id = state.identity.fingerprint();
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    Ok(JoinRequests {
+        incoming: store.list_join_requests(&self_id, group_id.as_deref()).map_err(|_| "无法读取入群申请".to_owned())?,
+        outgoing: store.list_out_join_requests(&self_id).map_err(|_| "无法读取已提交申请".to_owned())?,
+    })
+}
+
+#[tauri::command]
+pub fn v1_resolve_join_request(state: tauri::State<'_, AppState>, id: String, accept: bool) -> Result<(), String> {
+    let self_id = state.identity.fingerprint();
+    let now = unix_now()?;
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    let Some((group_id, applicant)) = store.resolve_join_request(&self_id, &id, accept)
+        .map_err(|_| "无法更新入群申请".to_owned())? else {
+        return Err("申请不存在或已处理".into());
+    };
+    if accept {
+        if !store.add_group_member(&group_id, &self_id, &applicant, now).map_err(|_| "无法加入成员".to_owned())? {
+            return Err("对方须仍是已确认联系人且不在群中".into());
+        }
+    } else {
+        store.queue_join_reject(&self_id, &group_id, &applicant, now).map_err(|_| "无法通知申请人".to_owned())?;
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub fn v1_remove_group_member(state: tauri::State<'_, AppState>, group_id: String, member: String) -> Result<(), String> {
     let actor = state.identity.fingerprint();
