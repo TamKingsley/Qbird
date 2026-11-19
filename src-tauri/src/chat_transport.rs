@@ -205,6 +205,22 @@ pub fn accept_one(identity: &Identity, store: &Mutex<Store>, socket: TcpStream) 
                     protocol::write_frame(&mut stream, &again)?;
                 }
             }
+            Payload::GroupAvatarRequest { id, group_id } => {
+                let png = store.lock().map_err(|_| invalid("store unavailable"))?
+                    .group_avatar(&group_id).ok().flatten();
+                let reply = Payload::GroupAvatar { id, group_id, png: png.map(|bytes| crate::base64::encode(&bytes)).unwrap_or_default() };
+                gate.outbound(&reply)?;
+                protocol::write_frame(&mut stream, &reply)?;
+            }
+            Payload::GroupAvatar { id, group_id, png } => {
+                let bytes = crate::base64::decode(&png).ok_or_else(|| invalid("invalid avatar encoding"))?;
+                let result = store.lock().map_err(|_| invalid("store unavailable"))?
+                    .receive_group_avatar(&self_id, &peer, &group_id, if bytes.is_empty() { None } else { Some(&bytes) }, unix_now())?;
+                if !matches!(result, IncomingResult::Inserted | IncomingResult::NotMember) {
+                    return Err(invalid("group avatar rejected").into());
+                }
+                acknowledge(&mut stream, &mut gate, &id)?;
+            }
             Payload::GroupJoinReject { id, group_id } => {
                 store.lock().map_err(|_| invalid("store unavailable"))?
                     .reject_out_join_request(&self_id, &group_id)?;
@@ -614,6 +630,28 @@ pub fn send_control_one(identity: &Identity, store: &Mutex<Store>, target: &str,
         return Err(invalid("control state changed").into());
     }
     Ok(())
+}
+
+/// Pull the group avatar from the owner. Members cache the last pulled copy locally,
+/// so an offline owner simply leaves the previous image in place.
+pub fn fetch_group_avatar(identity: &Identity, owner: &str, address: SocketAddr, group_id: &str) -> ChatResult<Option<Vec<u8>>> {
+    if address.port() == 0 || !crate::address::is_unicast(address.ip()) { return Err(invalid("invalid address").into()); }
+    let id = format!("avatar-{}-{}", std::process::id(), group_id);
+    let request = Payload::GroupAvatarRequest { id: id.clone(), group_id: group_id.to_owned() };
+    let (mut stream, mut gate) = connect(identity, owner, address)?;
+    gate.outbound(&request)?;
+    protocol::write_frame(&mut stream, &request)?;
+    let reply = protocol::read_frame(&mut stream)?;
+    gate.inbound(&reply)?;
+    let encoded = match reply {
+        Payload::GroupAvatar { id: echoed, group_id: echoed_group, png } if echoed == id && echoed_group == group_id => png,
+        _ => return Err(invalid("invalid avatar reply").into()),
+    };
+    let ack = Payload::Ack { id };
+    gate.outbound(&ack)?;
+    protocol::write_frame(&mut stream, &ack)?;
+    let bytes = crate::base64::decode(&encoded).ok_or_else(|| invalid("invalid avatar encoding"))?;
+    Ok(if bytes.is_empty() { None } else { Some(bytes) })
 }
 
 /// Ask each confirmed contact which of its groups match `query`. Best effort: a peer

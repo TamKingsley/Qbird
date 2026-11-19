@@ -889,6 +889,35 @@ async function saveContactProfile(peer: string): Promise<void> {
   } catch (error) { if (status) status.textContent = typeof error === 'string' ? error : '无法保存备注或分组'; }
 }
 
+async function loadGroupAvatarIcon(groupId: string, icon: HTMLImageElement): Promise<void> {
+  try {
+    const bytes = await invoke<number[] | null>('v1_group_avatar', { groupId });
+    if (bytes && bytes.length) icon.src = URL.createObjectURL(new Blob([toArrayBuffer(new Uint8Array(bytes))], { type: 'image/png' }));
+    else icon.hidden = true;
+  } catch { icon.hidden = true; }
+}
+
+/// Owner-only; the crop keeps the PNG small enough for the 96 KiB wire and storage cap.
+async function chooseGroupAvatar(): Promise<void> {
+  if (!isTauri() || !groupChat.groupId) return;
+  try {
+    const picked = await openFileDialog({ multiple: false, filters: [{ name: '图片', extensions: ['png', 'jpg', 'jpeg'] }] });
+    if (!picked || typeof picked !== 'string') return;
+    const source = new Uint8Array(await invoke<number[]>('v1_read_image_file', { path: picked }));
+    const cropped = await cropSquare(source, 256);
+    await invoke('v1_set_group_avatar', { groupId: groupChat.groupId, bytes: Array.from(cropped) });
+    await groupChat.loadAvatar();
+  } catch (error) { groupChat.notify(displayError(error)); }
+}
+
+async function clearGroupAvatar(): Promise<void> {
+  if (!isTauri() || !groupChat.groupId) return;
+  try {
+    await invoke('v1_set_group_avatar', { groupId: groupChat.groupId, bytes: [] });
+    await groupChat.loadAvatar();
+  } catch (error) { groupChat.notify(displayError(error)); }
+}
+
 async function searchGroups(): Promise<void> {
   if (!isTauri()) return;
   const query = app.querySelector<HTMLInputElement>('#group-search-name')?.value.trim() ?? '';
@@ -1043,7 +1072,12 @@ function paintGroups(contacts: Contact[]): void {
     }
     for (const group of groups) {
       const item = document.createElement('li');
-      item.textContent = `${group.name} · ${group.member_count} 人${group.is_owner ? ' · 我创建的' : ''}`;
+      const icon = document.createElement('img'); icon.className = 'group-list-avatar'; icon.alt = '';
+      void loadGroupAvatarIcon(group.id, icon);
+      item.append(icon);
+      const label = document.createElement('span');
+      label.textContent = `${group.name} · ${group.member_count} 人${group.is_owner ? ' · 我创建的' : ''}`;
+      item.append(label);
       const open = document.createElement('button');
       open.className = 'outline'; open.textContent = '打开群聊';
       open.dataset.action = 'open-group'; open.dataset.group = group.id; open.dataset.name = group.name;
@@ -1544,6 +1578,8 @@ app.addEventListener('click', (event) => {
   if (action?.dataset.action === 'add-group-member') { void groupChat.addMember(); return; }
   if (action?.dataset.action === 'remove-group-member' && action.dataset.member) { void groupChat.removeMember(action.dataset.member); return; }
   if (action?.dataset.action === 'create-group') { void createGroup(); return; }
+  if (action?.dataset.action === 'choose-group-avatar') { void chooseGroupAvatar(); return; }
+  if (action?.dataset.action === 'clear-group-avatar') { void clearGroupAvatar(); return; }
   if (action?.dataset.action === 'search-groups') { void searchGroups(); return; }
   if (action?.dataset.action === 'join-group' && action.dataset.group) {
     void requestJoin(action.dataset.group, action.dataset.name ?? '', action.dataset.owner ?? ''); return;

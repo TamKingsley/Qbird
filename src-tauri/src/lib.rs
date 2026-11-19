@@ -1,6 +1,7 @@
 pub mod address;
 pub mod app_state;
 pub mod avatar;
+pub mod base64;
 pub mod backup;
 mod auto_address;
 pub mod certificate;
@@ -118,6 +119,9 @@ pub fn run() {
             app_state::v1_set_lock_idle,
             app_state::v1_unlock,
             app_state::v1_list_group,
+            app_state::v1_group_avatar,
+            app_state::v1_set_group_avatar,
+            app_state::v1_fetch_group_avatar,
             app_state::v1_search_groups,
             app_state::v1_request_join_group,
             app_state::v1_join_requests,

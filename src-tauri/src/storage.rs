@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::{params, Connection, OptionalExtension, Result};
 use serde::Serialize;
 
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 14;
 
 /// Default cap for locally received attachments; the user may change it in settings.
 pub const DEFAULT_STORAGE_QUOTA: u64 = 2 * 1024 * 1024 * 1024;
@@ -611,6 +611,19 @@ impl Store {
                  );
                  CREATE INDEX IF NOT EXISTS group_file_transfers_by_peer ON group_file_transfers(peer, status);
                  PRAGMA user_version = 11;",
+            )?;
+            transaction.commit()?;
+        }
+        if version < 14 {
+            let transaction = connection.transaction()?;
+            // Avatars are small owner-chosen PNGs; members pull them on demand.
+            transaction.execute_batch(
+                "CREATE TABLE IF NOT EXISTS group_avatars (
+                    group_id TEXT PRIMARY KEY NOT NULL CHECK(length(group_id) = 32),
+                    png BLOB NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                PRAGMA user_version = 14;",
             )?;
             transaction.commit()?;
         }
@@ -2376,6 +2389,64 @@ impl Store {
         Ok(self.connection.execute("UPDATE group_control SET status = 'delivered' WHERE id = ?1 AND status = 'pending'", [id])? == 1)
     }
 
+    /// Owner-only; `None` removes the avatar. The bytes must be a bounded square PNG.
+    pub fn set_group_avatar(&self, actor: &str, group_id: &str, bytes: Option<&[u8]>, now: i64) -> Result<bool> {
+        if !valid_fingerprint(actor) || !valid_group_id(group_id) { return Err(rusqlite::Error::InvalidQuery); }
+        let owner: Option<String> = self.connection.query_row(
+            "SELECT owner FROM groups WHERE id = ?1", [group_id], |row| row.get(0)).optional()?;
+        if owner.as_deref() != Some(actor) { return Ok(false); }
+        match bytes {
+            None => { self.connection.execute("DELETE FROM group_avatars WHERE group_id = ?1", [group_id])?; }
+            Some(bytes) => {
+                if bytes.len() > crate::protocol::MAX_GROUP_AVATAR_BYTES || crate::avatar::validate(bytes).is_err() {
+                    return Err(rusqlite::Error::InvalidQuery);
+                }
+                self.connection.execute(
+                    "INSERT INTO group_avatars(group_id, png, updated_at) VALUES (?1, ?2, ?3)
+                     ON CONFLICT(group_id) DO UPDATE SET png = excluded.png, updated_at = excluded.updated_at",
+                    params![group_id, bytes, now])?;
+            }
+        }
+        Ok(true)
+    }
+
+    pub fn group_avatar(&self, group_id: &str) -> Result<Option<Vec<u8>>> {
+        if !valid_group_id(group_id) { return Err(rusqlite::Error::InvalidQuery); }
+        self.connection.query_row("SELECT png FROM group_avatars WHERE group_id = ?1", [group_id], |row| row.get(0)).optional()
+    }
+
+    /// Only the owner may define the avatar, and only for members still in the group.
+    pub fn receive_group_avatar(&self, self_id: &str, peer: &str, group_id: &str, png: Option<&[u8]>, now: i64) -> Result<IncomingResult> {
+        if !valid_fingerprint(self_id) || !valid_fingerprint(peer) || !valid_group_id(group_id) {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        let tx = self.connection.unchecked_transaction()?;
+        let verified: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM contacts WHERE fingerprint = ?1 AND trust_state = 'verified')",
+            [peer], |row| row.get(0))?;
+        if !verified { return Ok(IncomingResult::Unverified); }
+        let owner: Option<String> = tx.query_row("SELECT owner FROM groups WHERE id = ?1", [group_id], |row| row.get(0)).optional()?;
+        if owner.as_deref() != Some(peer) { return Ok(IncomingResult::Unverified); }
+        let member: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM group_members WHERE group_id = ?1 AND member = ?2 AND active = 1)",
+            params![group_id, self_id], |row| row.get(0))?;
+        if !member { return Ok(IncomingResult::NotMember); }
+        match png {
+            None => { tx.execute("DELETE FROM group_avatars WHERE group_id = ?1", [group_id])?; }
+            Some(bytes) => {
+                if bytes.len() > crate::protocol::MAX_GROUP_AVATAR_BYTES || crate::avatar::validate(bytes).is_err() {
+                    return Err(rusqlite::Error::InvalidQuery);
+                }
+                tx.execute(
+                    "INSERT INTO group_avatars(group_id, png, updated_at) VALUES (?1, ?2, ?3)
+                     ON CONFLICT(group_id) DO UPDATE SET png = excluded.png, updated_at = excluded.updated_at",
+                    params![group_id, bytes, now])?;
+            }
+        }
+        tx.commit()?;
+        Ok(IncomingResult::Inserted)
+    }
+
     /// Groups this device belongs to whose name matches `query`; reported on request.
     pub fn search_known_groups(&self, self_id: &str, query: &str) -> Result<Vec<crate::protocol::GroupDigest>> {
         if !valid_fingerprint(self_id) || query.trim().is_empty() || query.len() > crate::protocol::MAX_SEARCH_QUERY {
@@ -3473,6 +3544,43 @@ mod tests {
         );
         assert_eq!(store.list_group_members(&gid).unwrap().iter().filter(|member| member.active).count(), 2);
         assert_eq!(store.list_group_messages(&gid, 10, None).unwrap().len(), 2);
+    }
+
+    /// Minimal header-only PNG: the app validates the signature and square dimensions.
+    fn png_header(edge: u32) -> Vec<u8> {
+        let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13];
+        bytes.extend_from_slice(b"IHDR");
+        bytes.extend_from_slice(&edge.to_be_bytes());
+        bytes.extend_from_slice(&edge.to_be_bytes());
+        bytes
+    }
+
+    #[test]
+    fn group_avatar_is_owner_only_and_members_accept_owner_snapshots() {
+        let store = memory_store();
+        let owner = "b".repeat(64);
+        let me = "a".repeat(64);
+        let stranger = "c".repeat(64);
+        for peer in [&owner, &me, &stranger] {
+            store.add_candidate(peer, "P").unwrap();
+            store.confirm_candidate(peer).unwrap();
+        }
+        let group = store.create_group(&owner, "Team", &[me.clone()], 1).unwrap();
+        let png = png_header(128);
+
+        // Non-owners cannot set or clear the avatar.
+        assert!(!store.set_group_avatar(&me, &group.id, Some(&png), 2).unwrap());
+        // Malformed or oversized images are rejected.
+        assert!(store.set_group_avatar(&owner, &group.id, Some(b"not a png"), 3).is_err());
+        assert!(store.set_group_avatar(&owner, &group.id, Some(&vec![0u8; crate::protocol::MAX_GROUP_AVATAR_BYTES + 1]), 3).is_err());
+        assert!(store.set_group_avatar(&owner, &group.id, Some(&png), 4).unwrap());
+        assert_eq!(store.group_avatar(&group.id).unwrap().as_deref(), Some(png.as_slice()));
+
+        // Members only accept the owner's snapshot.
+        assert_eq!(store.receive_group_avatar(&me, &stranger, &group.id, Some(&png), 5).unwrap(), IncomingResult::Unverified);
+        assert_eq!(store.receive_group_avatar(&me, &owner, &group.id, Some(&png), 6).unwrap(), IncomingResult::Inserted);
+        assert!(store.set_group_avatar(&owner, &group.id, None, 7).unwrap());
+        assert!(store.group_avatar(&group.id).unwrap().is_none());
     }
 
     #[test]

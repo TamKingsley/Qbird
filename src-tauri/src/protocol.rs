@@ -55,7 +55,15 @@ pub enum Payload {
     GroupJoinRequest { id: String, group_id: String, name: String },
     /// The owner refused the request; terminal for the applicant.
     GroupJoinReject { id: String, group_id: String },
+    /// Ask the owner for the current group avatar; the owner answers or sends an empty image.
+    GroupAvatarRequest { id: String, group_id: String },
+    /// Base64 PNG chosen by the owner; an empty string means the group has no avatar.
+    GroupAvatar { id: String, group_id: String, png: String },
 }
+
+/// Decoded avatar budget shared by the wire, storage and UI (96 KiB).
+pub const MAX_GROUP_AVATAR_BYTES: usize = 96 * 1024;
+pub const MAX_GROUP_AVATAR_BASE64: usize = (MAX_GROUP_AVATAR_BYTES / 3 + 1) * 4;
 
 /// What one peer claims about a group it belongs to. Never a trust signal by itself.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -160,6 +168,10 @@ fn validate(payload: &Payload) -> io::Result<()> {
         Payload::GroupJoinRequest { id, group_id, name }
             if valid_id(id) && valid_group_id(group_id) && valid_group_name(name) => Ok(()),
         Payload::GroupJoinReject { id, group_id } if valid_id(id) && valid_group_id(group_id) => Ok(()),
+        Payload::GroupAvatarRequest { id, group_id } if valid_id(id) && valid_group_id(group_id) => Ok(()),
+        Payload::GroupAvatar { id, group_id, png }
+            if valid_id(id) && valid_group_id(group_id) && png.len() <= MAX_GROUP_AVATAR_BASE64
+                && png.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=')) => Ok(()),
         _ => Err(invalid("invalid message payload")),
     }
 }
@@ -323,6 +335,12 @@ mod tests {
         assert_eq!(read_frame(Cursor::new(&bytes)).unwrap(), request);
         assert!(write_frame(Vec::new(), &Payload::GroupJoinRequest { id: "join-1".into(), group_id: "short".into(), name: "团队".into() }).is_err());
         assert!(write_frame(Vec::new(), &Payload::GroupJoinRequest { id: "join-1".into(), group_id: "2".repeat(32), name: "  ".into() }).is_err());
+        let avatar = Payload::GroupAvatar { id: "avatar-1".into(), group_id: "2".repeat(32), png: "iVBORw0KGgo=".into() };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &avatar).unwrap();
+        assert_eq!(read_frame(Cursor::new(&bytes)).unwrap(), avatar);
+        assert!(write_frame(Vec::new(), &Payload::GroupAvatar { id: "avatar-1".into(), group_id: "2".repeat(32), png: "not base64!".into() }).is_err());
+        assert!(write_frame(Vec::new(), &Payload::GroupAvatarRequest { id: "avatar-1".into(), group_id: "short".into() }).is_err());
         let reject = Payload::GroupJoinReject { id: "join-1".into(), group_id: "2".repeat(32) };
         let mut bytes = Vec::new();
         write_frame(&mut bytes, &reject).unwrap();

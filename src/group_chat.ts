@@ -50,12 +50,14 @@ export class GroupChat {
   private thumbs = new Map<string, string>();
   private thumbPending = new Set<string>();
   private attaching = false;
+  private avatarUrl: string | null = null;
+  private avatarBytes: Uint8Array | null = null;
 
   constructor(private root: HTMLElement, private onChange: () => void) {}
 
   view(): string {
     return `<section class="self-chat" aria-label="群聊">
-      <header class="chat-header"><div><strong id="group-name"></strong><small id="group-subtitle">群聊</small></div><div class="group-actions"><button class="outline" data-action="export-text" data-kind="group">导出文本</button><button class="outline" data-action="toggle-group-search">搜索</button><button class="outline" data-action="toggle-group-members">成员</button><button class="outline" data-action="hide-group">不显示此会话</button><button class="outline" data-action="leave-group">退出群聊</button></div></header>
+      <header class="chat-header"><div class="chat-identity"><span class="chat-avatar" id="group-avatar">群</span><div><strong id="group-name"></strong><small id="group-subtitle">群聊</small></div></div><div class="group-actions"><button class="outline" id="group-avatar-button" data-action="choose-group-avatar" hidden>群头像</button><button class="outline" id="group-avatar-remove" data-action="clear-group-avatar" hidden>移除头像</button><button class="outline" data-action="export-text" data-kind="group">导出文本</button><button class="outline" data-action="toggle-group-search">搜索</button><button class="outline" data-action="toggle-group-members">成员</button><button class="outline" data-action="hide-group">不显示此会话</button><button class="outline" data-action="leave-group">退出群聊</button></div></header>
       <div class="group-search" id="group-search" hidden>
         <div class="search-row">
           <input id="group-search-query" type="search" maxlength="200" placeholder="搜索聊天记录" aria-label="搜索聊天记录">
@@ -82,6 +84,7 @@ export class GroupChat {
 
   clear(): void {
     this.groupId = ''; this.generation++; this.membersOpen = false; this.quoted = null;
+    this.setGroupAvatar(null);
     this.thumbs.clear(); this.thumbPending.clear();
     this.mentionQuery = null; this.mentioned.clear(); this.closeSearch();
   }
@@ -104,7 +107,7 @@ export class GroupChat {
     this.quoted = null; this.mentionQuery = null; this.mentioned.clear(); this.closeSearch();
     this.onChange();
     if (!this.self) { try { this.self = await invoke<string>('identity_fingerprint'); } catch { this.self = ''; } }
-    await Promise.all([this.load(false, true), this.loadMembers()]);
+    await Promise.all([this.load(false, true), this.loadMembers(), this.loadAvatar()]);
   }
 
   async load(older = false, initial = false): Promise<void> {
@@ -632,7 +635,43 @@ export class GroupChat {
     }
   }
 
+  /// Members pull the owner's copy on open; an offline owner keeps the cached image.
+  async loadAvatar(): Promise<void> {
+    if (!isTauri() || !this.groupId) return;
+    const groupId = this.groupId, generation = this.generation;
+    try { await invoke('v1_fetch_group_avatar', { groupId }); } catch { /* keep cache */ }
+    let bytes: number[] | null = null;
+    try { bytes = await invoke<number[] | null>('v1_group_avatar', { groupId }); } catch { return; }
+    if (generation !== this.generation) return;
+    this.setGroupAvatar(bytes && bytes.length ? new Uint8Array(bytes) : null);
+  }
+
+  setGroupAvatar(bytes: Uint8Array | null): void {
+    this.avatarBytes = bytes && bytes.length ? bytes : null;
+    if (this.avatarUrl) { URL.revokeObjectURL(this.avatarUrl); this.avatarUrl = null; }
+    this.avatarUrl = this.avatarBytes ? URL.createObjectURL(new Blob([toArrayBuffer(this.avatarBytes)], { type: 'image/png' })) : null;
+    this.paintAvatar();
+  }
+
+  private paintAvatar(): void {
+    const box = this.root.querySelector<HTMLElement>('#group-avatar');
+    if (!box) return;
+    box.replaceChildren();
+    if (this.avatarUrl) {
+      const image = document.createElement('img');
+      image.src = this.avatarUrl; image.alt = '群头像';
+      box.append(image);
+    } else {
+      box.textContent = this.name.slice(0, 1) || '群';
+    }
+  }
+
   render(): void {
+    this.paintAvatar();
+    const button = this.root.querySelector<HTMLButtonElement>('#group-avatar-button');
+    if (button) button.hidden = !this.isOwner;
+    const remove = this.root.querySelector<HTMLButtonElement>('#group-avatar-remove');
+    if (remove) remove.hidden = !this.isOwner;
     const name = this.root.querySelector<HTMLElement>('#group-name');
     const input = this.root.querySelector<HTMLTextAreaElement>('#group-input');
     if (name) name.textContent = this.name;
@@ -645,6 +684,13 @@ export class GroupChat {
     this.paintSearch();
     this.paint('bottom');
   }
+}
+
+/// Copies into a fresh ArrayBuffer so Blob accepts it under strict DOM typings.
+function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+  const buffer = new ArrayBuffer(bytes.byteLength);
+  new Uint8Array(buffer).set(bytes);
+  return buffer;
 }
 
 function previewOf(body: string): string {

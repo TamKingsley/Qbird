@@ -988,6 +988,62 @@ pub fn v1_add_group_member(state: tauri::State<'_, AppState>, group_id: String, 
     if added { Ok(()) } else { Err("只有群主可以添加，且该联系人须已确认、尚未在群中".into()) }
 }
 
+/// Avatar bytes for one group; only readable by active members.
+#[tauri::command]
+pub fn v1_group_avatar(state: tauri::State<'_, AppState>, group_id: String) -> Result<Option<Vec<u8>>, String> {
+    let self_id = state.identity.fingerprint();
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    let member = store.list_group_members(&group_id).map_err(|_| "无法读取群成员".to_owned())?
+        .into_iter().any(|item| item.member == self_id && item.active);
+    if !member { return Err("已不在该群中".into()); }
+    store.group_avatar(&group_id).map_err(|_| "无法读取群头像".to_owned())
+}
+
+/// Owner-only. An empty payload removes the avatar; the bytes are validated as a square PNG.
+#[tauri::command]
+pub fn v1_set_group_avatar(state: tauri::State<'_, AppState>, group_id: String, bytes: Vec<u8>) -> Result<(), String> {
+    let self_id = state.identity.fingerprint();
+    let now = unix_now()?;
+    let stored = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?
+        .set_group_avatar(&self_id, &group_id, if bytes.is_empty() { None } else { Some(&bytes) }, now)
+        .map_err(|_| "群头像需为不超过 96 KiB 的正方形 PNG".to_owned())?;
+    if stored { Ok(()) } else { Err("只有群主可以设置群头像".into()) }
+}
+
+/// Pulls the avatar from the owner when another member opens the group.
+#[tauri::command]
+pub async fn v1_fetch_group_avatar(state: tauri::State<'_, AppState>, group_id: String) -> Result<bool, String> {
+    let self_id = state.identity.fingerprint();
+    let (owner, address) = {
+        let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+        let members = store.list_group_members(&group_id).map_err(|_| "无法读取群成员".to_owned())?;
+        let Some(owner) = members.iter().find(|item| item.role == "owner").map(|item| item.member.clone()) else {
+            return Err("群不存在".into());
+        };
+        if owner == self_id { return Ok(false); }
+        if !members.iter().any(|item| item.member == self_id && item.active) { return Err("已不在该群中".into()); }
+        let address = store.contact_address(&owner).ok().flatten();
+        (owner, address)
+    };
+    let Some(address) = address.and_then(|value| crate::address::parse_manual_address(&value).ok()) else {
+        return Ok(false);
+    };
+    let store = Arc::clone(&state.store);
+    let identity = Arc::clone(&state.identity);
+    tauri::async_runtime::spawn_blocking(move || {
+        match crate::chat_transport::fetch_group_avatar(&identity, &owner, address, &group_id) {
+            Ok(bytes) => {
+                let now = unix_now()?;
+                store.lock().map_err(|_| "本地存储不可用".to_owned())?
+                    .receive_group_avatar(&self_id, &owner, &group_id, bytes.as_deref(), now)
+                    .map_err(|_| "无法保存群头像".to_owned())?;
+                Ok(true)
+            }
+            Err(_) => Ok(false),
+        }
+    }).await.map_err(|_| "群头像任务异常".to_owned())?
+}
+
 #[derive(serde::Serialize)]
 pub struct GroupSearchHit {
     pub group_id: String,
