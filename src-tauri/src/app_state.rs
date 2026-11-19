@@ -653,6 +653,69 @@ pub fn v1_set_composer_settings(state: tauri::State<'_, AppState>, send_shortcut
     read_composer(&store)
 }
 
+#[derive(serde::Serialize)]
+pub struct HoverSettings {
+    pub show_ip: bool,
+    pub show_mac: bool,
+}
+
+fn read_hover(store: &crate::storage::Store) -> Result<HoverSettings, String> {
+    let flag = |key: &str, default: bool| -> Result<bool, String> {
+        Ok(store.get_setting(key).map_err(|_| "无法读取悬浮信息设置".to_owned())?
+            .map(|value| value == "1").unwrap_or(default))
+    };
+    Ok(HoverSettings { show_ip: flag("hover_show_ip", true)?, show_mac: flag("hover_show_mac", false)? })
+}
+
+/// Contact hover card fields; MAC is opt-in and never fabricated when unavailable.
+#[tauri::command]
+pub fn v1_hover_settings(state: tauri::State<'_, AppState>) -> Result<HoverSettings, String> {
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    read_hover(&store)
+}
+
+#[tauri::command]
+pub fn v1_set_hover_settings(state: tauri::State<'_, AppState>, show_ip: bool, show_mac: bool) -> Result<HoverSettings, String> {
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    store.set_setting("hover_show_ip", Some(if show_ip { "1" } else { "0" })).map_err(|_| "无法保存悬浮信息设置".to_owned())?;
+    store.set_setting("hover_show_mac", Some(if show_mac { "1" } else { "0" })).map_err(|_| "无法保存悬浮信息设置".to_owned())?;
+    read_hover(&store)
+}
+
+#[derive(serde::Serialize)]
+pub struct ContactNetwork {
+    pub address: Option<String>,
+    pub ip: Option<String>,
+    pub mac: Option<String>,
+}
+
+/// Address comes from the local database; the MAC is a best-effort ARP lookup.
+#[tauri::command]
+pub fn v1_contact_network(state: tauri::State<'_, AppState>, peer: String) -> Result<ContactNetwork, String> {
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    let address = store.contact_address(&peer).map_err(|_| "无法读取联系人地址".to_owned())?;
+    drop(store);
+    let ip = address.as_deref().and_then(crate::network_info::ip_of);
+    let mac = ip.as_deref().and_then(crate::network_info::mac_for);
+    Ok(ContactNetwork { address, ip, mac })
+}
+
+/// Where clicking a chat image leads: the in-app lightbox or the right workspace panel.
+#[tauri::command]
+pub fn v1_image_open_mode(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    Ok(store.get_setting("image_open_mode").map_err(|_| "无法读取工作区设置".to_owned())?
+        .filter(|value| value == "workspace").unwrap_or_else(|| "lightbox".to_owned()))
+}
+
+#[tauri::command]
+pub fn v1_set_image_open_mode(state: tauri::State<'_, AppState>, mode: String) -> Result<String, String> {
+    if mode != "lightbox" && mode != "workspace" { return Err("图片打开方式无效".into()); }
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    store.set_setting("image_open_mode", Some(&mode)).map_err(|_| "无法保存工作区设置".to_owned())?;
+    Ok(mode)
+}
+
 /// Returns the local avatar as raw PNG bytes, or `null` when none is saved.
 #[tauri::command]
 pub fn v1_avatar(state: tauri::State<'_, AppState>) -> Result<Option<Vec<u8>>, String> {

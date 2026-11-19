@@ -67,6 +67,10 @@ let teamLogoUrl: string | null = null;
 let teamNotice = '';
 let chatArchiveNotice = '';
 let chatArchiveBusy = false;
+let imageOpenMode: 'lightbox' | 'workspace' = 'lightbox';
+let imageOpenNotice = '';
+let hover = { show_ip: true, show_mac: false };
+let hoverNotice = '';
 const COMMON_EMOJIS = ['😀', '😁', '😂', '🤣', '😊', '😍', '😘', '😜', '🤔', '😅', '😭', '😡', '👍', '👎', '👏', '🙏', '💪', '🎉', '❤️', '💔', '🔥', '✨', '⭐', '🌹', '🍀', '☕', '🍰', '🐱', '🐶', '🌙', '☀️', '💡', '✅', '❌', '⚠️', '📌', '📎', '🚀', '🎯', '💬', '🙌', '🤝', '😴', '😎', '🥳', '🤩', '😢', '😤'];
 let stickers: string[] = [];
 let stickersLoaded = false;
@@ -296,6 +300,14 @@ function profileView(): string {
     <input id="profile-email" type="text" maxlength="128" autocomplete="off">
     <div class="probe-row"><button class="outline" data-action="save-profile">保存资料</button></div>
     <p id="profile-notice" role="status">${profileNotice}</p>
+    <div class="probe-box"><h3>联系人悬浮信息</h3>
+      <p>悬停联系人时显示：${hover.show_ip ? 'IP 地址' : '不显示 IP'}${hover.show_mac ? '、MAC 地址' : '、不显示 MAC'}。</p>
+      <p><label><input id="hover-show-ip" type="checkbox" ${hover.show_ip ? 'checked' : ''}> 显示 IP 地址（来自本机保存的联系人地址）</label></p>
+      <p><label><input id="hover-show-mac" type="checkbox" ${hover.show_mac ? 'checked' : ''}> 显示 MAC 地址（读取本机 ARP 表，取不到时显示“未获取”）</label></p>
+      <div class="probe-row"><button class="outline" data-action="save-hover-settings">保存悬浮设置</button></div>
+      <p id="hover-notice" role="status">${hoverNotice}</p>
+      <small>IP 与 MAC 只作参考，不构成身份凭证；跨网段或系统未缓存时 MAC 无法获取，界面不会虚构。</small>
+    </div>
     <p>本机身份指纹（SHA-256）：<br><code class="fingerprint">${fingerprint}</code></p>
     <p id="avatar-notice" role="status">${avatarNotice}</p>
   </section>`;
@@ -682,6 +694,17 @@ function workspaceSettingsHtml(): string {
       <p id="team-notice" role="status">${teamNotice}</p>
       <small>团队名称与 Logo 只保存在本机侧栏与设置页，不随消息或群组发送。</small>
     </div>
+    <div class="probe-box"><h3>右侧工作区</h3>
+      <p>图片打开方式：${imageOpenMode === 'workspace' ? '在右侧工作区预览' : '在灯箱中放大'}</p>
+      <label for="image-open-mode">点击聊天图片时</label>
+      <select id="image-open-mode">
+        <option value="lightbox" ${imageOpenMode === 'lightbox' ? 'selected' : ''}>灯箱查看（可缩放、旋转、拖拽）</option>
+        <option value="workspace" ${imageOpenMode === 'workspace' ? 'selected' : ''}>右侧工作区打开</option>
+      </select>
+      <div class="probe-row"><button class="outline" data-action="save-image-open-mode">保存图片打开方式</button></div>
+      <p id="image-open-notice" role="status">${imageOpenNotice}</p>
+      <small>工作区面板可拖拽调宽；群聊目前只能预览图片，其他文件请用“打开所在目录”。</small>
+    </div>
     <div class="probe-box"><h3>表情</h3>
       <p>常用表情和本地表情收藏在聊天输入区的“表情”按钮中管理；收藏的表情按图片文件发送给已确认联系人。</p>
       <small>本地收藏最多 64 个，单个不超过 512 KiB，支持 PNG、JPEG、GIF 与 WebP。</small>
@@ -963,6 +986,47 @@ async function loadGroupAvatarIcon(groupId: string, icon: HTMLImageElement): Pro
     if (bytes && bytes.length) icon.src = URL.createObjectURL(new Blob([toArrayBuffer(new Uint8Array(bytes))], { type: 'image/png' }));
     else icon.hidden = true;
   } catch { icon.hidden = true; }
+}
+
+async function refreshHover(): Promise<void> {
+  if (!isTauri()) return;
+  try { hover = await invoke<{ show_ip: boolean; show_mac: boolean }>('v1_hover_settings'); }
+  catch { hoverNotice = '无法读取悬浮信息设置'; }
+}
+
+async function saveHover(): Promise<void> {
+  if (!isTauri()) return;
+  const showIp = app.querySelector<HTMLInputElement>('#hover-show-ip')?.checked ?? true;
+  const showMac = app.querySelector<HTMLInputElement>('#hover-show-mac')?.checked ?? false;
+  try {
+    hover = await invoke<{ show_ip: boolean; show_mac: boolean }>('v1_set_hover_settings', { showIp, showMac });
+    hoverNotice = '悬浮信息设置已保存。';
+  } catch (error) { hoverNotice = displayError(error); }
+  render();
+}
+
+async function refreshImageOpenMode(): Promise<void> {
+  if (!isTauri()) return;
+  try {
+    const mode = await invoke<'lightbox' | 'workspace'>('v1_image_open_mode');
+    applyImageOpenMode(mode);
+  } catch { imageOpenNotice = '无法读取图片打开方式'; }
+}
+
+function applyImageOpenMode(mode: 'lightbox' | 'workspace'): void {
+  imageOpenMode = mode;
+  direct.imageOpenMode = mode;
+  groupChat.imageOpenMode = mode;
+}
+
+async function saveImageOpenMode(): Promise<void> {
+  if (!isTauri()) return;
+  const mode = app.querySelector<HTMLSelectElement>('#image-open-mode')?.value === 'workspace' ? 'workspace' : 'lightbox';
+  try {
+    applyImageOpenMode(await invoke<'lightbox' | 'workspace'>('v1_set_image_open_mode', { mode }));
+    imageOpenNotice = mode === 'workspace' ? '已改为在右侧工作区打开图片。' : '已改为灯箱查看图片。';
+  } catch (error) { imageOpenNotice = displayError(error); }
+  render();
 }
 
 async function refreshTeam(): Promise<void> {
@@ -1273,7 +1337,7 @@ function render(): void {
         <button class="rail-bottom" data-action="lock-now" aria-label="临时离开锁定" title="临时离开锁定">${icon('lock')}</button>
         <button class="rail-bottom" data-action="menu" aria-label="更多" aria-expanded="${menuOpen}" title="更多">${icon('menu')}</button>
       </aside>
-      ${menuOpen ? '<div class="menu" role="menu"><button data-page="settings" role="menuitem">设置</button><button data-page="settings" data-settings-tab="privacy" role="menuitem">备份与聊天记录</button><button data-page="about" role="menuitem">关于</button></div>' : ''}
+      ${menuOpen ? '<div class="menu" role="menu"><button data-page="settings" role="menuitem">设置</button><button data-page="settings" data-settings-tab="privacy" role="menuitem">聊天备份</button><span>用户备份 · 待实现（将含身份私钥）</span><span>用户还原 · 待实现</span><button data-page="settings" data-settings-tab="privacy" role="menuitem">聊天记录还原</button><button data-page="about" role="menuitem">关于</button></div>' : ''}
       <aside class="sidebar">
         <div class="team"><span class="team-mark">${teamLogoUrl ? `<img class="team-logo" src="${teamLogoUrl}" alt="团队 Logo">` : icon('spark')}</span><div><strong>${team.name ? escapeText(team.name) : 'Qbird 青鸟'}</strong><small>LOCAL NETWORK MESSENGER</small></div></div>
         <div class="side-heading"><div><span class="eyebrow">${current.eyebrow}</span><h1>${current.title}</h1></div></div>
@@ -1601,11 +1665,21 @@ function showContactTip(row: HTMLElement): void {
   tip.style.top = `${Math.min(box.bottom + 6, window.innerHeight - 120)}px`;
   tip.hidden = false;
   if (!fingerprint) return;
-  void invoke<string | null>('v1_contact_address', { peer: fingerprint }).then((address) => {
-    if (tip.hidden || tip.dataset.fingerprint !== fingerprint) return;
-    const line = document.createElement('span'); line.textContent = `地址：${address ?? '未记录'}`;
-    tip.append(line);
-  }).catch(() => {});
+  if (hover.show_ip || hover.show_mac) {
+    void invoke<{ address: string | null; ip: string | null; mac: string | null }>('v1_contact_network', { peer: fingerprint }).then((info) => {
+      if (tip.hidden || tip.dataset.fingerprint !== fingerprint) return;
+      if (hover.show_ip) {
+        const line = document.createElement('span');
+        line.textContent = `IP：${info.ip ?? '未记录地址'}`;
+        tip.append(line);
+      }
+      if (hover.show_mac) {
+        const mac = document.createElement('span');
+        mac.textContent = `MAC：${info.mac ?? '未获取（跨网段或本机 ARP 无记录）'}`;
+        tip.append(mac);
+      }
+    }).catch(() => {});
+  }
   tip.dataset.fingerprint = fingerprint;
 }
 
@@ -1758,6 +1832,15 @@ app.addEventListener('click', (event) => {
   if (action?.dataset.action === 'add-group-member') { void groupChat.addMember(); return; }
   if (action?.dataset.action === 'remove-group-member' && action.dataset.member) { void groupChat.removeMember(action.dataset.member); return; }
   if (action?.dataset.action === 'create-group') { void createGroup(); return; }
+  if (action?.dataset.action === 'save-hover-settings') { void saveHover(); return; }
+  if (action?.dataset.action === 'save-image-open-mode') { void saveImageOpenMode(); return; }
+  if (action?.dataset.action === 'group-preview-file' && action.dataset.id) { groupChat.openPreviewById(action.dataset.id); return; }
+  if (action?.dataset.action === 'group-panel-close') { groupChat.closePanel(); return; }
+  if (action?.dataset.action === 'group-panel-reveal' && groupChat.panelId) {
+    void invoke('v1_reveal_group_attachment', { groupId: groupChat.groupId, messageId: groupChat.panelId })
+      .catch((error) => { groupChat.notify(displayError(error)); });
+    return;
+  }
   if (action?.dataset.action === 'export-chat-archive') { void exportChatArchive(); return; }
   if (action?.dataset.action === 'import-chat-archive') { void importChatArchive(); return; }
   if (action?.dataset.action === 'save-team-name') { void saveTeamName(); return; }
@@ -1829,6 +1912,8 @@ void refreshScanState().then(() => { if (!lockState.locked) render(); });
 void refreshExperiments().then(() => { if (!lockState.locked) render(); });
 void refreshFileAccept().then(() => { if (!lockState.locked) render(); });
 void refreshTeam().then(() => { if (!lockState.locked) render(); });
+void refreshImageOpenMode().then(() => { if (!lockState.locked) render(); });
+void refreshHover().then(() => { if (!lockState.locked) render(); });
 for (const type of ['pointerdown', 'keydown', 'wheel', 'mousemove'] as const) {
   window.addEventListener(type, () => { lastActivity = Date.now(); }, { passive: true });
 }

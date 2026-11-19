@@ -37,6 +37,8 @@ export class DirectChat {
   private panelWidth = 380;
   private panelBusy = false;
   private offers: FileOffer[] = [];
+  /// 'lightbox' keeps the in-app viewer; 'workspace' opens the right panel instead.
+  imageOpenMode: 'lightbox' | 'workspace' = 'lightbox';
 
   constructor(private root: HTMLElement, private onChange: () => void) {
     // The resizer is re-created on every render, so a single delegated listener is enough.
@@ -359,7 +361,11 @@ export class DirectChat {
     if (!url || !holder || holder.firstChild) return;
     const image = document.createElement('img');
     image.src = url; image.alt = '聊天图片'; image.className = 'message-image';
-    image.addEventListener('click', () => showImage(url, '聊天图片'));
+    image.addEventListener('click', () => {
+      const message = this.messages.find(item => item.id === id);
+      if (this.imageOpenMode === 'workspace' && message) { void this.openPreview(message); return; }
+      showImage(url, '聊天图片');
+    });
     holder.append(image);
   }
 

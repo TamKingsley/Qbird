@@ -17,6 +17,7 @@ const cursorOf = (message: GroupMessage): Cursor => ({ logical: message.logical,
 const compare = (a: Cursor, b: Cursor): number => a.logical - b.logical || (a.sender < b.sender ? -1 : a.sender > b.sender ? 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
 type SearchCategory = 'all' | 'text' | 'file' | 'image';
 type Quoted = { id: string; name: string; preview: string };
+type Panel = { id: string; name: string; kind: string };
 
 /// Group chat: outbound messages are queued per member by the backend, so the UI only
 /// shows the pending count and never claims delivery on its own. Replies keep a short
@@ -52,8 +53,15 @@ export class GroupChat {
   private attaching = false;
   private avatarUrl: string | null = null;
   private avatarBytes: Uint8Array | null = null;
+  private panel: Panel | null = null;
+  private panelWidth = 380;
+  /// 'lightbox' keeps the in-app viewer; 'workspace' opens the right panel instead.
+  imageOpenMode: 'lightbox' | 'workspace' = 'lightbox';
 
-  constructor(private root: HTMLElement, private onChange: () => void) {}
+  constructor(private root: HTMLElement, private onChange: () => void) {
+    // The panel resizer is recreated on every render, so one delegated listener suffices.
+    root.addEventListener('pointerdown', (event) => this.startResize(event));
+  }
 
   view(): string {
     return `<section class="self-chat" aria-label="群聊">
@@ -79,11 +87,17 @@ export class GroupChat {
         <p id="group-file-status" role="status"></p>
         <p id="group-error" role="status"></p>
       </div>
+      <aside class="file-panel" id="group-panel" hidden aria-label="文件预览">
+        <div class="panel-resizer" data-role="panel-resizer" aria-hidden="true"></div>
+        <header class="panel-header"><strong id="group-panel-title"></strong><div class="panel-actions"><button class="outline" data-action="group-panel-reveal">打开所在目录</button><button class="outline" data-action="group-panel-close">关闭</button></div></header>
+        <div class="panel-body" id="group-panel-body"></div>
+      </aside>
     </section>`;
   }
 
   clear(): void {
     this.groupId = ''; this.generation++; this.membersOpen = false; this.quoted = null;
+    this.closePanel();
     this.setGroupAvatar(null);
     this.thumbs.clear(); this.thumbPending.clear();
     this.mentionQuery = null; this.mentioned.clear(); this.closeSearch();
@@ -471,7 +485,10 @@ export class GroupChat {
       const row = document.createElement('div'); row.className = 'group-member-row';
       const name = document.createElement('span');
       name.textContent = `${member.display_name}${member.role === 'owner' ? ' · 群主' : ''}${member.member === this.self ? ' · 我' : ''}`;
-      row.append(name);
+      const joined = document.createElement('small');
+      joined.className = 'file-meta';
+      joined.textContent = member.joined_at > 0 ? `${formatJoined(member.joined_at)} 进群` : '进群时间未知';
+      row.append(name, joined);
       if (this.isOwner && member.role !== 'owner') {
         const transfer = document.createElement('button');
         transfer.className = 'outline'; transfer.textContent = '转让群主';
@@ -554,6 +571,75 @@ export class GroupChat {
     }
   }
 
+  /// Show one completed group attachment in the right workspace panel.
+  async openPreview(message: GroupMessage): Promise<void> {
+    if (!isTauri() || message.kind !== 'file' || message.file_status !== 'completed') return;
+    const name = message.file_name ?? message.body;
+    const kind = previewKind(name);
+    this.panel = { id: message.id, name, kind };
+    this.paintPanel('正在读取…');
+    try {
+      if (kind === 'other') { this.paintPanel('该类型暂不支持预览，可使用“打开所在目录”。'); return; }
+      if (kind !== 'image') { this.paintPanel('群聊目前只能预览图片，其他文件请使用“打开所在目录”。'); return; }
+      const preview = await invoke<{ name: string; data_url: string } | null>('v1_read_group_attachment', { groupId: this.groupId, messageId: message.id });
+      if (!preview) { this.paintPanel('图片过大或无法读取，未能预览'); return; }
+      this.thumbs.set(message.id, preview.data_url);
+      this.paintPanel('', preview.data_url);
+    } catch (error) { this.paintPanel(typeof error === 'string' ? error : '无法读取群文件'); }
+  }
+
+  get panelId(): string { return this.panel?.id ?? ''; }
+
+  openPreviewById(id: string): void {
+    const message = this.messages.find(item => item.id === id);
+    if (message) void this.openPreview(message);
+  }
+
+  closePanel(): void {
+    this.panel = null;
+    const panel = this.root.querySelector<HTMLElement>('#group-panel');
+    if (panel) panel.hidden = true;
+  }
+
+  private paintPanel(message: string, content?: string): void {
+    const panel = this.root.querySelector<HTMLElement>('#group-panel');
+    const title = this.root.querySelector<HTMLElement>('#group-panel-title');
+    const body = this.root.querySelector<HTMLElement>('#group-panel-body');
+    if (!panel || !title || !body) return;
+    if (!this.panel) { panel.hidden = true; return; }
+    panel.hidden = false;
+    panel.style.width = `${this.panelWidth}px`;
+    title.textContent = this.panel.name;
+    body.replaceChildren();
+    if (!content) {
+      const note = document.createElement('p'); note.className = 'panel-note'; note.textContent = message;
+      body.append(note);
+      return;
+    }
+    if (this.panel.kind === 'image') {
+      const image = document.createElement('img'); image.src = content; image.alt = this.panel.name;
+      body.append(image);
+      return;
+    }
+    const note = document.createElement('p'); note.className = 'panel-note'; note.textContent = message;
+    body.append(note);
+  }
+
+  private startResize(event: PointerEvent): void {
+    const target = event.target;
+    if (!(target instanceof HTMLElement) || target.dataset.role !== 'panel-resizer') return;
+    event.preventDefault();
+    const startX = event.clientX, startWidth = this.panelWidth;
+    const move = (moveEvent: PointerEvent) => {
+      this.panelWidth = Math.min(Math.max(startWidth + (startX - moveEvent.clientX), 280), window.innerWidth * 0.7);
+      const panel = this.root.querySelector<HTMLElement>('#group-panel');
+      if (panel) panel.style.width = `${this.panelWidth}px`;
+    };
+    const up = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up); };
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', up);
+  }
+
   private paint(mode: 'bottom' | 'preserve' | 'auto'): void {
     const history = this.root.querySelector<HTMLElement>('#group-history');
     const list = this.root.querySelector<HTMLElement>('#group-messages');
@@ -588,7 +674,10 @@ export class GroupChat {
         if (this.isImageMessage(message) && this.thumbs.has(message.id)) {
           const image = document.createElement('img'); image.className = 'file-thumb'; image.src = this.thumbs.get(message.id) ?? '';
           image.alt = message.file_name ?? '图片';
-          image.addEventListener('click', () => showImage(image.src, message.file_name ?? '图片'));
+          image.addEventListener('click', () => {
+            if (this.imageOpenMode === 'workspace') { void this.openPreview(message); return; }
+            showImage(image.src, message.file_name ?? '图片');
+          });
           card.append(image);
           this.loadThumbnail(message.id);
         } else if (this.isImageMessage(message) && message.file_status === 'completed') {
@@ -599,10 +688,13 @@ export class GroupChat {
         meta.textContent = `${this.formatSize(message.file_size ?? 0)} · ${this.fileStatusText(message)}`;
         card.append(name, meta);
         if (message.file_status === 'completed') {
+          const preview = document.createElement('button');
+          preview.className = 'linkish'; preview.textContent = '预览';
+          preview.dataset.action = 'group-preview-file'; preview.dataset.id = message.id;
           const reveal = document.createElement('button');
           reveal.className = 'linkish'; reveal.textContent = '打开所在目录';
           reveal.dataset.action = 'group-reveal-file'; reveal.dataset.id = message.id;
-          card.append(reveal);
+          card.append(preview, reveal);
         }
         bubble.append(card);
       } else {
@@ -691,6 +783,21 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
   const buffer = new ArrayBuffer(bytes.byteLength);
   new Uint8Array(buffer).set(bytes);
   return buffer;
+}
+
+function previewKind(name: string): 'image' | 'html' | 'markdown' | 'text' | 'other' {
+  const extension = name.slice(name.lastIndexOf('.') + 1).toLowerCase();
+  if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp'].includes(extension)) return 'image';
+  if (['html', 'htm'].includes(extension)) return 'html';
+  if (['md', 'markdown'].includes(extension)) return 'markdown';
+  if (['txt', 'log', 'csv', 'json', 'xml', 'ini', 'toml', 'yaml', 'yml'].includes(extension)) return 'text';
+  return 'other';
+}
+
+function formatJoined(seconds: number): string {
+  const date = new Date(seconds * 1000);
+  if (Number.isNaN(date.getTime())) return '进群时间未知';
+  return date.toLocaleDateString();
 }
 
 function previewOf(body: string): string {
