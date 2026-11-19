@@ -377,6 +377,34 @@ pub fn v1_set_profile(state: tauri::State<'_, AppState>, nickname: String, email
     store.get_profile().map_err(|_| "无法读取个人资料".to_owned())
 }
 
+#[tauri::command]
+pub fn v1_list_stickers(state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
+    crate::stickers::list(&state.data_dir)
+}
+
+/// Copies a user-picked image into the sticker collection.
+#[tauri::command]
+pub fn v1_add_sticker(state: tauri::State<'_, AppState>, path: String) -> Result<String, String> {
+    crate::stickers::add(&state.data_dir, Path::new(&path))
+}
+
+#[tauri::command]
+pub fn v1_sticker_bytes(state: tauri::State<'_, AppState>, name: String) -> Result<Vec<u8>, String> {
+    crate::stickers::read(&state.data_dir, &name)
+}
+
+/// Returns the absolute path so the sticker can be sent as a normal image file.
+#[tauri::command]
+pub fn v1_sticker_path(state: tauri::State<'_, AppState>, name: String) -> Result<String, String> {
+    let path = crate::stickers::path(&state.data_dir, &name)?;
+    path.to_str().map(str::to_owned).ok_or_else(|| "表情路径无效".to_owned())
+}
+
+#[tauri::command]
+pub fn v1_remove_sticker(state: tauri::State<'_, AppState>, name: String) -> Result<(), String> {
+    crate::stickers::remove(&state.data_dir, &name)
+}
+
 /// Composer preferences shared by direct, group and self chats.
 #[derive(serde::Serialize)]
 pub struct ComposerSettings {

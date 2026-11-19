@@ -13,6 +13,7 @@ pub mod probe;
 pub mod probe_service;
 pub mod protocol;
 pub mod retry_queue;
+pub mod stickers;
 pub mod storage;
 pub mod tls;
 
@@ -36,6 +37,11 @@ pub fn run() {
             app_state::v1_profile,
             app_state::v1_set_profile,
             app_state::v1_composer_settings,
+            app_state::v1_list_stickers,
+            app_state::v1_add_sticker,
+            app_state::v1_sticker_bytes,
+            app_state::v1_sticker_path,
+            app_state::v1_remove_sticker,
             app_state::v1_set_composer_settings,
             app_state::v1_avatar,
             app_state::v1_set_avatar,

@@ -37,6 +37,12 @@ let avatarBusy = false;
 type ComposerSettings = { send_shortcut: string; rows: number };
 let composer: ComposerSettings = { send_shortcut: 'enter', rows: 3 };
 let composerNotice = '';
+const COMMON_EMOJIS = ['😀', '😁', '😂', '🤣', '😊', '😍', '😘', '😜', '🤔', '😅', '😭', '😡', '👍', '👎', '👏', '🙏', '💪', '🎉', '❤️', '💔', '🔥', '✨', '⭐', '🌹', '🍀', '☕', '🍰', '🐱', '🐶', '🌙', '☀️', '💡', '✅', '❌', '⚠️', '📌', '📎', '🚀', '🎯', '💬', '🙌', '🤝', '😴', '😎', '🥳', '🤩', '😢', '😤'];
+let stickers: string[] = [];
+let stickersLoaded = false;
+const stickerUrls = new Map<string, string>();
+let stickerManage = false;
+let emojiNotice = '';
 type Profile = { nickname: string; email: string };
 type Conversation = { id: string; last_body: string; last_logical: number; kind: string };
 type Group = { id: string; name: string; owner: string; member_count: number; hidden: boolean; is_owner: boolean; last_body: string; last_logical: number };
@@ -330,6 +336,107 @@ async function clearAvatar(): Promise<void> {
     avatarNotice = '头像已移除。';
   } catch (error) { avatarNotice = displayError(error); }
   finally { avatarBusy = false; if (page === 'profile') render(); }
+}
+
+function emojiPanelHtml(): string {
+  const grid = COMMON_EMOJIS.map((emoji) => `<button type="button" data-action="pick-emoji" data-emoji="${emoji}">${emoji}</button>`).join('');
+  return `<div class="emoji-grid">${grid}</div>
+    <div class="sticker-head"><strong>我的表情</strong><button type="button" class="outline" data-action="add-sticker">添加…</button><button type="button" class="outline" data-action="toggle-sticker-manage">${stickerManage ? '完成' : '管理'}</button></div>
+    <div class="sticker-list"></div>
+    <p class="emoji-notice" role="status">${emojiNotice}</p>`;
+}
+
+/// Re-created after every render, so the trigger and panel always exist together.
+function applyEmojiUI(): void {
+  for (const compose of app.querySelectorAll<HTMLElement>('.chat-compose')) {
+    if (compose.querySelector('[data-action="toggle-emoji"]')) continue;
+    const footer = compose.querySelector<HTMLElement>('.compose-footer');
+    if (!footer) continue;
+    const toggle = document.createElement('button');
+    toggle.type = 'button';
+    toggle.className = 'outline emoji-toggle';
+    toggle.dataset.action = 'toggle-emoji';
+    toggle.textContent = '表情';
+    footer.insertBefore(toggle, footer.firstChild);
+    const panel = document.createElement('div');
+    panel.className = 'emoji-panel';
+    panel.hidden = true;
+    panel.innerHTML = emojiPanelHtml();
+    footer.after(panel);
+  }
+}
+
+/// Loads sticker thumbnails only when a panel is opened, never on every render.
+async function loadStickers(panel: HTMLElement): Promise<void> {
+  if (!isTauri()) return;
+  try {
+    if (!stickersLoaded) { stickers = await invoke<string[]>('v1_list_stickers'); stickersLoaded = true; }
+    for (const name of stickers) {
+      if (stickerUrls.has(name)) continue;
+      const bytes = new Uint8Array(await invoke<number[]>('v1_sticker_bytes', { name }));
+      stickerUrls.set(name, URL.createObjectURL(new Blob([toArrayBuffer(bytes)])));
+    }
+  } catch { emojiNotice = '无法读取表情收藏'; }
+  paintStickers(panel);
+}
+
+function paintStickers(panel: HTMLElement): void {
+  const list = panel.querySelector<HTMLElement>('.sticker-list');
+  const notice = panel.querySelector<HTMLElement>('.emoji-notice');
+  if (notice) notice.textContent = emojiNotice;
+  if (!list) return;
+  if (!stickers.length) { list.textContent = '还没有收藏的表情，点击“添加…”选择 PNG、GIF、JPEG 或 WebP（≤512 KiB）。'; return; }
+  list.innerHTML = stickers.map((name) => `<div class="sticker"><button type="button" data-action="use-sticker" data-name="${name}" title="发送此表情"><img src="${stickerUrls.get(name) ?? ''}" alt=""></button>${stickerManage ? `<button type="button" class="sticker-remove" data-action="remove-sticker" data-name="${name}" aria-label="移除表情">×</button>` : ''}</div>`).join('');
+}
+
+function insertAtCursor(input: HTMLTextAreaElement, text: string): void {
+  const start = input.selectionStart ?? input.value.length;
+  const end = input.selectionEnd ?? start;
+  input.setRangeText(text, start, end, 'end');
+  input.focus();
+  input.dispatchEvent(new Event('input', { bubbles: true }));
+}
+
+async function sendSticker(name: string): Promise<void> {
+  if (!isTauri()) return;
+  if (!direct.peer) { emojiNotice = '请先打开一个单聊，再发送表情。'; paintEmojiNotices(); return; }
+  try {
+    const path = await invoke<string>('v1_sticker_path', { name });
+    await direct.queuePaths([path]);
+    emojiNotice = '表情已加入待发送队列。';
+  } catch (error) { emojiNotice = displayError(error); }
+  paintEmojiNotices();
+}
+
+async function addSticker(): Promise<void> {
+  if (!isTauri()) return;
+  const picked = await openFileDialog({ multiple: false, filters: [{ name: '表情图片', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp'] }] });
+  if (!picked || typeof picked !== 'string') return;
+  try {
+    const name = await invoke<string>('v1_add_sticker', { path: picked });
+    stickersLoaded = true;
+    if (!stickers.includes(name)) stickers = [...stickers, name].sort();
+    emojiNotice = '已加入我的表情。';
+  } catch (error) { emojiNotice = displayError(error); }
+  const panel = app.querySelector<HTMLElement>('.emoji-panel');
+  if (panel) void loadStickers(panel);
+}
+
+async function removeSticker(name: string): Promise<void> {
+  if (!isTauri()) return;
+  try {
+    await invoke('v1_remove_sticker', { name });
+    stickers = stickers.filter((item) => item !== name);
+    const url = stickerUrls.get(name);
+    if (url) { URL.revokeObjectURL(url); stickerUrls.delete(name); }
+    emojiNotice = '表情已移除。';
+  } catch (error) { emojiNotice = displayError(error); }
+  const panel = app.querySelector<HTMLElement>('.emoji-panel');
+  if (panel) paintStickers(panel);
+}
+
+function paintEmojiNotices(): void {
+  for (const notice of app.querySelectorAll<HTMLElement>('.emoji-notice')) notice.textContent = emojiNotice;
 }
 
 function sendHint(): string {
@@ -709,6 +816,7 @@ function render(): void {
     }
   }
   applyComposerSettings();
+  applyEmojiUI();
 }
 
 function paintDiscovery(): void {
@@ -1080,6 +1188,25 @@ app.addEventListener('click', (event) => {
   if (action?.dataset.action === 'backup-restore-overwrite') { void restoreBackup(true); return; }
   if (action?.dataset.action === 'save-profile') { void saveProfile(); return; }
   if (action?.dataset.action === 'save-composer') { void saveComposer(); return; }
+  if (action?.dataset.action === 'toggle-emoji') {
+    const panel = action.closest('.chat-compose')?.querySelector<HTMLElement>('.emoji-panel');
+    if (panel) { const open = panel.hidden; if (open) void loadStickers(panel); panel.hidden = !open; }
+    return;
+  }
+  if (action?.dataset.action === 'pick-emoji' && action.dataset.emoji) {
+    const input = action.closest('.chat-compose')?.querySelector<HTMLTextAreaElement>('textarea');
+    if (input) insertAtCursor(input, action.dataset.emoji);
+    return;
+  }
+  if (action?.dataset.action === 'add-sticker') { void addSticker(); return; }
+  if (action?.dataset.action === 'use-sticker' && action.dataset.name) { void sendSticker(action.dataset.name); return; }
+  if (action?.dataset.action === 'remove-sticker' && action.dataset.name) { void removeSticker(action.dataset.name); return; }
+  if (action?.dataset.action === 'toggle-sticker-manage') {
+    stickerManage = !stickerManage;
+    const panel = app.querySelector<HTMLElement>('.emoji-panel');
+    if (panel) { panel.innerHTML = emojiPanelHtml(); void loadStickers(panel); }
+    return;
+  }
   if (action?.dataset.action === 'choose-avatar') { void chooseAvatar(); return; }
   if (action?.dataset.action === 'clear-avatar') { void clearAvatar(); return; }
   if (action?.dataset.action === 'save-contact-profile' && action.dataset.peer) { void saveContactProfile(action.dataset.peer); return; }
