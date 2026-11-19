@@ -495,13 +495,28 @@ async function saveComposer(): Promise<void> {
   if (page === 'settings') render();
 }
 
+type SettingsTab = 'general' | 'privacy' | 'workspace' | 'experimental';
+let settingsTab: SettingsTab = 'general';
+const SETTINGS_TABS: { id: SettingsTab; label: string }[] = [
+  { id: 'general', label: '常规与网络' },
+  { id: 'privacy', label: '隐私与安全' },
+  { id: 'workspace', label: '工作区' },
+  { id: 'experimental', label: '实验功能' },
+];
+
 function settingsView(): string {
+  const tab = SETTINGS_TABS.find((item) => item.id === settingsTab) ?? SETTINGS_TABS[0];
+  return `<section class="card settings-card">
+    <span class="eyebrow">SETTINGS / 设置</span><h2>${tab.label}</h2>
+    ${settingsTab === 'privacy' ? privacySettingsHtml() : settingsTab === 'workspace' ? workspaceSettingsHtml() : settingsTab === 'experimental' ? experimentalSettingsHtml() : generalSettingsHtml()}
+  </section>`;
+}
+
+function generalSettingsHtml(): string {
   const used = storageInfo ? formatBytes(storageInfo.used) : '读取中…';
   const quota = storageInfo ? formatBytes(storageInfo.quota) : '读取中…';
   const quotaMib = storageInfo ? Math.round(storageInfo.quota / (1024 * 1024)) : '';
-  return `<section class="card settings-card">
-    <span class="eyebrow">SETTINGS / 设置</span><h2>常规与网络</h2>
-    <p>消息列表、联系人、发现与聊天功能已开放；备份与应用锁已接入，插件尚未实现。</p>
+  return `<p>消息列表、联系人、发现与聊天功能已开放；插件与部分设置仍在后续阶段。</p>
     <div class="probe-box"><h3>存储配额</h3>
       <p>已接收附件占用 <strong id="storage-used">${used}</strong>，上限 <strong id="storage-quota">${quota}</strong>。</p>
       <label for="storage-quota-mib">配额上限（MiB，256–65536）</label>
@@ -509,18 +524,12 @@ function settingsView(): string {
       <p id="storage-notice" role="status">${storageNotice}</p>
       <small>配额只限制本机接收的附件；未完成的分片也计入占用。超过上限的新文件会被拒绝，已保存的记录不受影响。</small>
     </div>
-    <div class="probe-box"><h3>聊天备份与恢复</h3>
-      <p>备份使用密码加密并校验完整性；${backupInfo ? `已校验备份：${backupInfo.message_count} 条消息 · ${new Date(backupInfo.created_at * 1000).toLocaleString()}${backupInfo.include_chat ? ' · 含聊天记录' : ' · 不含聊天记录'}` : '尚未校验备份文件'}</p>
-      <label for="backup-password">备份密码（8–256 字符）</label>
-      <input id="backup-password" type="password" maxlength="256" autocomplete="new-password" value="${backupPassword.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;')}">
-      <p><label><input id="backup-include-chat" type="checkbox" checked> 导出时包含聊天记录（取消后仅含联系人与群组）</label></p>
-      <div class="probe-row"><button class="outline" data-action="backup-export" ${backupBusy ? 'disabled' : ''}>导出备份…</button><button class="outline" data-action="backup-choose" ${backupBusy ? 'disabled' : ''}>选择备份文件…</button><button class="outline" data-action="backup-inspect" ${backupBusy || !backupPath ? 'disabled' : ''}>校验备份</button></div>
-      <p id="backup-path">${backupPath ? `当前文件：${backupPath}` : '合并恢复会跳过相同 ID 且内容一致的消息；覆盖恢复会先在本机保存一份恢复前快照。'}</p>
-      <div class="probe-row"><button class="outline" data-action="backup-restore-merge" ${backupBusy || !backupPath ? 'disabled' : ''}>合并恢复</button><button class="outline danger" data-action="backup-restore-overwrite" ${backupBusy || !backupPath ? 'disabled' : ''}>覆盖恢复</button></div>
-      <p id="backup-notice" role="status">${backupNotice}</p>
-      <small>备份不包含身份私钥与附件文件；在新设备恢复会使用新身份，附件需另行拷贝。恢复不会改动本机存储配额。密码丢失后备份无法解密。</small>
-    </div>
-    <div class="probe-box"><h3>应用锁</h3>
+    <p>本机身份指纹（SHA-256）：<br><code class="fingerprint">${fingerprint}</code></p>
+    <button data-page="about" class="outline">关于 Qbird</button>`;
+}
+
+function privacySettingsHtml(): string {
+  return `<div class="probe-box"><h3>应用锁</h3>
       <p>当前状态：${lockState.has_password ? '已设置密码' : '未设置密码（锁定只隐藏界面，任何人都能直接解锁）'}；空闲自动锁定：${lockState.idle_minutes ? `${lockState.idle_minutes} 分钟（按系统无键鼠输入计算）` : '关闭'}。</p>
       <label for="lock-current">当前应用锁密码${lockState.has_password ? '' : '（尚未设置，可留空）'}</label>
       <input id="lock-current" type="password" maxlength="128" autocomplete="current-password">
@@ -532,7 +541,21 @@ function settingsView(): string {
       <p id="lock-notice" role="status">${lockNotice}</p>
       <small>应用锁只隐藏界面，不加密本地 SQLite 数据库；备份密码与应用锁密码相互独立。忘记应用锁密码时目前只能在本机设置中移除后重设；Windows 身份验证重置尚未实现。</small>
     </div>
-    <div class="probe-box"><h3>输入与快捷键</h3>
+    <div class="probe-box"><h3>聊天备份与恢复</h3>
+      <p>备份使用密码加密并校验完整性；${backupInfo ? `已校验备份：${backupInfo.message_count} 条消息 · ${new Date(backupInfo.created_at * 1000).toLocaleString()}${backupInfo.include_chat ? ' · 含聊天记录' : ' · 不含聊天记录'}` : '尚未校验备份文件'}</p>
+      <label for="backup-password">备份密码（8–256 字符）</label>
+      <input id="backup-password" type="password" maxlength="256" autocomplete="new-password" value="${backupPassword.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;')}">
+      <p><label><input id="backup-include-chat" type="checkbox" checked> 导出时包含聊天记录（取消后仅含联系人与群组）</label></p>
+      <div class="probe-row"><button class="outline" data-action="backup-export" ${backupBusy ? 'disabled' : ''}>导出备份…</button><button class="outline" data-action="backup-choose" ${backupBusy ? 'disabled' : ''}>选择备份文件…</button><button class="outline" data-action="backup-inspect" ${backupBusy || !backupPath ? 'disabled' : ''}>校验备份</button></div>
+      <p id="backup-path">${backupPath ? `当前文件：${backupPath}` : '合并恢复会跳过相同 ID 且内容一致的消息；覆盖恢复会先在本机保存一份恢复前快照。'}</p>
+      <div class="probe-row"><button class="outline" data-action="backup-restore-merge" ${backupBusy || !backupPath ? 'disabled' : ''}>合并恢复</button><button class="outline danger" data-action="backup-restore-overwrite" ${backupBusy || !backupPath ? 'disabled' : ''}>覆盖恢复</button></div>
+      <p id="backup-notice" role="status">${backupNotice}</p>
+      <small>备份不包含身份私钥与附件文件；在新设备恢复会使用新身份，附件需另行拷贝。恢复不会改动本机存储配额。密码丢失后备份无法解密。</small>
+    </div>`;
+}
+
+function workspaceSettingsHtml(): string {
+  return `<div class="probe-box"><h3>输入与快捷键</h3>
       <label for="send-shortcut">发送方式</label>
       <select id="send-shortcut">
         <option value="enter" ${composer.send_shortcut === 'enter' ? 'selected' : ''}>Enter 发送，Shift+Enter 换行</option>
@@ -543,10 +566,23 @@ function settingsView(): string {
       <p id="composer-notice" role="status">${composerNotice}</p>
       <small>发送方式对单聊、群聊和自聊一致生效；输入区高度只影响本机界面，不随消息发送。</small>
     </div>
-    <p>本机身份指纹（SHA-256）：<br><code class="fingerprint">${fingerprint}</code></p>
-    <button data-page="about" class="outline">关于 Qbird</button>
-  </section>`;
+    <div class="probe-box"><h3>表情</h3>
+      <p>常用表情和本地表情收藏在聊天输入区的“表情”按钮中管理；收藏的表情按图片文件发送给已确认联系人。</p>
+      <small>本地收藏最多 64 个，单个不超过 512 KiB，支持 PNG、JPEG、GIF 与 WebP。</small>
+    </div>
+    <div class="probe-box"><h3>右侧工作区</h3>
+      <p>文件预览面板可拖拽调宽，支持图片、TXT/日志/CSV/JSON、Markdown 与禁用脚本的 HTML。</p>
+      <small>预览只读取已完成的本地附件，不会上传内容。</small>
+    </div>`;
 }
+
+function experimentalSettingsHtml(): string {
+  return `<div class="probe-box"><h3>实验功能</h3>
+      <p>当前版本没有开放的实验功能。</p>
+      <small>群文件内容引用、插件接口等仍在规划中，未实现前不会显示为可操作开关。</small>
+    </div>`;
+}
+
 
 async function refreshStorage(): Promise<void> {
   if (!isTauri()) return;
@@ -815,7 +851,7 @@ function render(): void {
       <aside class="sidebar">
         <div class="team"><span class="team-mark">${icon('spark')}</span><div><strong>Qbird 青鸟</strong><small>LOCAL NETWORK MESSENGER</small></div></div>
         <div class="side-heading"><div><span class="eyebrow">${current.eyebrow}</span><h1>${current.title}</h1></div></div>
-        ${page === 'settings' || page === 'about' ? `<div class="settings-links"><button data-page="settings" class="${page === 'settings' ? 'selected' : ''}">常规与网络</button><button data-page="about" class="${page === 'about' ? 'selected' : ''}">关于</button></div>` : page === 'messages' ? `<div class="side-search"><input id="global-search" type="search" maxlength="200" placeholder="搜索全部消息" aria-label="搜索全部消息" value="${searchQuery.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;')}"></div><div id="search-results" class="search-hits" hidden></div><div id="conversation-list" class="conversation-list">正在读取…</div>` : '<div class="side-empty">暂无内容</div>'}
+        ${page === 'settings' || page === 'about' ? `<div class="settings-links">${SETTINGS_TABS.map((tab) => `<button data-settings-tab="${tab.id}" class="${page === 'settings' && settingsTab === tab.id ? 'selected' : ''}">${tab.label}</button>`).join('')}<button data-page="about" class="${page === 'about' ? 'selected' : ''}">关于</button></div>` : page === 'messages' ? `<div class="side-search"><input id="global-search" type="search" maxlength="200" placeholder="搜索全部消息" aria-label="搜索全部消息" value="${searchQuery.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;')}"></div><div id="search-results" class="search-hits" hidden></div><div id="conversation-list" class="conversation-list">正在读取…</div>` : '<div class="side-empty">暂无内容</div>'}
         <div class="side-foot"><span class="dot"></span>开发中 · 本地桌面版</div>
       </aside>
       <main class="workspace">
@@ -1268,6 +1304,15 @@ app.addEventListener('click', (event) => {
   if (action?.dataset.action === 'group-mention' && action.dataset.member) { groupChat.selectMention(action.dataset.member); return; }
   if (action?.dataset.action === 'group-transfer-owner' && action.dataset.member) { void groupChat.transferOwner(action.dataset.member); return; }
   if (action?.dataset.action === 'group-dissolve') { void groupChat.dissolve(); return; }
+  const settingsNav = target.closest<HTMLButtonElement>('button[data-settings-tab]');
+  if (settingsNav?.dataset.settingsTab && SETTINGS_TABS.some((tab) => tab.id === settingsNav.dataset.settingsTab)) {
+    settingsTab = settingsNav.dataset.settingsTab as SettingsTab;
+    page = 'settings';
+    menuOpen = false;
+    render();
+    void refreshStorage();
+    return;
+  }
   const nav = target.closest<HTMLButtonElement>('button[data-page]');
   if (nav?.dataset.page && nav.dataset.page in pages) {
     page = nav.dataset.page as Page;
