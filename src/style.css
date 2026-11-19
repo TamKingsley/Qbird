@@ -104,3 +104,13 @@
 .settings-card h2{margin:4px 0}
 .settings-card p{font-size:12px;color:#877668;line-height:1.7}
 .settings-card .probe-box input{max-width:160px}
+
+/* Profile and contact notes */
+.profile{border:0;cursor:pointer;font:inherit}
+.contact-title{display:block;overflow-wrap:anywhere}
+.contact-actions{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:6px}
+.contact-actions input{width:110px;padding:4px 6px;border:1px solid #ddcbbb;border-radius:6px;background:#fffdfa;color:#3f352f;font-size:11px}
+.contact-actions .outline{margin:0;padding:4px 8px;font-size:11px}
+.settings-card label{display:block;font-size:12px;color:#6f6257;margin-top:10px}
+.settings-card input[type=text],.settings-card input[type=password]{display:block;width:100%;padding:8px;margin:4px 0 10px;border:1px solid #ddcbbb;border-radius:8px;background:#fffdfa;color:#3f352f}
+.settings-card input[type=search]{width:100%;padding:8px;margin:4px 0 10px;border:1px solid #ddcbbb;border-radius:8px;background:#fffdfa}

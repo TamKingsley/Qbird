@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::{params, Connection, OptionalExtension, Result};
 use serde::Serialize;
 
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 
 /// Default cap for locally received attachments; the user may change it in settings.
 pub const DEFAULT_STORAGE_QUOTA: u64 = 2 * 1024 * 1024 * 1024;
@@ -42,6 +42,16 @@ pub struct Contact {
     pub fingerprint: String,
     pub display_name: String,
     pub trust_state: String,
+    /// Local-only note; never sent to peers and never changes identity.
+    pub remark: Option<String>,
+    /// Local-only category/group label used to organise the contact list.
+    pub category: Option<String>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct Profile {
+    pub nickname: String,
+    pub email: String,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -468,6 +478,19 @@ impl Store {
             )?;
             transaction.commit()?;
         }
+        if version < 9 {
+            let transaction = connection.transaction()?;
+            for statement in [
+                "ALTER TABLE contacts ADD COLUMN remark TEXT",
+                "ALTER TABLE contacts ADD COLUMN category TEXT",
+            ] {
+                if let Err(error) = transaction.execute_batch(statement) {
+                    if !error.to_string().contains("duplicate column name") { return Err(error); }
+                }
+            }
+            transaction.execute_batch("PRAGMA user_version = 9;")?;
+            transaction.commit()?;
+        }
         Ok(Self { connection, data_dir, address_revision: std::cell::Cell::new(0) })
     }
 
@@ -672,10 +695,67 @@ impl Store {
 
     pub fn list_contacts(&self) -> Result<Vec<Contact>> {
         let mut statement = self.connection.prepare(
-            "SELECT fingerprint, display_name, trust_state FROM contacts ORDER BY display_name, fingerprint LIMIT 1000"
+            "SELECT fingerprint, display_name, trust_state, remark, category FROM contacts ORDER BY display_name, fingerprint LIMIT 1000"
         )?;
         let rows = statement.query_map([], |row| Ok(Contact {
             fingerprint: row.get(0)?, display_name: row.get(1)?, trust_state: row.get(2)?,
+            remark: row.get(3)?, category: row.get(4)?,
+        }))?;
+        rows.collect()
+    }
+
+    /// Sets local remark/category on an existing contact. Neither field affects trust.
+    pub fn set_contact_profile(&self, fingerprint: &str, remark: Option<&str>, category: Option<&str>) -> Result<bool> {
+        if !valid_fingerprint(fingerprint) { return Err(rusqlite::Error::InvalidQuery); }
+        for value in [remark, category].into_iter().flatten() {
+            if value.chars().count() > 64 || value.chars().any(char::is_control) {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+        }
+        let remark = remark.map(str::trim).filter(|value| !value.is_empty());
+        let category = category.map(str::trim).filter(|value| !value.is_empty());
+        Ok(self.connection.execute(
+            "UPDATE contacts SET remark = ?2, category = ?3 WHERE fingerprint = ?1",
+            params![fingerprint, remark, category])? == 1)
+    }
+
+    pub fn get_profile(&self) -> Result<Profile> {
+        let read = |key: &str| -> Result<Option<String>> {
+            self.connection.query_row("SELECT value FROM settings WHERE key = ?1", [key], |row| row.get(0)).optional()
+        };
+        Ok(Profile { nickname: read("profile_nickname")?.unwrap_or_default(), email: read("profile_email")?.unwrap_or_default() })
+    }
+
+    pub fn set_profile(&self, nickname: &str, email: &str) -> Result<bool> {
+        let nickname = nickname.trim();
+        let email = email.trim();
+        if nickname.chars().count() > 64 || nickname.chars().any(char::is_control) { return Ok(false); }
+        if email.chars().count() > 128 || email.chars().any(char::is_control) || (email.matches('@').count() != 1 && !email.is_empty()) {
+            return Ok(false);
+        }
+        for (key, value) in [("profile_nickname", nickname), ("profile_email", email)] {
+            self.connection.execute(
+                "INSERT INTO settings(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![key, value])?;
+        }
+        Ok(true)
+    }
+
+    /// Contact list search across name, local remark, category and fingerprint.
+    pub fn search_contacts(&self, query: &str, limit: u32) -> Result<Vec<Contact>> {
+        if query.chars().count() > 64 || limit == 0 || limit > 200 || query.chars().any(char::is_control) {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        let pattern = like_pattern(query);
+        let mut statement = self.connection.prepare(
+            "SELECT fingerprint, display_name, trust_state, remark, category FROM contacts
+             WHERE ?1 = '' OR display_name LIKE ?2 ESCAPE '\\' OR COALESCE(remark, '') LIKE ?2 ESCAPE '\\'
+                OR COALESCE(category, '') LIKE ?2 ESCAPE '\\' OR fingerprint LIKE ?2 ESCAPE '\\'
+             ORDER BY display_name, fingerprint LIMIT ?3"
+        )?;
+        let rows = statement.query_map(params![query, pattern, limit], |row| Ok(Contact {
+            fingerprint: row.get(0)?, display_name: row.get(1)?, trust_state: row.get(2)?,
+            remark: row.get(3)?, category: row.get(4)?,
         }))?;
         rows.collect()
     }
@@ -2787,6 +2867,37 @@ mod tests {
         assert!(store.storage_used() >= 5);
         let _ = std::fs::remove_dir_all(store.attachments_dir());
         let _ = me;
+    }
+    #[test]
+    fn contact_remark_category_and_profile_are_local_only() {
+        let store = memory_store();
+        let peer = "b".repeat(64);
+        store.add_candidate(&peer, "Bob").unwrap();
+        store.confirm_candidate(&peer).unwrap();
+        assert!(store.set_contact_profile(&peer, Some("项目对接人"), Some("研发部")).unwrap());
+        let contact = store.list_contacts().unwrap().into_iter().find(|item| item.fingerprint == peer).unwrap();
+        assert_eq!(contact.remark.as_deref(), Some("项目对接人"));
+        assert_eq!(contact.category.as_deref(), Some("研发部"));
+        assert_eq!(contact.trust_state, "verified", "local notes must not change trust");
+        assert!(store.set_contact_profile(&peer, Some("  "), None).unwrap());
+        assert_eq!(store.list_contacts().unwrap()[0].remark, None);
+        assert!(store.set_contact_profile(&"c".repeat(64), Some("x"), None).unwrap() == false);
+        assert!(store.set_contact_profile(&peer, Some(&"x".repeat(65)), None).is_err());
+        assert!(store.set_contact_profile(&peer, Some("对接"), Some("研发部")).unwrap());
+
+        assert_eq!(store.get_profile().unwrap(), Profile { nickname: String::new(), email: String::new() });
+        assert!(store.set_profile("青鸟测试", "a@example.com").unwrap());
+        assert_eq!(store.get_profile().unwrap(), Profile { nickname: "青鸟测试".into(), email: "a@example.com".into() });
+        assert!(!store.set_profile(&"x".repeat(65), "").unwrap());
+        assert!(!store.set_profile("ok", "not-an-email").unwrap());
+        assert_eq!(store.get_profile().unwrap().email, "a@example.com");
+
+        assert_eq!(store.search_contacts("研发", 20).unwrap().len(), 1);
+        assert_eq!(store.search_contacts("Bob", 20).unwrap().len(), 1);
+        assert_eq!(store.search_contacts(&peer[..8], 20).unwrap().len(), 1);
+        assert!(store.search_contacts("missing", 20).unwrap().is_empty());
+        assert_eq!(store.search_contacts("", 20).unwrap().len(), 1);
+        assert!(store.search_contacts("x", 0).is_err());
     }
 }
 

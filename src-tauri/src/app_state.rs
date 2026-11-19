@@ -357,6 +357,36 @@ pub fn identity_fingerprint(state: tauri::State<'_, AppState>) -> String {
 }
 
 #[tauri::command]
+pub fn v1_profile(state: tauri::State<'_, AppState>) -> Result<crate::storage::Profile, String> {
+    state.store.lock().map_err(|_| "本地存储不可用".to_owned())?
+        .get_profile().map_err(|_| "无法读取个人资料".to_owned())
+}
+
+#[tauri::command]
+pub fn v1_set_profile(state: tauri::State<'_, AppState>, nickname: String, email: String) -> Result<crate::storage::Profile, String> {
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    if !store.set_profile(&nickname, &email).map_err(|_| "无法保存个人资料".to_owned())? {
+        return Err("昵称不超过 64 字符；邮箱需包含一个 @ 或留空".into());
+    }
+    store.get_profile().map_err(|_| "无法读取个人资料".to_owned())
+}
+
+#[tauri::command]
+pub fn v1_set_contact_profile(state: tauri::State<'_, AppState>, peer: String, remark: Option<String>, category: Option<String>)
+    -> Result<(), String> {
+    let saved = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?
+        .set_contact_profile(&peer, remark.as_deref(), category.as_deref())
+        .map_err(|_| "备注或分组过长".to_owned())?;
+    if saved { Ok(()) } else { Err("联系人或分组不存在".into()) }
+}
+
+#[tauri::command]
+pub fn v1_search_contacts(state: tauri::State<'_, AppState>, query: String, limit: u32) -> Result<Vec<crate::storage::Contact>, String> {
+    state.store.lock().map_err(|_| "本地存储不可用".to_owned())?
+        .search_contacts(&query, limit).map_err(|_| "搜索条件无效".to_owned())
+}
+
+#[tauri::command]
 pub fn v1_list_contacts(state: tauri::State<'_, AppState>) -> Result<Vec<crate::storage::Contact>, String> {
     let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
     store.list_contacts().map_err(|_| "无法读取联系人".to_owned())

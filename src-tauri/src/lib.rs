@@ -31,6 +31,10 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             app_state::identity_fingerprint,
+            app_state::v1_profile,
+            app_state::v1_set_profile,
+            app_state::v1_set_contact_profile,
+            app_state::v1_search_contacts,
             app_state::v1_list_contacts,
             app_state::v1_confirm_contact,
             app_state::v1_set_contact_address,

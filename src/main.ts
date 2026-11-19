@@ -6,7 +6,7 @@ import { version as appVersion } from '../package.json';
 import { DirectChat } from './direct_chat';
 import { GroupChat } from './group_chat';
 
-type Page = 'messages' | 'contacts' | 'discover' | 'settings' | 'about';
+type Page = 'messages' | 'contacts' | 'discover' | 'settings' | 'about' | 'profile';
 const root = document.querySelector<HTMLDivElement>('#app');
 if (!root) throw new Error('Application root is missing');
 const app = root;
@@ -28,7 +28,10 @@ let remoteFingerprint = '';
 let observedAddress = '';
 let probeBusy = false;
 let selectedFingerprint = '';
-type Contact = { fingerprint: string; display_name: string; trust_state: string };
+type Contact = { fingerprint: string; display_name: string; trust_state: string; remark: string | null; category: string | null };
+let contactQuery = '';
+let profileNotice = '';
+type Profile = { nickname: string; email: string };
 type Conversation = { id: string; last_body: string; last_logical: number; kind: string };
 type Group = { id: string; name: string; owner: string; member_count: number; hidden: boolean; is_owner: boolean; last_body: string; last_logical: number };
 let groups: Group[] = [];
@@ -179,12 +182,14 @@ function selfChatView(): string {
   </section>`;
 }
 
-const pages: Record<Page, { title: string; eyebrow: string; heading: string; copy: string }> = {
+type PlaceholderPage = 'messages' | 'contacts' | 'discover' | 'settings' | 'about' | 'profile';
+const pages: Record<PlaceholderPage, { title: string; eyebrow: string; heading: string; copy: string }> = {
   messages: { title: '消息', eyebrow: 'MESSAGES', heading: '还没有会话', copy: '从联系人打开自聊或已确认的单聊。' },
-  contacts: { title: '联系人', eyebrow: 'CONTACTS', heading: '联系人', copy: '联系人管理功能正在开发中。' },
+  contacts: { title: '联系人', eyebrow: 'CONTACTS', heading: '联系人', copy: '可搜索联系人、编辑本机备注与分组。' },
   discover: { title: '发现', eyebrow: 'DISCOVERY', heading: '局域网发现', copy: '仅浏览同网段 IPv4 mDNS 服务；发现结果未经身份验证，不代表可信联系人。' },
-  settings: { title: '设置', eyebrow: 'PREFERENCES', heading: '设置', copy: '网络、隐私、备份和应用锁功能将在后续阶段开放。' },
-  about: { title: '设置', eyebrow: 'ABOUT', heading: 'Qbird 青鸟', copy: '本地优先的局域网聊天工具。' }
+  settings: { title: '设置', eyebrow: 'PREFERENCES', heading: '设置', copy: '存储配额与备份恢复已开放；应用锁等将在后续阶段提供。' },
+  about: { title: '设置', eyebrow: 'ABOUT', heading: 'Qbird 青鸟', copy: '本地优先的局域网聊天工具。' },
+  profile: { title: '我的资料', eyebrow: 'PROFILE', heading: '个人资料', copy: '昵称与邮箱仅保存在本机。' }
 };
 
 function formatBytes(bytes: number): string {
@@ -193,6 +198,44 @@ function formatBytes(bytes: number): string {
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
   return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
+}
+
+function profileView(): string {
+  return `<section class="card settings-card">
+    <span class="eyebrow">PROFILE / 我的资料</span><h2>个人资料</h2>
+    <p>昵称和邮箱只保存在本机，不改变身份指纹；联系人看到的是对方各自保存的名称。</p>
+    <label for="profile-nickname">昵称</label>
+    <input id="profile-nickname" type="text" maxlength="64" autocomplete="off">
+    <label for="profile-email">邮箱（可选）</label>
+    <input id="profile-email" type="text" maxlength="128" autocomplete="off">
+    <div class="probe-row"><button class="outline" data-action="save-profile">保存资料</button></div>
+    <p id="profile-notice" role="status">${profileNotice}</p>
+    <p>本机身份指纹（SHA-256）：<br><code class="fingerprint">${fingerprint}</code></p>
+    <p><small>头像设置尚未实现。</small></p>
+  </section>`;
+}
+
+async function refreshProfile(): Promise<void> {
+  if (!isTauri()) return;
+  try {
+    const profile = await invoke<Profile>('v1_profile');
+    const nickname = app.querySelector<HTMLInputElement>('#profile-nickname');
+    const email = app.querySelector<HTMLInputElement>('#profile-email');
+    if (nickname) nickname.value = profile.nickname;
+    if (email) email.value = profile.email;
+  } catch { profileNotice = '无法读取个人资料'; }
+}
+
+async function saveProfile(): Promise<void> {
+  const nickname = app.querySelector<HTMLInputElement>('#profile-nickname')?.value ?? '';
+  const email = app.querySelector<HTMLInputElement>('#profile-email')?.value ?? '';
+  const notice = app.querySelector<HTMLElement>('#profile-notice');
+  if (!isTauri()) return;
+  try {
+    await invoke<Profile>('v1_set_profile', { nickname, email });
+    profileNotice = '资料已保存在本机。';
+  } catch (error) { profileNotice = typeof error === 'string' ? error : '无法保存资料'; }
+  if (notice) notice.textContent = profileNotice;
 }
 
 function settingsView(): string {
@@ -364,26 +407,57 @@ async function confirmContact(): Promise<void> {
   finally { if (button) button.disabled = false; }
 }
 
+async function saveContactProfile(peer: string): Promise<void> {
+  const remark = app.querySelector<HTMLInputElement>(`input[data-remark-for="${peer}"]`)?.value ?? '';
+  const category = app.querySelector<HTMLInputElement>(`input[data-category-for="${peer}"]`)?.value ?? '';
+  const status = app.querySelector<HTMLElement>('#contacts-status');
+  if (!isTauri()) return;
+  try {
+    await invoke('v1_set_contact_profile', { peer, remark, category });
+    if (status) status.textContent = '备注与分组已保存（仅本机可见，不影响信任）。';
+    await refreshContacts();
+  } catch (error) { if (status) status.textContent = typeof error === 'string' ? error : '无法保存备注或分组'; }
+}
+
 async function refreshContacts(): Promise<void> {
   const status = app.querySelector<HTMLElement>('#contacts-status');
   const list = app.querySelector<HTMLUListElement>('#contacts-list');
   if (!status || !list) return;
   if (!isTauri()) { status.textContent = '仅桌面应用支持联系人'; return; }
   try {
-    const [contacts, groupList] = await Promise.all([invoke<Contact[]>('v1_list_contacts'), invoke<Group[]>('v1_list_groups')]);
+    const [contacts, groupList] = await Promise.all([
+      contactQuery ? invoke<Contact[]>('v1_search_contacts', { query: contactQuery, limit: 100 }) : invoke<Contact[]>('v1_list_contacts'),
+      invoke<Group[]>('v1_list_groups'),
+    ]);
     groups = groupList;
     if (!list.isConnected) return;
     list.replaceChildren();
-    status.textContent = contacts.length ? `其他联系人：${contacts.length}` : '暂无其他联系人，可前往发现页面核对指纹。';
+    status.textContent = contactQuery
+      ? (contacts.length ? `匹配 ${contacts.length} 位联系人` : '没有匹配的联系人')
+      : (contacts.length ? `其他联系人：${contacts.length}` : '暂无其他联系人，可前往发现页面核对指纹。');
     paintGroups(contacts);
     for (const contact of contacts) {
       const item = document.createElement('li');
-      item.textContent = `${contact.display_name} · ${contact.trust_state === 'verified' ? '已确认' : '待确认'} · ${contact.fingerprint}`;
+      const title = document.createElement('span');
+      title.className = 'contact-title';
+      title.textContent = `${contact.remark ? `${contact.remark}（${contact.display_name}）` : contact.display_name} · ${contact.trust_state === 'verified' ? '已确认' : '待确认'}${contact.category ? ` · ${contact.category}` : ''} · ${contact.fingerprint}`;
+      item.append(title);
+      const actions = document.createElement('div'); actions.className = 'contact-actions';
       if (contact.trust_state === 'verified') {
         const button = document.createElement('button'); button.className = 'outline'; button.textContent = '打开单聊';
-        button.dataset.action = 'open-direct'; button.dataset.peer = contact.fingerprint; button.dataset.name = contact.display_name;
-        item.append(button);
+        button.dataset.action = 'open-direct'; button.dataset.peer = contact.fingerprint; button.dataset.name = contact.remark || contact.display_name;
+        actions.append(button);
       }
+      const remark = document.createElement('input');
+      remark.type = 'text'; remark.maxLength = 64; remark.placeholder = '备注'; remark.value = contact.remark ?? '';
+      remark.dataset.remarkFor = contact.fingerprint; remark.setAttribute('aria-label', '联系人备注');
+      const category = document.createElement('input');
+      category.type = 'text'; category.maxLength = 64; category.placeholder = '分组'; category.value = contact.category ?? '';
+      category.dataset.categoryFor = contact.fingerprint; category.setAttribute('aria-label', '联系人分组');
+      const save = document.createElement('button'); save.className = 'outline'; save.textContent = '保存备注/分组';
+      save.dataset.action = 'save-contact-profile'; save.dataset.peer = contact.fingerprint;
+      actions.append(remark, category, save);
+      item.append(actions);
       list.append(item);
     }
   } catch { if (status.isConnected) status.textContent = '无法读取联系人'; }
@@ -446,7 +520,7 @@ function render(): void {
   app.innerHTML = `
     <div class="shell">
       <aside class="rail" aria-label="主导航">
-        <div class="profile" aria-label="我的资料">青</div>
+        <button class="profile" data-page="profile" aria-label="我的资料" title="我的资料">青</button>
         <nav class="rail-nav" aria-label="主要功能">
           <button data-page="messages" class="${page === 'messages' ? 'active' : ''}" aria-label="消息" title="消息">${icon('messages')}</button>
           <button data-page="contacts" class="${page === 'contacts' ? 'active' : ''}" aria-label="联系人" title="联系人">${icon('contacts')}</button>
@@ -464,11 +538,12 @@ function render(): void {
         <div class="side-foot"><span class="dot"></span>开发中 · 本地桌面版</div>
       </aside>
       <main class="workspace">
-        ${page === 'messages' && groupChat.groupId ? groupChat.view() : page === 'messages' && direct.peer ? direct.view() : page === 'messages' && selfOpen ? selfChatView() : page === 'discover' ? discoveryView() : page === 'settings' ? settingsView() : page === 'contacts' ? `<section class="discovery-panel card"><h2>联系人</h2><button class="self-contact" data-action="open-self" ${isTauri() ? '' : 'disabled'}><strong>自己</strong><span>打开本地自聊</span></button><p>已确认的联系人保存在本机；双方须各自核对指纹后才能聊天。</p><p id="contacts-status" aria-live="polite"></p><ul id="contacts-list" class="discovery-results"></ul><div class="probe-box"><h3>我的群聊</h3><ul id="groups-list" class="discovery-results"></ul><label for="group-name">新建群聊名称</label><input id="group-name" type="text" maxlength="128" placeholder="例如：项目组"><div id="group-members-pick" class="group-pick"></div><button class="outline" data-action="create-group">创建群聊</button><p id="group-create-status" aria-live="polite"></p><small>只能邀请已确认的联系人；新成员只能看到加入之后的消息。</small></div></section>` : page === 'about' ? `<section class="card about"><span class="eyebrow">ABOUT / 关于</span><h2>Qbird 青鸟</h2><p>面向局域网的本地优先聊天与文件交流工具。</p><dl><div><dt>当前阶段</dt><dd>Windows 开发版 ${appVersion}</dd></div><div><dt>许可证</dt><dd>Apache License 2.0</dd></div><div><dt>平台规划</dt><dd>Windows 首发 · 后续 Linux / macOS</dd></div></dl><p class="notice">开发版未经安全审计，本地数据库未加密。</p></section>` : `<section class="empty"><div class="empty-mark">${icon('spark')}</div><h2>${current.heading}</h2><p>${current.copy}</p></section>`}
+        ${page === 'messages' && groupChat.groupId ? groupChat.view() : page === 'messages' && direct.peer ? direct.view() : page === 'messages' && selfOpen ? selfChatView() : page === 'discover' ? discoveryView() : page === 'settings' ? settingsView() : page === 'profile' ? profileView() : page === 'contacts' ? `<section class="discovery-panel card"><h2>联系人</h2><button class="self-contact" data-action="open-self" ${isTauri() ? '' : 'disabled'}><strong>自己</strong><span>打开本地自聊</span></button><p>已确认的联系人保存在本机；双方须各自核对指纹后才能聊天。</p><label for="contact-search">搜索联系人</label><input id="contact-search" type="search" maxlength="64" placeholder="名称、备注、分组或指纹" value="${contactQuery.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;')}"><p id="contacts-status" aria-live="polite"></p><ul id="contacts-list" class="discovery-results"></ul><div class="probe-box"><h3>我的群聊</h3><ul id="groups-list" class="discovery-results"></ul><label for="group-name">新建群聊名称</label><input id="group-name" type="text" maxlength="128" placeholder="例如：项目组"><div id="group-members-pick" class="group-pick"></div><button class="outline" data-action="create-group">创建群聊</button><p id="group-create-status" aria-live="polite"></p><small>只能邀请已确认的联系人；新成员只能看到加入之后的消息。</small></div></section>` : page === 'about' ? `<section class="card about"><span class="eyebrow">ABOUT / 关于</span><h2>Qbird 青鸟</h2><p>面向局域网的本地优先聊天与文件交流工具。</p><dl><div><dt>当前阶段</dt><dd>Windows 开发版 ${appVersion}</dd></div><div><dt>许可证</dt><dd>Apache License 2.0</dd></div><div><dt>平台规划</dt><dd>Windows 首发 · 后续 Linux / macOS</dd></div></dl><p class="notice">开发版未经安全审计，本地数据库未加密。</p></section>` : `<section class="empty"><div class="empty-mark">${icon('spark')}</div><h2>${current.heading}</h2><p>${current.copy}</p></section>`}
       </main>
     </div>`;
   if (page === 'discover') paintDiscovery();
   if (page === 'settings') void refreshStorage();
+  if (page === 'profile') void refreshProfile();
   if (page === 'messages') {
     void refreshConversations();
     if (direct.peer) direct.render();
@@ -612,6 +687,7 @@ app.addEventListener('input', (event) => {
   if (target.id === 'group-search-member') { groupChat.searchDraft('member', target.value); return; }
   if (target.id === 'group-search-category') { groupChat.searchDraft('category', target.value); return; }
   if (target.id === 'backup-password') { backupPassword = target.value; return; }
+  if (target.id === 'contact-search') { contactQuery = target.value; void refreshContacts(); return; }
 });
 app.addEventListener('keydown', (event) => {
   if (event.target instanceof HTMLTextAreaElement && event.target.id === 'direct-input' && event.key === 'Enter' && !event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey && !event.isComposing) {
@@ -661,6 +737,8 @@ app.addEventListener('click', (event) => {
   if (action?.dataset.action === 'backup-inspect') { void inspectBackup(); return; }
   if (action?.dataset.action === 'backup-restore-merge') { void restoreBackup(false); return; }
   if (action?.dataset.action === 'backup-restore-overwrite') { void restoreBackup(true); return; }
+  if (action?.dataset.action === 'save-profile') { void saveProfile(); return; }
+  if (action?.dataset.action === 'save-contact-profile' && action.dataset.peer) { void saveContactProfile(action.dataset.peer); return; }
   if (action?.dataset.action === 'save-direct-address') { void direct.saveAddress(); return; }
   if (action?.dataset.action === 'group-send') { void groupChat.send(); return; }
   if (action?.dataset.action === 'group-older') { void groupChat.load(true); return; }
