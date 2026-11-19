@@ -16,6 +16,16 @@ pub struct StorageUsage {
     pub quota: u64,
 }
 
+/// Result of a database restore. `conflicts > 0` means nothing was applied.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct RestoreReport {
+    pub mode: String,
+    pub inserted: u64,
+    pub skipped: u64,
+    pub conflicts: u64,
+    pub snapshot_path: Option<String>,
+}
+
 /// Upper bound for a quoted snippet, kept short so it fits one compose bar.
 pub const REPLY_PREVIEW_MAX: usize = 160;
 
@@ -750,6 +760,140 @@ impl Store {
 
     pub fn storage_status(&self) -> Result<StorageUsage> {
         Ok(StorageUsage { used: self.storage_used(), quota: self.storage_quota()? })
+    }
+
+    pub fn data_dir(&self) -> &Path { &self.data_dir }
+
+    /// Writes a consistent SQLite snapshot with `VACUUM INTO`. When chat history is
+    /// excluded only contacts/groups remain; the destination must not exist yet.
+    pub fn snapshot_to(&self, destination: &Path, include_chat: bool) -> Result<()> {
+        if destination.exists() { return Err(rusqlite::Error::InvalidQuery); }
+        let escaped = destination.to_string_lossy().replace('\'', "''");
+        self.connection.execute_batch(&format!("VACUUM INTO '{escaped}'"))?;
+        if !include_chat {
+            let snapshot = Connection::open(destination)?;
+            snapshot.execute_batch(
+                "PRAGMA foreign_keys = OFF;
+                 DELETE FROM file_transfers;
+                 DELETE FROM direct_messages;
+                 DELETE FROM group_outbox;
+                 DELETE FROM group_messages;
+                 DELETE FROM local_messages;
+                 DELETE FROM messages;",
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Merges or replaces local data from a snapshot written by `snapshot_to`.
+    /// In merge mode any message id whose immutable fields differ aborts the whole
+    /// restore; delivery queues are never imported because they are device-local.
+    pub fn restore_from(&mut self, snapshot: &Path, overwrite: bool, now: i64) -> Result<RestoreReport> {
+        // VACUUM and ATTACH are both rejected inside a transaction, so the pre-overwrite
+        // snapshot and the attachment happen first and only the data copy is transactional.
+        let mut snapshot_path = None;
+        if overwrite {
+            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|value| value.as_nanos()).unwrap_or(0);
+            let target = self.data_dir.join(format!("pre-restore-{now}-{nanos}.db"));
+            let escaped_target = target.to_string_lossy().replace('\'', "''");
+            self.connection.execute_batch(&format!("VACUUM INTO '{escaped_target}'"))?;
+            snapshot_path = Some(target.to_string_lossy().to_string());
+        }
+        let escaped = snapshot.to_string_lossy().replace('\'', "''");
+        self.connection.execute_batch(&format!("ATTACH DATABASE '{escaped}' AS src"))?;
+        let result = self.restore_attached(overwrite, snapshot_path);
+        let _ = self.connection.execute_batch("DETACH DATABASE src");
+        result
+    }
+
+    fn restore_attached(&self, overwrite: bool, snapshot_path: Option<String>) -> Result<RestoreReport> {
+        let tx = self.connection.unchecked_transaction()?;
+        let conflicts: i64 = tx.query_row(
+            "SELECT
+                (SELECT count(*) FROM src.direct_messages s JOIN main.direct_messages m ON m.id = s.id
+                  WHERE s.peer <> m.peer OR s.sender <> m.sender OR s.body <> m.body OR s.created_at <> m.created_at
+                     OR s.logical <> m.logical OR s.kind <> m.kind
+                     OR COALESCE(s.file_sha256, '') <> COALESCE(m.file_sha256, ''))
+              + (SELECT count(*) FROM src.group_messages s JOIN main.group_messages m ON m.id = s.id
+                  WHERE s.group_id <> m.group_id OR s.sender <> m.sender OR s.body <> m.body
+                     OR s.created_at <> m.created_at OR s.logical <> m.logical
+                     OR COALESCE(s.reply_to, '') <> COALESCE(m.reply_to, ''))
+              + (SELECT count(*) FROM src.local_messages s JOIN main.local_messages m ON m.id = s.id
+                  WHERE s.body <> m.body OR s.created_at <> m.created_at OR s.logical <> m.logical)",
+            [], |row| row.get(0),
+        )?;
+        if conflicts > 0 {
+            tx.commit()?;
+            return Ok(RestoreReport { mode: "merge".into(), inserted: 0, skipped: 0, conflicts: conflicts as u64, snapshot_path });
+        }
+        let snapshot_messages: i64 = tx.query_row(
+            "SELECT (SELECT count(*) FROM src.direct_messages) + (SELECT count(*) FROM src.group_messages)
+                  + (SELECT count(*) FROM src.local_messages)", [], |row| row.get(0),
+        )?;
+        let before: i64 = tx.query_row(
+            "SELECT (SELECT count(*) FROM main.direct_messages) + (SELECT count(*) FROM main.group_messages)
+                  + (SELECT count(*) FROM main.local_messages)", [], |row| row.get(0),
+        )?;
+        if overwrite {
+            tx.execute_batch(
+                "DELETE FROM main.file_transfers;
+                 DELETE FROM main.direct_messages;
+                 DELETE FROM main.direct_conversations;
+                 DELETE FROM main.group_outbox;
+                 DELETE FROM main.group_control;
+                 DELETE FROM main.group_messages;
+                 DELETE FROM main.group_members;
+                 DELETE FROM main.groups;
+                 DELETE FROM main.local_messages;
+                 DELETE FROM main.messages;
+                 DELETE FROM main.conversations;
+                 DELETE FROM main.contact_addresses;
+                 DELETE FROM main.contacts;
+                 INSERT INTO main.contacts SELECT * FROM src.contacts;
+                 INSERT INTO main.contact_addresses SELECT * FROM src.contact_addresses;
+                 INSERT INTO main.conversations SELECT * FROM src.conversations;
+                 INSERT INTO main.local_messages SELECT * FROM src.local_messages;
+                 INSERT INTO main.direct_conversations SELECT * FROM src.direct_conversations;
+                 INSERT INTO main.direct_messages SELECT * FROM src.direct_messages;
+                 INSERT INTO main.file_transfers SELECT * FROM src.file_transfers;
+                 INSERT INTO main.groups SELECT * FROM src.groups;
+                 INSERT INTO main.group_members SELECT * FROM src.group_members;
+                 INSERT INTO main.group_messages SELECT * FROM src.group_messages;
+                 INSERT INTO main.messages SELECT * FROM src.messages;",
+            )?;
+        } else {
+            tx.execute_batch(
+                "INSERT OR IGNORE INTO main.contacts SELECT * FROM src.contacts;
+                 UPDATE main.contacts SET trust_state = 'verified'
+                   WHERE trust_state = 'pending' AND fingerprint IN (SELECT fingerprint FROM src.contacts WHERE trust_state = 'verified');
+                 INSERT OR IGNORE INTO main.contact_addresses SELECT * FROM src.contact_addresses;
+                 INSERT OR IGNORE INTO main.conversations SELECT * FROM src.conversations;
+                 INSERT OR IGNORE INTO main.local_messages SELECT * FROM src.local_messages;
+                 INSERT OR IGNORE INTO main.direct_conversations SELECT * FROM src.direct_conversations;
+                 INSERT OR IGNORE INTO main.direct_messages SELECT * FROM src.direct_messages;
+                 INSERT OR IGNORE INTO main.file_transfers SELECT * FROM src.file_transfers;
+                 INSERT OR IGNORE INTO main.groups SELECT * FROM src.groups;
+                 INSERT OR IGNORE INTO main.group_members SELECT * FROM src.group_members;
+                 INSERT OR IGNORE INTO main.group_messages SELECT * FROM src.group_messages;
+                 INSERT OR IGNORE INTO main.messages SELECT * FROM src.messages;",
+            )?;
+        }
+        // Keep the logical clock at least as high as every restored message.
+        tx.execute_batch(
+            "UPDATE main.logical_clock SET value = max(value,
+                COALESCE((SELECT max(logical) FROM main.direct_messages), 0),
+                COALESCE((SELECT max(logical) FROM main.group_messages), 0),
+                COALESCE((SELECT max(logical) FROM main.local_messages), 0))
+             WHERE singleton = 1 AND value < 9223372036854775807;",
+        )?;
+        let after: i64 = tx.query_row(
+            "SELECT (SELECT count(*) FROM main.direct_messages) + (SELECT count(*) FROM main.group_messages)
+                  + (SELECT count(*) FROM main.local_messages)", [], |row| row.get(0),
+        )?;
+        tx.commit()?;
+        let inserted = if overwrite { snapshot_messages as u64 } else { (after - before).max(0) as u64 };
+        let skipped = if overwrite { 0 } else { (snapshot_messages - (after - before)).max(0) as u64 };
+        Ok(RestoreReport { mode: if overwrite { "overwrite".into() } else { "merge".into() }, inserted, skipped, conflicts: 0, snapshot_path })
     }
 
     /// Queue an outgoing file. The file stays at `source`; the receiver verifies the hash.

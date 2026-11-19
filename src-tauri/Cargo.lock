@@ -2675,10 +2675,11 @@ dependencies = [
 
 [[package]]
 name = "qbird"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "mdns-sd",
  "rcgen",
+ "ring",
  "rusqlite",
  "rustls",
  "serde",

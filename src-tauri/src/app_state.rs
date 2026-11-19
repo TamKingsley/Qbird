@@ -180,6 +180,34 @@ pub fn v1_set_storage_quota(state: tauri::State<'_, AppState>, bytes: u64) -> Re
     store.storage_status().map_err(|_| "无法读取存储占用".to_owned())
 }
 
+#[tauri::command]
+pub async fn v1_create_backup(state: tauri::State<'_, AppState>, password: String, path: String, include_chat: bool)
+    -> Result<crate::backup::BackupInfo, String> {
+    if path.chars().count() > 4096 { return Err("备份路径无效".into()); }
+    let store = Arc::clone(&state.store);
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+        crate::backup::create(&password, &store, std::path::Path::new(&path), include_chat)
+    }).await.map_err(|_| "备份任务异常".to_owned())?
+}
+
+#[tauri::command]
+pub async fn v1_inspect_backup(password: String, path: String) -> Result<crate::backup::BackupInfo, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::backup::inspect(&password, std::path::Path::new(&path))
+    }).await.map_err(|_| "读取备份任务异常".to_owned())?
+}
+
+#[tauri::command]
+pub async fn v1_restore_backup(state: tauri::State<'_, AppState>, password: String, path: String, overwrite: bool)
+    -> Result<crate::storage::RestoreReport, String> {
+    let store = Arc::clone(&state.store);
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut store = store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+        crate::backup::restore(&password, std::path::Path::new(&path), &mut store, overwrite)
+    }).await.map_err(|_| "恢复任务异常".to_owned())?
+}
+
 #[derive(serde::Serialize)]
 pub struct ProbeStatus {
     pub running: bool,

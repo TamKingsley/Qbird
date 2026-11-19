@@ -1,5 +1,6 @@
 pub mod address;
 pub mod app_state;
+pub mod backup;
 mod auto_address;
 pub mod certificate;
 pub mod chat_transport;
@@ -45,6 +46,9 @@ pub fn run() {
             app_state::v1_read_text_attachment,
             app_state::v1_reveal_attachment,
             app_state::v1_storage_usage,
+            app_state::v1_create_backup,
+            app_state::v1_inspect_backup,
+            app_state::v1_restore_backup,
             app_state::v1_set_storage_quota,
             app_state::v1_deliver_direct,
             app_state::v1_open_self,

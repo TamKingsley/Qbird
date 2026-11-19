@@ -1,5 +1,6 @@
 import './style.css';
 import { invoke, isTauri } from '@tauri-apps/api/core';
+import { open as openFileDialog, save as saveFileDialog } from '@tauri-apps/plugin-dialog';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { version as appVersion } from '../package.json';
 import { DirectChat } from './direct_chat';
@@ -41,6 +42,13 @@ type StorageUsage = { used: number; quota: number };
 let storageInfo: StorageUsage | null = null;
 let storageNotice = '';
 let storageBusy = false;
+type BackupInfo = { created_at: number; include_chat: boolean; message_count: number; checksum: string };
+type RestoreReport = { mode: string; inserted: number; skipped: number; conflicts: number; snapshot_path: string | null };
+let backupPassword = '';
+let backupPath = '';
+let backupInfo: BackupInfo | null = null;
+let backupNotice = '';
+let backupBusy = false;
 const direct = new DirectChat(app, () => { groupChat.clear(); selfOpen = false; page = 'messages'; menuOpen = false; render(); });
 const groupChat = new GroupChat(app, () => { direct.clear(); selfOpen = false; page = 'messages'; menuOpen = false; render(); });
 
@@ -201,6 +209,17 @@ function settingsView(): string {
       <p id="storage-notice" role="status">${storageNotice}</p>
       <small>配额只限制本机接收的附件；未完成的分片也计入占用。超过上限的新文件会被拒绝，已保存的记录不受影响。</small>
     </div>
+    <div class="probe-box"><h3>聊天备份与恢复</h3>
+      <p>备份使用密码加密并校验完整性；${backupInfo ? `已校验备份：${backupInfo.message_count} 条消息 · ${new Date(backupInfo.created_at * 1000).toLocaleString()}${backupInfo.include_chat ? ' · 含聊天记录' : ' · 不含聊天记录'}` : '尚未校验备份文件'}</p>
+      <label for="backup-password">备份密码（8–256 字符）</label>
+      <input id="backup-password" type="password" maxlength="256" autocomplete="new-password" value="${backupPassword.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;')}">
+      <p><label><input id="backup-include-chat" type="checkbox" checked> 导出时包含聊天记录（取消后仅含联系人与群组）</label></p>
+      <div class="probe-row"><button class="outline" data-action="backup-export" ${backupBusy ? 'disabled' : ''}>导出备份…</button><button class="outline" data-action="backup-choose" ${backupBusy ? 'disabled' : ''}>选择备份文件…</button><button class="outline" data-action="backup-inspect" ${backupBusy || !backupPath ? 'disabled' : ''}>校验备份</button></div>
+      <p id="backup-path">${backupPath ? `当前文件：${backupPath}` : '合并恢复会跳过相同 ID 且内容一致的消息；覆盖恢复会先在本机保存一份恢复前快照。'}</p>
+      <div class="probe-row"><button class="outline" data-action="backup-restore-merge" ${backupBusy || !backupPath ? 'disabled' : ''}>合并恢复</button><button class="outline danger" data-action="backup-restore-overwrite" ${backupBusy || !backupPath ? 'disabled' : ''}>覆盖恢复</button></div>
+      <p id="backup-notice" role="status">${backupNotice}</p>
+      <small>备份不包含身份私钥与附件文件；在新设备恢复会使用新身份，附件需另行拷贝。恢复不会改动本机存储配额。密码丢失后备份无法解密。</small>
+    </div>
     <p>本机身份指纹（SHA-256）：<br><code class="fingerprint">${fingerprint}</code></p>
     <button data-page="about" class="outline">关于 Qbird</button>
   </section>`;
@@ -237,6 +256,64 @@ async function saveQuota(): Promise<void> {
     storageBusy = false;
     if (page === 'settings') { render(); }
   }
+}
+
+async function exportBackup(): Promise<void> {
+  if (!isTauri() || backupBusy) return;
+  if (backupPassword.length < 8) { backupNotice = '备份密码至少 8 个字符'; if (page === 'settings') render(); return; }
+  const includeChat = app.querySelector<HTMLInputElement>('#backup-include-chat')?.checked ?? true;
+  const date = new Date();
+  const stamp = `${date.getFullYear()}${String(date.getMonth() + 1).padStart(2, '0')}${String(date.getDate()).padStart(2, '0')}`;
+  const target = await saveFileDialog({
+    title: '导出 Qbird 备份',
+    defaultPath: `qbird-backup-${stamp}.qbird`,
+    filters: [{ name: 'Qbird 备份', extensions: ['qbird'] }],
+  }).catch(() => null);
+  if (!target) return;
+  backupBusy = true; backupNotice = '正在生成备份…';
+  try {
+    const info = await invoke<BackupInfo>('v1_create_backup', { password: backupPassword, path: target, includeChat });
+    backupInfo = info; backupPath = target;
+    backupNotice = `备份已生成：${info.message_count} 条消息。请妥善保管密码。`;
+  } catch (error) { backupNotice = typeof error === 'string' ? error : '导出备份失败'; }
+  finally { backupBusy = false; if (page === 'settings') render(); }
+}
+
+async function chooseBackup(): Promise<void> {
+  if (!isTauri() || backupBusy) return;
+  const selected = await openFileDialog({
+    title: '选择 Qbird 备份',
+    multiple: false,
+    filters: [{ name: 'Qbird 备份', extensions: ['qbird'] }],
+  }).catch(() => null);
+  if (!selected || Array.isArray(selected)) return;
+  backupPath = selected; backupInfo = null;
+  backupNotice = '已选择备份文件；输入密码后可校验或恢复。';
+  if (page === 'settings') render();
+}
+
+async function inspectBackup(): Promise<void> {
+  if (!isTauri() || backupBusy || !backupPath) return;
+  backupBusy = true; backupNotice = '正在校验…';
+  try {
+    backupInfo = await invoke<BackupInfo>('v1_inspect_backup', { password: backupPassword, path: backupPath });
+    backupNotice = '密码正确，备份完整性校验通过。';
+  } catch (error) { backupInfo = null; backupNotice = typeof error === 'string' ? error : '校验失败'; }
+  finally { backupBusy = false; if (page === 'settings') render(); }
+}
+
+async function restoreBackup(overwrite: boolean): Promise<void> {
+  if (!isTauri() || backupBusy || !backupPath) return;
+  if (overwrite && !window.confirm('覆盖恢复会先保存一份恢复前快照，然后用备份替换联系人与聊天数据。确认继续？')) return;
+  backupBusy = true; backupNotice = overwrite ? '正在覆盖恢复…' : '正在合并恢复…';
+  try {
+    const report = await invoke<RestoreReport>('v1_restore_backup', { password: backupPassword, path: backupPath, overwrite });
+    backupNotice = report.conflicts > 0
+      ? `发现 ${report.conflicts} 条相同 ID 但内容不同的消息，已中止恢复，未修改任何数据。`
+      : `恢复完成：${report.mode === 'overwrite' ? '覆盖' : '合并'}，新增 ${report.inserted} 条消息${report.skipped ? `，跳过 ${report.skipped} 条已有消息` : ''}。${report.snapshot_path ? '恢复前快照已保存在本机数据目录。' : ''}`;
+    await refreshConversations();
+  } catch (error) { backupNotice = typeof error === 'string' ? error : '恢复失败，现有数据未被修改'; }
+  finally { backupBusy = false; if (page === 'settings') render(); }
 }
 
 function discoveryView(): string {
@@ -534,6 +611,7 @@ app.addEventListener('input', (event) => {
   if (target.id === 'group-search-query') { groupChat.searchDraft('query', target.value); return; }
   if (target.id === 'group-search-member') { groupChat.searchDraft('member', target.value); return; }
   if (target.id === 'group-search-category') { groupChat.searchDraft('category', target.value); return; }
+  if (target.id === 'backup-password') { backupPassword = target.value; return; }
 });
 app.addEventListener('keydown', (event) => {
   if (event.target instanceof HTMLTextAreaElement && event.target.id === 'direct-input' && event.key === 'Enter' && !event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey && !event.isComposing) {
@@ -578,6 +656,11 @@ app.addEventListener('click', (event) => {
   if (action?.dataset.action === 'panel-reveal' && direct.panelId) { void direct.reveal(direct.panelId); return; }
   if (action?.dataset.action === 'panel-close') { direct.closePanel(); return; }
   if (action?.dataset.action === 'save-storage-quota') { void saveQuota(); return; }
+  if (action?.dataset.action === 'backup-export') { void exportBackup(); return; }
+  if (action?.dataset.action === 'backup-choose') { void chooseBackup(); return; }
+  if (action?.dataset.action === 'backup-inspect') { void inspectBackup(); return; }
+  if (action?.dataset.action === 'backup-restore-merge') { void restoreBackup(false); return; }
+  if (action?.dataset.action === 'backup-restore-overwrite') { void restoreBackup(true); return; }
   if (action?.dataset.action === 'save-direct-address') { void direct.saveAddress(); return; }
   if (action?.dataset.action === 'group-send') { void groupChat.send(); return; }
   if (action?.dataset.action === 'group-older') { void groupChat.load(true); return; }
