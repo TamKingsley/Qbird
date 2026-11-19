@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::{params, Connection, OptionalExtension, Result};
 use serde::Serialize;
 
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 
 /// Default cap for locally received attachments; the user may change it in settings.
 pub const DEFAULT_STORAGE_QUOTA: u64 = 2 * 1024 * 1024 * 1024;
@@ -160,6 +160,8 @@ pub struct Conversation {
     pub last_logical: i64,
     /// "self", "direct" or "group"; the UI uses it to route a conversation row.
     pub kind: String,
+    /// Incoming messages not yet read in this conversation.
+    pub unread: u32,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -518,6 +520,20 @@ impl Store {
             transaction.execute_batch("PRAGMA user_version = 9;")?;
             transaction.commit()?;
         }
+        if version < 10 {
+            let transaction = connection.transaction()?;
+            // Unread counters are local UI state; they never affect message ordering or trust.
+            for statement in [
+                "ALTER TABLE direct_conversations ADD COLUMN unread INTEGER NOT NULL DEFAULT 0 CHECK(unread >= 0)",
+                "ALTER TABLE group_members ADD COLUMN unread INTEGER NOT NULL DEFAULT 0 CHECK(unread >= 0)",
+            ] {
+                if let Err(error) = transaction.execute_batch(statement) {
+                    if !error.to_string().contains("duplicate column name") { return Err(error); }
+                }
+            }
+            transaction.execute_batch("PRAGMA user_version = 10;")?;
+            transaction.commit()?;
+        }
         Ok(Self { connection, data_dir, address_revision: std::cell::Cell::new(0) })
     }
 
@@ -629,7 +645,7 @@ impl Store {
         Ok(self.connection.execute(
             "INSERT INTO direct_conversations(peer, hidden)
              SELECT fingerprint, 0 FROM contacts WHERE fingerprint = ?1 AND trust_state = 'verified'
-             ON CONFLICT(peer) DO UPDATE SET hidden = 0", [peer],
+             ON CONFLICT(peer) DO UPDATE SET hidden = 0, unread = 0", [peer],
         )? == 1)
     }
 
@@ -833,7 +849,10 @@ impl Store {
         if tx.execute("UPDATE logical_clock SET value = max(value, ?1) + 1 WHERE singleton = 1 AND value < 9223372036854775807", [logical])? != 1 {
             return Err(rusqlite::Error::InvalidQuery);
         }
-        tx.execute("INSERT INTO direct_conversations(peer, hidden) VALUES (?1, 0) ON CONFLICT(peer) DO UPDATE SET hidden = 0", [peer])?;
+        tx.execute(
+            "INSERT INTO direct_conversations(peer, hidden, unread) VALUES (?1, 0, 1)
+             ON CONFLICT(peer) DO UPDATE SET hidden = 0, unread = unread + 1", [peer],
+        )?;
         tx.execute("INSERT INTO direct_messages(id, peer, sender, body, created_at, logical, status) VALUES (?1, ?2, ?2, ?3, ?4, ?5, 'received')", params![id, peer, body, created_at, logical])?;
         tx.commit()?;
         Ok(IncomingResult::Inserted)
@@ -1201,20 +1220,20 @@ impl Store {
     pub fn list_conversations(&self, self_id: &str) -> Result<Vec<Conversation>> {
         if !valid_fingerprint(self_id) { return Err(rusqlite::Error::InvalidQuery); }
         let mut statement = self.connection.prepare(
-            "SELECT c.id AS id, c.hidden AS hidden, m.body AS body, m.logical AS logical, 'self' AS kind FROM conversations c
+            "SELECT c.id AS id, c.hidden AS hidden, m.body AS body, m.logical AS logical, 'self' AS kind, 0 AS unread FROM conversations c
              JOIN local_messages m ON m.id = (
                SELECT id FROM local_messages WHERE conversation_id = c.id
                ORDER BY logical DESC, sender DESC, id DESC LIMIT 1
              ) WHERE c.hidden = 0
              UNION ALL
-             SELECT c.peer AS id, c.hidden AS hidden, m.body AS body, m.logical AS logical, 'direct' AS kind FROM direct_conversations c
+             SELECT c.peer AS id, c.hidden AS hidden, m.body AS body, m.logical AS logical, 'direct' AS kind, c.unread AS unread FROM direct_conversations c
              JOIN direct_messages m ON m.id = (
                SELECT id FROM direct_messages WHERE peer = c.peer
                ORDER BY logical DESC, sender DESC, id DESC LIMIT 1
              ) WHERE c.hidden = 0
              UNION ALL
              SELECT g.id AS id, gm.hidden AS hidden, COALESCE(m.body, '') AS body,
-                    COALESCE(m.logical, 0) AS logical, 'group' AS kind
+                    COALESCE(m.logical, 0) AS logical, 'group' AS kind, gm.unread AS unread
              FROM groups g JOIN group_members gm ON gm.group_id = g.id
              LEFT JOIN group_messages m ON m.id = (
                SELECT id FROM group_messages WHERE group_id = g.id
@@ -1224,7 +1243,7 @@ impl Store {
              ORDER BY logical DESC, id"
         )?;
         let rows = statement.query_map([self_id], |row| Ok(Conversation {
-            id: row.get(0)?, hidden: row.get(1)?, last_body: row.get(2)?, last_logical: row.get(3)?, kind: row.get(4)?,
+            id: row.get(0)?, hidden: row.get(1)?, last_body: row.get(2)?, last_logical: row.get(3)?, kind: row.get(4)?, unread: row.get(5)?,
         }))?;
         rows.collect()
     }
@@ -1451,7 +1470,7 @@ impl Store {
     pub fn open_group(&self, group_id: &str, self_id: &str) -> Result<bool> {
         if !valid_group_id(group_id) || !valid_fingerprint(self_id) { return Err(rusqlite::Error::InvalidQuery); }
         Ok(self.connection.execute(
-            "UPDATE group_members SET hidden = 0 WHERE group_id = ?1 AND member = ?2 AND active = 1",
+            "UPDATE group_members SET hidden = 0, unread = 0 WHERE group_id = ?1 AND member = ?2 AND active = 1",
             params![group_id, self_id])? == 1)
     }
 
@@ -1901,7 +1920,10 @@ impl Store {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![id, group_id, peer, body, created_at, logical, reply_to, reply_sender, reply_preview,
                 serde_json::to_string(&unique_mentions).unwrap_or_else(|_| "[]".to_owned())])?;
-        tx.execute("UPDATE group_members SET hidden = 0 WHERE group_id = ?1 AND member = ?2", params![group_id, self_id])?;
+        tx.execute(
+            "UPDATE group_members SET hidden = 0, unread = unread + 1 WHERE group_id = ?1 AND member = ?2",
+            params![group_id, self_id],
+        )?;
         tx.commit()?;
         Ok(IncomingResult::Inserted)
     }
@@ -2589,6 +2611,20 @@ mod tests {
     }
 
     #[test]
+    fn unread_counts_follow_incoming_messages_and_clear_on_open() {
+        let store = memory_store();
+        let peer = "a".repeat(64);
+        store.add_candidate(&peer, "peer").unwrap();
+        store.confirm_candidate(&peer).unwrap();
+        store.receive_direct(&peer, "msg-1", "hello", 10, 10).unwrap();
+        store.receive_direct(&peer, "msg-2", "again", 11, 11).unwrap();
+        let rows = store.list_conversations(&"b".repeat(64)).unwrap();
+        assert_eq!(rows.iter().find(|item| item.kind == "direct").map(|item| item.unread), Some(2));
+        store.open_direct(&peer).unwrap();
+        let rows = store.list_conversations(&"b".repeat(64)).unwrap();
+        assert_eq!(rows.iter().find(|item| item.kind == "direct").map(|item| item.unread), Some(0));
+    }
+
     fn self_history_and_hidden_state_survive_reopen() {
         use std::{fs, time::{SystemTime, UNIX_EPOCH}};
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("storage-tests");

@@ -44,7 +44,7 @@ const stickerUrls = new Map<string, string>();
 let stickerManage = false;
 let emojiNotice = '';
 type Profile = { nickname: string; email: string };
-type Conversation = { id: string; last_body: string; last_logical: number; kind: string };
+type Conversation = { id: string; last_body: string; last_logical: number; kind: string; unread: number };
 type Group = { id: string; name: string; owner: string; member_count: number; hidden: boolean; is_owner: boolean; last_body: string; last_logical: number };
 let groups: Group[] = [];
 type LocalMessage = { id: string; body: string; logical: number; created_at: number };
@@ -136,6 +136,15 @@ async function sendSelf(): Promise<void> {
   finally { selfBusy = false; if (button?.isConnected) button.disabled = false; }
 }
 
+function appendUnread(button: HTMLButtonElement, count: number): void {
+  if (count <= 0) return;
+  const badge = document.createElement('span');
+  badge.className = 'unread-badge';
+  badge.textContent = count > 99 ? '99+' : String(count);
+  badge.setAttribute('aria-label', `${count} 条未读消息`);
+  button.append(badge);
+}
+
 async function refreshConversations(): Promise<void> {
   const list = app.querySelector<HTMLElement>('#conversation-list');
   if (!list) return;
@@ -150,6 +159,15 @@ async function refreshConversations(): Promise<void> {
     if (!list.isConnected) return;
     list.replaceChildren();
     if (!conversations.length) { list.textContent = '暂无会话'; return; }
+    // Whatever is on screen counts as read; the backend counter is the source of truth.
+    if (direct.peer) {
+      const active = conversations.find((item) => item.kind === 'direct' && item.id === direct.peer);
+      if (active && active.unread > 0) { active.unread = 0; void invoke('v1_open_direct', { peer: direct.peer }).catch(() => {}); }
+    }
+    if (groupChat.groupId) {
+      const active = conversations.find((item) => item.kind === 'group' && item.id === groupChat.groupId);
+      if (active && active.unread > 0) { active.unread = 0; void invoke('v1_open_group', { groupId: groupChat.groupId }).catch(() => {}); }
+    }
     for (const conversation of conversations) {
       if (conversation.kind === 'group') {
         const group = groups.find(item => item.id === conversation.id);
@@ -159,7 +177,7 @@ async function refreshConversations(): Promise<void> {
         button.dataset.action = 'open-group'; button.dataset.group = group.id; button.dataset.name = group.name;
         const name = document.createElement('strong'); name.textContent = group.name;
         const preview = document.createElement('span'); preview.textContent = conversation.last_body || `${group.member_count} 位成员`;
-        button.append(name, preview); list.append(button);
+        button.append(name, preview); appendUnread(button, conversation.unread); list.append(button);
         continue;
       }
       const contact = contacts.find(item => item.fingerprint === conversation.id && item.trust_state === 'verified');
@@ -167,6 +185,7 @@ async function refreshConversations(): Promise<void> {
       const button = document.createElement('button');
       button.className = `conversation-row${conversation.id === 'self' ? (selfOpen ? ' selected' : '') : (direct.peer === conversation.id ? ' selected' : '')}`;
       button.dataset.action = conversation.id === 'self' ? 'open-self' : 'open-direct';
+      appendUnread(button, conversation.unread);
       if (contact) { button.dataset.peer = contact.fingerprint; button.dataset.name = contact.display_name; }
       const name = document.createElement('strong'); name.textContent = contact?.display_name ?? '自己';
       const preview = document.createElement('span'); preview.textContent = conversation.last_body;
