@@ -36,6 +36,8 @@ pub fn run() {
             app_state::identity_fingerprint,
             app_state::v1_profile,
             app_state::v1_set_profile,
+            app_state::v1_network_settings,
+            app_state::v1_set_network_settings,
             app_state::v1_composer_settings,
             app_state::v1_list_stickers,
             app_state::v1_add_sticker,

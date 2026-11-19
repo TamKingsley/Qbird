@@ -377,6 +377,41 @@ pub fn v1_set_profile(state: tauri::State<'_, AppState>, nickname: String, email
     store.get_profile().map_err(|_| "无法读取个人资料".to_owned())
 }
 
+/// Default TCP port for the shared probe/chat listener.
+#[derive(serde::Serialize)]
+pub struct NetworkSettings {
+    pub default_port: u16,
+}
+
+pub const DEFAULT_LISTEN_PORT: u16 = 42853;
+pub const MIN_LISTEN_PORT: u16 = 1024;
+
+fn read_network(store: &crate::storage::Store) -> Result<NetworkSettings, String> {
+    let port = store.get_setting("listen_port").map_err(|_| "无法读取网络设置".to_owned())?
+        .and_then(|text| text.parse::<u16>().ok())
+        .filter(|port| *port >= MIN_LISTEN_PORT)
+        .unwrap_or(DEFAULT_LISTEN_PORT);
+    Ok(NetworkSettings { default_port: port })
+}
+
+#[tauri::command]
+pub fn v1_network_settings(state: tauri::State<'_, AppState>) -> Result<NetworkSettings, String> {
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    read_network(&store)
+}
+
+/// Saves the default port used the next time a listener starts; a running
+/// listener keeps its port.
+#[tauri::command]
+pub fn v1_set_network_settings(state: tauri::State<'_, AppState>, port: u16) -> Result<NetworkSettings, String> {
+    if port < MIN_LISTEN_PORT {
+        return Err(format!("监听端口需为 {MIN_LISTEN_PORT}–65535"));
+    }
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    store.set_setting("listen_port", Some(&port.to_string())).map_err(|_| "无法保存网络设置".to_owned())?;
+    read_network(&store)
+}
+
 #[tauri::command]
 pub fn v1_list_stickers(state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
     crate::stickers::list(&state.data_dir)

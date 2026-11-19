@@ -21,6 +21,9 @@ type ProbeRequest = { fingerprint: string; remote_ip: string };
 type ProbeStatus = { running: boolean; port: number | null; requests: ProbeRequest[] };
 let probeStatus: ProbeStatus = { running: false, port: null, requests: [] };
 let probePort = '42853';
+type NetworkSettings = { default_port: number };
+let networkSettings: NetworkSettings = { default_port: 42853 };
+let networkNotice = '';
 let manualAddress = '';
 let probeNotice = isTauri() ? '探测服务未启动' : '仅桌面应用支持身份探测';
 let probeMessage = '';
@@ -477,6 +480,26 @@ function applyComposerSettings(): void {
   for (const hint of app.querySelectorAll<HTMLElement>('.compose-footer > span')) hint.textContent = sendHint();
 }
 
+async function refreshNetwork(): Promise<void> {
+  if (!isTauri()) return;
+  try {
+    networkSettings = await invoke<NetworkSettings>('v1_network_settings');
+    probePort = String(networkSettings.default_port);
+  } catch { networkNotice = '无法读取网络设置'; }
+}
+
+async function saveListenPort(): Promise<void> {
+  if (!isTauri()) return;
+  const port = Number(app.querySelector<HTMLInputElement>('#listen-port')?.value ?? '0');
+  if (!Number.isInteger(port) || port < 1024 || port > 65535) { networkNotice = '监听端口需为 1024–65535'; if (page === 'settings') render(); return; }
+  try {
+    networkSettings = await invoke<NetworkSettings>('v1_set_network_settings', { port });
+    probePort = String(networkSettings.default_port);
+    networkNotice = '默认端口已保存；下次启动聊天服务时生效。';
+  } catch (error) { networkNotice = displayError(error); }
+  if (page === 'settings') render();
+}
+
 async function refreshComposer(): Promise<void> {
   if (!isTauri()) return;
   try { composer = await invoke<ComposerSettings>('v1_composer_settings'); }
@@ -523,6 +546,13 @@ function generalSettingsHtml(): string {
       <div class="probe-row"><input id="storage-quota-mib" type="number" min="256" max="65536" value="${quotaMib}" ${storageBusy ? 'disabled' : ''}><button class="outline" data-action="save-storage-quota" ${storageBusy ? 'disabled' : ''}>保存配额</button></div>
       <p id="storage-notice" role="status">${storageNotice}</p>
       <small>配额只限制本机接收的附件；未完成的分片也计入占用。超过上限的新文件会被拒绝，已保存的记录不受影响。</small>
+    </div>
+    <div class="probe-box"><h3>监听端口</h3>
+      <p>默认端口 <strong>${networkSettings.default_port}</strong>，在发现页启动聊天服务时使用；正在运行的服务不受保存影响。</p>
+      <label for="listen-port">默认端口（1024–65535）</label>
+      <div class="probe-row"><input id="listen-port" type="number" min="1024" max="65535" value="${networkSettings.default_port}"><button class="outline" data-action="save-listen-port">保存端口</button></div>
+      <p id="network-notice" role="status">${networkNotice}</p>
+      <small>端口被占用时启动会提示；修改只影响本机监听，不改变身份或信任状态。</small>
     </div>
     <p>本机身份指纹（SHA-256）：<br><code class="fingerprint">${fingerprint}</code></p>
     <button data-page="about" class="outline">关于 Qbird</button>`;
@@ -680,7 +710,7 @@ function discoveryView(): string {
     <span class="eyebrow">DISCOVERY / 发现</span><h2>局域网身份探测</h2>
     <p>探测仅证明对方持有密钥，不会自动建立信任。双方须分别通过独立可靠渠道核对完整指纹。</p>
     <div class="probe-box"><label for="probe-port">本机监听端口</label><div class="probe-row"><input id="probe-port" type="number" min="1" max="65535" aria-label="本机监听端口"><button class="outline" data-action="probe-start">启动聊天和探测</button><button class="outline" data-action="probe-stop">停止</button></div>
-    <p id="probe-status" aria-live="polite"></p><small>端口仅本次生效；启动后提供探测、聊天及待发消息重试。停止后待发消息保留在本机。</small></div>
+    <p id="probe-status" aria-live="polite"></p><small>启动时使用设置页保存的默认端口，此处可临时修改；启动后提供探测、聊天及待发消息重试。停止后待发消息保留在本机。</small></div>
     <div class="probe-box"><label for="probe-address">手动地址</label><div class="probe-row"><input id="probe-address" type="text" placeholder="192.168.1.8:42853" aria-label="手动地址"><button class="outline" data-action="probe-manual">探测指纹</button></div><p id="probe-message" aria-live="polite"></p>
     <p>本机指纹：<br><code id="local-fingerprint" class="fingerprint"></code></p><p>对方指纹（未确认）：<br><span id="remote-target"></span><br><code id="remote-fingerprint" class="fingerprint"></code></p><button class="outline" data-action="select-outbound">选择此指纹核对</button></div>
     <p id="discovery-status" aria-live="polite"></p><ul id="discovery-results" class="discovery-results"></ul>
@@ -1243,6 +1273,7 @@ app.addEventListener('click', (event) => {
   if (action?.dataset.action === 'backup-restore-overwrite') { void restoreBackup(true); return; }
   if (action?.dataset.action === 'save-profile') { void saveProfile(); return; }
   if (action?.dataset.action === 'save-composer') { void saveComposer(); return; }
+  if (action?.dataset.action === 'save-listen-port') { void saveListenPort(); return; }
   if (action?.dataset.action === 'toggle-emoji') {
     const panel = action.closest('.chat-compose')?.querySelector<HTMLElement>('.emoji-panel');
     if (panel) { const open = panel.hidden; if (open) void loadStickers(panel); panel.hidden = !open; }
@@ -1327,6 +1358,7 @@ render();
 void initLock();
 void refreshAvatar().then(() => { if (!lockState.locked) render(); });
 void refreshComposer().then(() => { if (!lockState.locked) render(); });
+void refreshNetwork().then(() => { if (!lockState.locked) render(); });
 for (const type of ['pointerdown', 'keydown', 'wheel', 'mousemove'] as const) {
   window.addEventListener(type, () => { lastActivity = Date.now(); }, { passive: true });
 }
