@@ -2625,6 +2625,7 @@ mod tests {
         assert_eq!(rows.iter().find(|item| item.kind == "direct").map(|item| item.unread), Some(0));
     }
 
+    #[test]
     fn self_history_and_hidden_state_survive_reopen() {
         use std::{fs, time::{SystemTime, UNIX_EPOCH}};
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("storage-tests");

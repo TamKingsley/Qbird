@@ -24,6 +24,14 @@ let probePort = '42853';
 type NetworkSettings = { default_port: number };
 let networkSettings: NetworkSettings = { default_port: 42853 };
 let networkNotice = '';
+let scanCidr = '192.168.1.0/24';
+let scanBusy = false;
+let scanNotice = '';
+type ScanHit = { address: string; fingerprint: string };
+let scanHits: ScanHit[] = [];
+let scanBlacklist: string[] = [];
+let scanBlacklistDraft = '';
+let scanBlacklistNotice = '';
 let manualAddress = '';
 let probeNotice = isTauri() ? '探测服务未启动' : '仅桌面应用支持身份探测';
 let probeMessage = '';
@@ -480,6 +488,42 @@ function applyComposerSettings(): void {
   for (const hint of app.querySelectorAll<HTMLElement>('.compose-footer > span')) hint.textContent = sendHint();
 }
 
+async function refreshScanState(): Promise<void> {
+  if (!isTauri()) return;
+  try {
+    scanBlacklist = await invoke<string[]>('v1_scan_blacklist');
+    scanBlacklistDraft = scanBlacklist.join(', ');
+  } catch { scanBlacklistNotice = '无法读取扫描黑名单'; }
+}
+
+async function startScan(): Promise<void> {
+  if (!isTauri() || scanBusy) return;
+  const input = app.querySelector<HTMLInputElement>('#scan-cidr');
+  const cidr = (input?.value ?? scanCidr).trim();
+  scanCidr = cidr;
+  const port = Number(probePort);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) { scanNotice = '请先在发现页设置 1–65535 的监听端口'; render(); return; }
+  scanBusy = true; scanNotice = '正在扫描…'; scanHits = [];
+  render();
+  try {
+    scanHits = await invoke<ScanHit[]>('v1_scan_range', { cidr, port });
+    scanNotice = scanHits.length ? `发现 ${scanHits.length} 个候选，请用独立渠道核对完整指纹。` : '本次未发现候选；端口未开放或对方未启动服务。';
+  } catch (error) { scanNotice = displayError(error); }
+  finally { scanBusy = false; if (page === 'discover') render(); }
+}
+
+async function saveScanBlacklist(): Promise<void> {
+  if (!isTauri()) return;
+  const raw = app.querySelector<HTMLInputElement>('#scan-block')?.value ?? scanBlacklistDraft;
+  const entries = raw.split(',').map((item) => item.trim()).filter(Boolean);
+  try {
+    scanBlacklist = await invoke<string[]>('v1_set_scan_blacklist', { entries });
+    scanBlacklistDraft = scanBlacklist.join(', ');
+    scanBlacklistNotice = '黑名单已保存。';
+  } catch (error) { scanBlacklistNotice = displayError(error); }
+  if (page === 'discover') render();
+}
+
 async function refreshNetwork(): Promise<void> {
   if (!isTauri()) return;
   try {
@@ -715,6 +759,19 @@ function discoveryView(): string {
     <p>本机指纹：<br><code id="local-fingerprint" class="fingerprint"></code></p><p>对方指纹（未确认）：<br><span id="remote-target"></span><br><code id="remote-fingerprint" class="fingerprint"></code></p><button class="outline" data-action="select-outbound">选择此指纹核对</button></div>
     <p id="discovery-status" aria-live="polite"></p><ul id="discovery-results" class="discovery-results"></ul>
     <h3>收到的探测请求（未确认）</h3><ul id="probe-requests" class="discovery-results"></ul>
+    <div class="probe-box"><h3>扫描其他网段</h3>
+      <p>mDNS 只覆盖本网段；可对 /24–/32 的 IPv4 网段限速探测身份。扫描结果只是候选，不代表可信。</p>
+      <label for="scan-cidr">网段（CIDR）</label>
+      <input id="scan-cidr" type="text" maxlength="24" spellcheck="false" placeholder="192.168.1.0/24" value="${scanCidr.replace(/"/g, '&quot;')}">
+      <div class="probe-row"><button class="outline" data-action="scan-start" ${scanBusy ? 'disabled' : ''}>${scanBusy ? '扫描中…' : '开始扫描'}</button></div>
+      <p id="scan-status" role="status">${scanNotice}</p>
+      <ul class="discovery-results">${scanHits.map((hit) => `<li><span>${hit.address} · <code>${hit.fingerprint.slice(0, 16)}…</code></span><button class="outline" data-action="probe-scanned" data-address="${hit.address}">核对指纹</button></li>`).join('')}</ul>
+      <label for="scan-block">黑名单（IP 或 CIDR，逗号分隔）</label>
+      <input id="scan-block" type="text" maxlength="512" spellcheck="false" placeholder="192.168.1.20, 10.0.0.0/24" value="${scanBlacklistDraft.replace(/"/g, '&quot;')}">
+      <div class="probe-row"><button class="outline" data-action="save-scan-blacklist">保存黑名单</button></div>
+      <p id="scan-blacklist-notice" role="status">${scanBlacklistNotice}</p>
+      <small>扫描并发 4、单地址超时 400 毫秒，仅用于发现候选；黑名单中的地址不会被扫描。</small>
+    </div>
     <div class="probe-box"><h3>确认联系人</h3><p>所选指纹：<br><code id="selected-fingerprint" class="fingerprint"></code></p>
     <p>请通过当面或其他可靠渠道取得对方的完整指纹并输入；不要仅根据此页面显示的结果确认。对方也需要独立确认你的指纹。</p>
     <label for="checked-fingerprint">对方通过可靠渠道提供的完整指纹</label><input id="checked-fingerprint" type="text" autocomplete="off" spellcheck="false">
@@ -1219,6 +1276,8 @@ app.addEventListener('input', (event) => {
   if (!(target instanceof HTMLInputElement)) return;
   if (target.id === 'direct-address') { direct.addressDraft(target.value); return; }
   if (target.id === 'probe-port') probePort = target.value;
+  if (target.id === 'scan-cidr') scanCidr = target.value;
+  if (target.id === 'scan-block') scanBlacklistDraft = target.value;
   if (target.id === 'probe-address') { manualAddress = target.value; remoteFingerprint = ''; observedAddress = ''; paintDiscovery(); }
   if (target.id === 'group-search-query') { groupChat.searchDraft('query', target.value); return; }
   if (target.id === 'group-search-member') { groupChat.searchDraft('member', target.value); return; }
@@ -1274,6 +1333,9 @@ app.addEventListener('click', (event) => {
   if (action?.dataset.action === 'save-profile') { void saveProfile(); return; }
   if (action?.dataset.action === 'save-composer') { void saveComposer(); return; }
   if (action?.dataset.action === 'save-listen-port') { void saveListenPort(); return; }
+  if (action?.dataset.action === 'scan-start') { void startScan(); return; }
+  if (action?.dataset.action === 'save-scan-blacklist') { void saveScanBlacklist(); return; }
+  if (action?.dataset.action === 'probe-scanned' && action.dataset.address) { void probePeer(action.dataset.address); return; }
   if (action?.dataset.action === 'toggle-emoji') {
     const panel = action.closest('.chat-compose')?.querySelector<HTMLElement>('.emoji-panel');
     if (panel) { const open = panel.hidden; if (open) void loadStickers(panel); panel.hidden = !open; }
@@ -1359,6 +1421,7 @@ void initLock();
 void refreshAvatar().then(() => { if (!lockState.locked) render(); });
 void refreshComposer().then(() => { if (!lockState.locked) render(); });
 void refreshNetwork().then(() => { if (!lockState.locked) render(); });
+void refreshScanState().then(() => { if (!lockState.locked) render(); });
 for (const type of ['pointerdown', 'keydown', 'wheel', 'mousemove'] as const) {
   window.addEventListener(type, () => { lastActivity = Date.now(); }, { passive: true });
 }

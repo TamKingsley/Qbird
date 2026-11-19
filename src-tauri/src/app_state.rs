@@ -377,6 +377,43 @@ pub fn v1_set_profile(state: tauri::State<'_, AppState>, nickname: String, email
     store.get_profile().map_err(|_| "无法读取个人资料".to_owned())
 }
 
+fn read_scan_blacklist(store: &crate::storage::Store) -> Result<Vec<String>, String> {
+    let raw = store.get_setting("scan_blacklist").map_err(|_| "无法读取扫描黑名单".to_owned())?.unwrap_or_default();
+    let entries: Vec<String> = serde_json::from_str(&raw).unwrap_or_default();
+    Ok(entries)
+}
+
+#[tauri::command]
+pub fn v1_scan_blacklist(state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    read_scan_blacklist(&store)
+}
+
+#[tauri::command]
+pub fn v1_set_scan_blacklist(state: tauri::State<'_, AppState>, entries: Vec<String>) -> Result<Vec<String>, String> {
+    let entries: Vec<String> = entries.into_iter().map(|entry| entry.trim().to_owned()).filter(|entry| !entry.is_empty()).collect();
+    crate::scan::validate_blacklist(&entries)?;
+    let encoded = serde_json::to_string(&entries).map_err(|_| "无法保存扫描黑名单".to_owned())?;
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    store.set_setting("scan_blacklist", Some(&encoded)).map_err(|_| "无法保存扫描黑名单".to_owned())?;
+    Ok(entries)
+}
+
+/// Scans at most a /24 with a bounded worker pool; results never grant trust.
+#[tauri::command]
+pub async fn v1_scan_range(state: tauri::State<'_, AppState>, cidr: String, port: u16)
+    -> Result<Vec<crate::scan::ScanHit>, String> {
+    let identity = Arc::clone(&state.identity);
+    let store = Arc::clone(&state.store);
+    tauri::async_runtime::spawn_blocking(move || {
+        let blacklist = {
+            let store = store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+            read_scan_blacklist(&store)?
+        };
+        crate::scan::scan(&identity, &cidr, port, &blacklist)
+    }).await.map_err(|_| "扫描任务异常".to_owned())?
+}
+
 /// Default TCP port for the shared probe/chat listener.
 #[derive(serde::Serialize)]
 pub struct NetworkSettings {

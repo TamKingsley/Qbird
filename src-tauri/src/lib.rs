@@ -14,6 +14,7 @@ pub mod probe_service;
 pub mod protocol;
 pub mod retry_queue;
 pub mod stickers;
+pub mod scan;
 pub mod storage;
 pub mod tls;
 
@@ -37,6 +38,9 @@ pub fn run() {
             app_state::v1_profile,
             app_state::v1_set_profile,
             app_state::v1_network_settings,
+            app_state::v1_scan_blacklist,
+            app_state::v1_set_scan_blacklist,
+            app_state::v1_scan_range,
             app_state::v1_set_network_settings,
             app_state::v1_composer_settings,
             app_state::v1_list_stickers,

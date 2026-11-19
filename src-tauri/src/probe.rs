@@ -130,16 +130,21 @@ fn handshake(connection: &mut rustls::Connection, stream: &mut TcpStream) -> io:
 
 /// Returns an untrusted fingerprint for display only; it does not confirm a contact.
 pub fn connect(identity: &Identity, address: SocketAddr) -> ProbeResult<String> {
-    connect_inner(identity, address, false)
+    connect_inner(identity, address, false, TIMEOUT)
 }
 
 pub(crate) fn connect_auto(identity: &Identity, address: SocketAddr) -> ProbeResult<String> {
-    connect_inner(identity, address, true)
+    connect_inner(identity, address, true, TIMEOUT)
 }
 
-fn connect_inner(identity: &Identity, address: SocketAddr, automatic: bool) -> ProbeResult<String> {
+/// Range scanning uses a shorter connect timeout so a /24 stays bounded.
+pub(crate) fn connect_with_timeout(identity: &Identity, address: SocketAddr, timeout: Duration) -> ProbeResult<String> {
+    connect_inner(identity, address, false, timeout)
+}
+
+fn connect_inner(identity: &Identity, address: SocketAddr, automatic: bool, timeout: Duration) -> ProbeResult<String> {
     if address.port() == 0 || !is_unicast(address.ip()) { return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid address").into()); }
-    let mut stream = TcpStream::connect_timeout(&address, TIMEOUT)?;
+    let mut stream = TcpStream::connect_timeout(&address, timeout)?;
     prepare(&stream)?;
     let mut connection = rustls::Connection::Client(ClientConnection::new(Arc::new(client_config(identity, automatic)?), ServerName::try_from("qbird.invalid")?.to_owned())?);
     handshake(&mut connection, &mut stream)?;
