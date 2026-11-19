@@ -3,6 +3,7 @@ pub mod app_state;
 pub mod avatar;
 pub mod base64;
 pub mod network_info;
+pub mod plugins;
 pub mod backup;
 mod auto_address;
 pub mod certificate;
@@ -54,6 +55,13 @@ pub fn run() {
             app_state::v1_set_scan_blacklist,
             app_state::v1_scan_range,
             app_state::v1_set_network_settings,
+            app_state::v1_list_plugins,
+            app_state::v1_install_plugin,
+            app_state::v1_set_plugin_enabled,
+            app_state::v1_remove_plugin,
+            app_state::v1_plugin_preview,
+            app_state::v1_attachment_base64,
+            app_state::v1_group_attachment_base64,
             app_state::v1_hover_settings,
             app_state::v1_set_hover_settings,
             app_state::v1_contact_network,

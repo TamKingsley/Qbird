@@ -653,6 +653,90 @@ pub fn v1_set_composer_settings(state: tauri::State<'_, AppState>, send_shortcut
     read_composer(&store)
 }
 
+/// Installed preview plugins; entries are re-validated from disk on every listing.
+#[tauri::command]
+pub fn v1_list_plugins(state: tauri::State<'_, AppState>) -> Result<Vec<crate::plugins::PluginView>, String> {
+    let rows = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?.list_plugins()
+        .map_err(|_| "无法读取插件列表".to_owned())?;
+    let root = crate::plugins::plugins_dir(&state.data_dir);
+    Ok(rows.into_iter().filter_map(|row| crate::plugins::load_view(&root.join(&row.id), row.enabled)).collect())
+}
+
+#[tauri::command]
+pub async fn v1_install_plugin(state: tauri::State<'_, AppState>, path: String)
+    -> Result<crate::plugins::PluginView, String> {
+    let store = Arc::clone(&state.store);
+    let data_dir = Arc::clone(&state.data_dir);
+    tauri::async_runtime::spawn_blocking(move || {
+        if path.len() > 4096 { return Err("插件路径无效".to_owned()); }
+        let now = unix_now()?;
+        let (view, _) = crate::plugins::install(&data_dir, std::path::Path::new(&path))?;
+        store.lock().map_err(|_| "本地存储不可用".to_owned())?
+            .register_plugin(&view.id, &view.name, &view.version, now)
+            .map_err(|_| "无法登记插件".to_owned())?;
+        Ok(view)
+    }).await.map_err(|_| "插件安装任务异常".to_owned())?
+}
+
+#[tauri::command]
+pub fn v1_set_plugin_enabled(state: tauri::State<'_, AppState>, id: String, enabled: bool) -> Result<(), String> {
+    let changed = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?
+        .set_plugin_enabled(&id, enabled).map_err(|_| "无法更新插件状态".to_owned())?;
+    if changed { Ok(()) } else { Err("插件不存在".into()) }
+}
+
+/// User-initiated removal: drops the database row and the copied plugin folder only.
+#[tauri::command]
+pub fn v1_remove_plugin(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
+    crate::plugins::remove(&state.data_dir, &id)?;
+    state.store.lock().map_err(|_| "本地存储不可用".to_owned())?
+        .remove_plugin_row(&id).map_err(|_| "无法移除插件记录".to_owned())?;
+    Ok(())
+}
+
+#[derive(serde::Serialize)]
+pub struct PluginPreview {
+    pub plugin_id: String,
+    pub html: String,
+}
+
+/// The entry HTML for one file name, if an enabled plugin claims the extension.
+#[tauri::command]
+pub fn v1_plugin_preview(state: tauri::State<'_, AppState>, file_name: String) -> Result<Option<PluginPreview>, String> {
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    let Some((plugin_id, html)) = crate::plugins::entry_html(&state.data_dir, &file_name, |id| {
+        store.is_plugin_enabled(id).unwrap_or(false)
+    }) else { return Ok(None); };
+    Ok(Some(PluginPreview { plugin_id, html }))
+}
+
+/// Base64 bytes for a completed attachment, bounded so the IPC payload stays sane.
+#[tauri::command]
+pub fn v1_attachment_base64(state: tauri::State<'_, AppState>, message_id: String) -> Result<String, String> {
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    let Some((_, path)) = store.attachment_path(&message_id).map_err(|_| "无法读取附件".to_owned())? else {
+        return Err("文件尚未接收完成或已被移动".into());
+    };
+    let size = crate::files::file_size(&path).map_err(|_| "无法读取附件".to_owned())?;
+    if size == 0 || size > crate::plugins::MAX_ENTRY_BYTES { return Err("文件过大，暂不能交给插件预览".into()); }
+    let data = std::fs::read(&path).map_err(|_| "无法读取附件".to_owned())?;
+    Ok(crate::files::base64_encode(&data))
+}
+
+#[tauri::command]
+pub fn v1_group_attachment_base64(state: tauri::State<'_, AppState>, group_id: String, message_id: String) -> Result<String, String> {
+    let self_id = state.identity.fingerprint();
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    let Some((_, path)) = store.group_attachment_path(&group_id, &self_id, &message_id)
+        .map_err(|_| "无法读取群文件".to_owned())? else {
+        return Err("文件尚未接收完成或已被移动".into());
+    };
+    let size = crate::files::file_size(&path).map_err(|_| "无法读取群文件".to_owned())?;
+    if size == 0 || size > crate::plugins::MAX_ENTRY_BYTES { return Err("文件过大，暂不能交给插件预览".into()); }
+    let data = std::fs::read(&path).map_err(|_| "无法读取群文件".to_owned())?;
+    Ok(crate::files::base64_encode(&data))
+}
+
 #[derive(serde::Serialize)]
 pub struct HoverSettings {
     pub show_ip: bool,

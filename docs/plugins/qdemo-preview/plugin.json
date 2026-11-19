@@ -1,0 +1,9 @@
+{
+  "id": "qbird.qdemo-preview",
+  "name": "QDEMO 十六进制预览",
+  "version": "1.0.0",
+  "api": 1,
+  "preview": [
+    { "extensions": ["qdemo"], "entry": "preview.html" }
+  ]
+}

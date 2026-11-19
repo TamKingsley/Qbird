@@ -1,6 +1,7 @@
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
 import { showImage } from './image_viewer';
+import { base64ToBytes, createPluginFrame } from './plugin_view';
 
 type GroupMessage = {
   id: string; group_id: string; sender: string; sender_name: string; body: string;
@@ -56,6 +57,7 @@ export class GroupChat {
   private batches = new Map<string, string>();
   private batchCaptions = new Map<string, string>();
   private renderedBatches = new Set<string>();
+  private panelBytes: Uint8Array | null = null;
   private panel: Panel | null = null;
   private panelWidth = 380;
   /// 'lightbox' keeps the in-app viewer; 'workspace' opens the right panel instead.
@@ -618,13 +620,32 @@ export class GroupChat {
     this.panel = { id: message.id, name, kind };
     this.paintPanel('正在读取…');
     try {
-      if (kind === 'other') { this.paintPanel('该类型暂不支持预览，可使用“打开所在目录”。'); return; }
-      if (kind !== 'image') { this.paintPanel('群聊目前只能预览图片，其他文件请使用“打开所在目录”。'); return; }
+      if (kind !== 'image') {
+        if (await this.openWithPlugin(message, name)) { return; }
+        this.paintPanel('该类型暂不支持预览，也未安装对应插件；可使用“打开所在目录”。');
+        return;
+      }
       const preview = await invoke<{ name: string; data_url: string } | null>('v1_read_group_attachment', { groupId: this.groupId, messageId: message.id });
       if (!preview) { this.paintPanel('图片过大或无法读取，未能预览'); return; }
       this.thumbs.set(message.id, preview.data_url);
       this.paintPanel('', preview.data_url);
     } catch (error) { this.paintPanel(typeof error === 'string' ? error : '无法读取群文件'); }
+  }
+
+  /// Hands the file bytes to an installed read-only preview plugin, if one claims it.
+  private async openWithPlugin(message: GroupMessage, name: string): Promise<boolean> {
+    try {
+      const plugin = await invoke<{ plugin_id: string; html: string } | null>('v1_plugin_preview', { fileName: name });
+      if (!plugin) return false;
+      const data = await invoke<string>('v1_group_attachment_base64', { groupId: this.groupId, messageId: message.id });
+      this.panel = { id: message.id, name, kind: 'plugin' };
+      this.panelBytes = base64ToBytes(data);
+      this.paintPanel('', plugin.html);
+      return true;
+    } catch (error) {
+      this.paintPanel(typeof error === 'string' ? error : '插件预览失败');
+      return true;
+    }
   }
 
   get panelId(): string { return this.panel?.id ?? ''; }
@@ -652,6 +673,13 @@ export class GroupChat {
     body.replaceChildren();
     if (!content) {
       const note = document.createElement('p'); note.className = 'panel-note'; note.textContent = message;
+      body.append(note);
+      return;
+    }
+    if (this.panel.kind === 'plugin') {
+      body.append(createPluginFrame(content, this.panelBytes ?? new Uint8Array(), this.panel.name));
+      const note = document.createElement('p'); note.className = 'panel-note';
+      note.textContent = '插件在沙箱中运行，只能读取这个文件的字节；第一版为只读预览。';
       body.append(note);
       return;
     }

@@ -71,6 +71,10 @@ let imageOpenMode: 'lightbox' | 'workspace' = 'lightbox';
 let imageOpenNotice = '';
 let hover = { show_ip: true, show_mac: false };
 let hoverNotice = '';
+type PluginView = { id: string; name: string; version: string; api: number; enabled: boolean; extensions: string[] };
+let plugins: PluginView[] = [];
+let pluginNotice = '';
+let pluginRemovePending = '';
 const COMMON_EMOJIS = ['😀', '😁', '😂', '🤣', '😊', '😍', '😘', '😜', '🤔', '😅', '😭', '😡', '👍', '👎', '👏', '🙏', '💪', '🎉', '❤️', '💔', '🔥', '✨', '⭐', '🌹', '🍀', '☕', '🍰', '🐱', '🐶', '🌙', '☀️', '💡', '✅', '❌', '⚠️', '📌', '📎', '🚀', '🎯', '💬', '🙌', '🤝', '😴', '😎', '🥳', '🤩', '😢', '😤'];
 let stickers: string[] = [];
 let stickersLoaded = false;
@@ -721,7 +725,14 @@ function experimentalSettingsHtml(): string {
       <p>开启后，群聊里可以引用文件消息并在气泡中显示文件名；关闭时文件消息不能引用。默认关闭，不影响普通成员 @。</p>
       <div class="probe-row"><button class="outline" data-action="save-experiment">保存实验设置</button></div>
       <p id="experiment-notice" role="status">${experimentNotice}</p>
-      <small>插件接口与 Agent 能力仍未实现，不会显示为可操作开关。</small>
+      <small>Agent 联系人等能力仍未实现，不会显示为可操作开关。</small>
+    </div>
+    <div class="probe-box"><h3>预览插件（只读）</h3>
+      <p>插件以本地文件夹安装，页面在沙箱 iframe 中运行：没有同源权限和网络访问，只能拿到被预览文件的字节，看不到聊天数据、身份或本机路径。</p>
+      <ul id="plugin-list" class="discovery-results">${plugins.map(plugin => `<li><span class="contact-title">${escapeText(plugin.name)} ${escapeText(plugin.version)} · ${escapeText(plugin.extensions.join(' / ')) || '无扩展名'}</span><div class="contact-actions"><label><input type="checkbox" data-plugin-toggle="${escapeText(plugin.id)}" ${plugin.enabled ? 'checked' : ''}> 启用</label><button class="linkish" data-action="remove-plugin" data-id="${escapeText(plugin.id)}">${pluginRemovePending === plugin.id ? '确认移除' : '移除'}</button></div></li>`).join('') || '<li>尚未安装插件</li>'}</ul>
+      <div class="probe-row"><button class="outline" data-action="install-plugin">从文件夹安装…</button></div>
+      <p id="plugin-notice" role="status">${pluginNotice}</p>
+      <small>第一版只读：docx、pptx、pdf、xlsx 等由插件自带查看器渲染；编辑写回不在本版。插件目录位于本机应用数据目录的 plugins/ 下。</small>
     </div>`;
 }
 
@@ -986,6 +997,53 @@ async function loadGroupAvatarIcon(groupId: string, icon: HTMLImageElement): Pro
     if (bytes && bytes.length) icon.src = URL.createObjectURL(new Blob([toArrayBuffer(new Uint8Array(bytes))], { type: 'image/png' }));
     else icon.hidden = true;
   } catch { icon.hidden = true; }
+}
+
+async function refreshPlugins(): Promise<void> {
+  if (!isTauri()) return;
+  try { plugins = await invoke<PluginView[]>('v1_list_plugins'); }
+  catch { pluginNotice = '无法读取插件列表'; }
+}
+
+async function installPlugin(): Promise<void> {
+  if (!isTauri()) return;
+  const picked = await openFileDialog({ directory: true, multiple: false, title: '选择包含 plugin.json 的插件文件夹' }).catch(() => null);
+  if (!picked || typeof picked !== 'string') return;
+  pluginNotice = '正在安装…';
+  try {
+    const view = await invoke<PluginView>('v1_install_plugin', { path: picked });
+    pluginNotice = `已安装「${view.name}」，可预览：${view.extensions.join('、') || '无'}`;
+  } catch (error) { pluginNotice = displayError(error); }
+  await refreshPlugins();
+  render();
+}
+
+async function togglePlugin(id: string, enabled: boolean): Promise<void> {
+  if (!isTauri()) return;
+  try {
+    await invoke('v1_set_plugin_enabled', { id, enabled });
+    pluginNotice = enabled ? '插件已启用。' : '插件已停用。';
+  } catch (error) { pluginNotice = displayError(error); }
+  await refreshPlugins();
+  render();
+}
+
+/// Two clicks: the first arms the removal so a stray click cannot delete a plugin.
+async function removePlugin(id: string): Promise<void> {
+  if (!isTauri()) return;
+  if (pluginRemovePending !== id) {
+    pluginRemovePending = id;
+    pluginNotice = '再次点击“确认移除”会删除该插件目录。';
+    render();
+    return;
+  }
+  pluginRemovePending = '';
+  try {
+    await invoke('v1_remove_plugin', { id });
+    pluginNotice = '插件已移除。';
+  } catch (error) { pluginNotice = displayError(error); }
+  await refreshPlugins();
+  render();
 }
 
 async function refreshHover(): Promise<void> {
@@ -1748,6 +1806,10 @@ app.addEventListener('keydown', (event) => {
 });
 app.addEventListener('change', (event) => {
   const target = event.target;
+  if (target instanceof HTMLInputElement && target.dataset.pluginToggle) {
+    void togglePlugin(target.dataset.pluginToggle, target.checked);
+    return;
+  }
   if (!(target instanceof HTMLSelectElement)) return;
   if (target.id === 'group-search-member') groupChat.searchDraft('member', target.value);
   if (target.id === 'group-search-category') groupChat.searchDraft('category', target.value);
@@ -1832,6 +1894,8 @@ app.addEventListener('click', (event) => {
   if (action?.dataset.action === 'add-group-member') { void groupChat.addMember(); return; }
   if (action?.dataset.action === 'remove-group-member' && action.dataset.member) { void groupChat.removeMember(action.dataset.member); return; }
   if (action?.dataset.action === 'create-group') { void createGroup(); return; }
+  if (action?.dataset.action === 'install-plugin') { void installPlugin(); return; }
+  if (action?.dataset.action === 'remove-plugin' && action.dataset.id) { void removePlugin(action.dataset.id); return; }
   if (action?.dataset.action === 'save-hover-settings') { void saveHover(); return; }
   if (action?.dataset.action === 'save-image-open-mode') { void saveImageOpenMode(); return; }
   if (action?.dataset.action === 'group-preview-file' && action.dataset.id) { groupChat.openPreviewById(action.dataset.id); return; }
@@ -1914,6 +1978,7 @@ void refreshFileAccept().then(() => { if (!lockState.locked) render(); });
 void refreshTeam().then(() => { if (!lockState.locked) render(); });
 void refreshImageOpenMode().then(() => { if (!lockState.locked) render(); });
 void refreshHover().then(() => { if (!lockState.locked) render(); });
+void refreshPlugins().then(() => { if (!lockState.locked) render(); });
 for (const type of ['pointerdown', 'keydown', 'wheel', 'mousemove'] as const) {
   window.addEventListener(type, () => { lastActivity = Date.now(); }, { passive: true });
 }

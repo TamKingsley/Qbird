@@ -176,3 +176,6 @@
 .batch-item .file-thumb{width:100%;max-height:160px;object-fit:cover;border-radius:8px;cursor:zoom-in}
 .batch-item .file-meta{font-size:10px;color:#9d8b7c;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .image-batch .message-text{white-space:pre-wrap}
+
+/* Read-only preview plugin frame */
+.plugin-preview{width:100%;height:calc(100% - 30px);min-height:320px;border:1px solid #eee2d7;border-radius:10px;background:#fff}

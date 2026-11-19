@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::{params, Connection, OptionalExtension, Result};
 use serde::{Deserialize, Serialize};
 
-const SCHEMA_VERSION: i64 = 15;
+const SCHEMA_VERSION: i64 = 16;
 
 /// Default cap for locally received attachments; the user may change it in settings.
 pub const DEFAULT_STORAGE_QUOTA: u64 = 2 * 1024 * 1024 * 1024;
@@ -281,6 +281,15 @@ pub struct ArchiveImportReport {
     pub inserted: u64,
     pub skipped: u64,
     pub conflicts: u64,
+}
+
+/// One installed preview plugin as recorded in the database.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct PluginRow {
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    pub enabled: bool,
 }
 
 /// Links an image message to the bubble it belongs to.
@@ -647,6 +656,21 @@ impl Store {
                  );
                  CREATE INDEX IF NOT EXISTS group_file_transfers_by_peer ON group_file_transfers(peer, status);
                  PRAGMA user_version = 11;",
+            )?;
+            transaction.commit()?;
+        }
+        if version < 16 {
+            let transaction = connection.transaction()?;
+            // Installed preview plugins; the files live under <data>/plugins/<id>.
+            transaction.execute_batch(
+                "CREATE TABLE IF NOT EXISTS plugins (
+                    id TEXT PRIMARY KEY NOT NULL CHECK(length(id) BETWEEN 2 AND 64),
+                    name TEXT NOT NULL CHECK(length(name) BETWEEN 1 AND 64),
+                    version TEXT NOT NULL CHECK(length(version) BETWEEN 1 AND 32),
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    installed_at INTEGER NOT NULL
+                );
+                PRAGMA user_version = 16;",
             )?;
             transaction.commit()?;
         }
@@ -2584,6 +2608,39 @@ impl Store {
         }
         tx.commit()?;
         Ok(report)
+    }
+
+    pub fn register_plugin(&self, id: &str, name: &str, version: &str, now: i64) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO plugins(id, name, version, enabled, installed_at) VALUES (?1, ?2, ?3, 1, ?4)
+             ON CONFLICT(id) DO UPDATE SET name = excluded.name, version = excluded.version,
+                enabled = 1, installed_at = excluded.installed_at",
+            params![id, name, version, now])?;
+        Ok(())
+    }
+
+    pub fn list_plugins(&self) -> Result<Vec<PluginRow>> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, name, version, enabled FROM plugins ORDER BY name, id")?;
+        let rows = statement.query_map([], |row| Ok(PluginRow {
+            id: row.get(0)?, name: row.get(1)?, version: row.get(2)?, enabled: row.get::<_, i64>(3)? == 1,
+        }))?;
+        rows.collect()
+    }
+
+    pub fn set_plugin_enabled(&self, id: &str, enabled: bool) -> Result<bool> {
+        Ok(self.connection.execute(
+            "UPDATE plugins SET enabled = ?2 WHERE id = ?1",
+            params![id, if enabled { 1 } else { 0 }])? > 0)
+    }
+
+    pub fn remove_plugin_row(&self, id: &str) -> Result<bool> {
+        Ok(self.connection.execute("DELETE FROM plugins WHERE id = ?1", [id])? > 0)
+    }
+
+    pub fn is_plugin_enabled(&self, id: &str) -> Result<bool> {
+        Ok(self.connection.query_row(
+            "SELECT enabled FROM plugins WHERE id = ?1", [id], |row| row.get::<_, i64>(0)).optional()?.unwrap_or(0) == 1)
     }
 
     /// Creates a fresh 32-character batch id for one bubble of images.

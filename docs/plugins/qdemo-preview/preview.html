@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>QDEMO 预览</title>
+<style>
+  body{margin:0;padding:16px;font:12px/1.6 Consolas,monospace;color:#4a3d34;background:#fffdfa}
+  h1{font:600 14px/1.4 system-ui;margin:0 0 8px}
+  code{display:block;white-space:pre-wrap;overflow-wrap:anywhere}
+</style></head>
+<body>
+  <h1 id="title">等待文件…</h1>
+  <code id="out"></code>
+  <script>
+    window.addEventListener("message", (event) => {
+      const data = event.data;
+      if (!data || data.type !== "qbird:preview" || !(data.bytes instanceof ArrayBuffer)) return;
+      const bytes = new Uint8Array(data.bytes);
+      document.getElementById("title").textContent = data.name + " · " + bytes.length + " 字节";
+      const head = bytes.subarray(0, 64);
+      document.getElementById("out").textContent = Array.from(head)
+        .map((b) => b.toString(16).padStart(2, "0")).join(" ")
+        + (bytes.length > head.length ? "\n…" : "");
+      parent.postMessage({ type: "qbird:ready" }, "*");
+    });
+  </script>
+</body></html>

@@ -1,6 +1,7 @@
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
 import { showImage } from './image_viewer';
+import { base64ToBytes, createPluginFrame } from './plugin_view';
 
 type DirectMessage = {
   id: string; peer: string; sender: string; body: string; created_at: number; logical: number;
@@ -40,6 +41,7 @@ export class DirectChat {
   private batches = new Map<string, string>();
   private batchCaptions = new Map<string, string>();
   private renderedBatches = new Set<string>();
+  private panelBytes: Uint8Array | null = null;
   /// 'lightbox' keeps the in-app viewer; 'workspace' opens the right panel instead.
   imageOpenMode: 'lightbox' | 'workspace' = 'lightbox';
 
@@ -206,13 +208,30 @@ export class DirectChat {
         this.paintPanel('', preview.data_url);
         return;
       }
-      if (kind === 'other') { this.paintPanel('该类型暂不支持预览，可使用“打开所在目录”。'); return; }
+      if (kind === 'other' && await this.openWithPlugin(message, name)) { return; }
+      if (kind === 'other') { this.paintPanel('该类型暂不支持预览，也未安装对应插件；可使用“打开所在目录”。'); return; }
       const preview = await invoke<TextPreview | null>('v1_read_text_attachment', { messageId: message.id });
       if (!preview) { this.paintPanel('文件过大、不是文本或无法读取，未能预览'); return; }
       this.paintPanel('', preview.text);
     } catch (error) {
       this.paintPanel(typeof error === 'string' ? error : '无法读取附件');
     } finally { this.panelBusy = false; }
+  }
+
+  /// Hands the file bytes to an installed read-only preview plugin, if one claims it.
+  private async openWithPlugin(message: DirectMessage, name: string): Promise<boolean> {
+    try {
+      const plugin = await invoke<{ plugin_id: string; html: string } | null>('v1_plugin_preview', { fileName: name });
+      if (!plugin) return false;
+      const data = await invoke<string>('v1_attachment_base64', { messageId: message.id });
+      this.panel = { id: message.id, name, kind: 'plugin' };
+      this.panelBytes = base64ToBytes(data);
+      this.paintPanel('', plugin.html);
+      return true;
+    } catch (error) {
+      this.paintPanel(typeof error === 'string' ? error : '插件预览失败');
+      return true;
+    }
   }
 
   get panelId(): string { return this.panel?.id ?? ''; }
@@ -242,6 +261,13 @@ export class DirectChat {
     body.replaceChildren();
     if (!content) {
       const note = document.createElement('p'); note.className = 'panel-note'; note.textContent = message;
+      body.append(note);
+      return;
+    }
+    if (this.panel.kind === 'plugin') {
+      body.append(createPluginFrame(content, this.panelBytes ?? new Uint8Array(), this.panel.name));
+      const note = document.createElement('p'); note.className = 'panel-note';
+      note.textContent = '插件在沙箱中运行，只能读取这个文件的字节；第一版为只读预览。';
       body.append(note);
       return;
     }
