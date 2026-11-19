@@ -1,5 +1,6 @@
 pub mod address;
 pub mod app_state;
+pub mod avatar;
 pub mod backup;
 mod auto_address;
 pub mod certificate;
@@ -34,6 +35,10 @@ pub fn run() {
             app_state::identity_fingerprint,
             app_state::v1_profile,
             app_state::v1_set_profile,
+            app_state::v1_avatar,
+            app_state::v1_set_avatar,
+            app_state::v1_clear_avatar,
+            app_state::v1_read_image_file,
             app_state::v1_set_contact_profile,
             app_state::v1_search_contacts,
             app_state::v1_list_contacts,

@@ -31,6 +31,9 @@ let selectedFingerprint = '';
 type Contact = { fingerprint: string; display_name: string; trust_state: string; remark: string | null; category: string | null };
 let contactQuery = '';
 let profileNotice = '';
+let avatarUrl: string | null = null;
+let avatarNotice = '';
+let avatarBusy = false;
 type Profile = { nickname: string; email: string };
 type Conversation = { id: string; last_body: string; last_logical: number; kind: string };
 type Group = { id: string; name: string; owner: string; member_count: number; hidden: boolean; is_owner: boolean; last_body: string; last_logical: number };
@@ -221,6 +224,14 @@ function profileView(): string {
   return `<section class="card settings-card">
     <span class="eyebrow">PROFILE / 我的资料</span><h2>个人资料</h2>
     <p>昵称和邮箱只保存在本机，不改变身份指纹；联系人看到的是对方各自保存的名称。</p>
+    <div class="avatar-row">
+      <div class="avatar-preview">${avatarMarkup()}</div>
+      <div class="avatar-actions">
+        <button class="outline" data-action="choose-avatar" ${avatarBusy ? 'disabled' : ''}>${avatarUrl ? '更换头像…' : '选择头像…'}</button>
+        <button class="outline" data-action="clear-avatar" ${avatarUrl && !avatarBusy ? '' : 'disabled'}>移除头像</button>
+        <small>自动居中裁剪为正方形，最长边 512 像素；头像只保存在本机，尚未随消息发送。</small>
+      </div>
+    </div>
     <label for="profile-nickname">昵称</label>
     <input id="profile-nickname" type="text" maxlength="64" autocomplete="off">
     <label for="profile-email">邮箱（可选）</label>
@@ -228,7 +239,7 @@ function profileView(): string {
     <div class="probe-row"><button class="outline" data-action="save-profile">保存资料</button></div>
     <p id="profile-notice" role="status">${profileNotice}</p>
     <p>本机身份指纹（SHA-256）：<br><code class="fingerprint">${fingerprint}</code></p>
-    <p><small>头像设置尚未实现。</small></p>
+    <p id="avatar-notice" role="status">${avatarNotice}</p>
   </section>`;
 }
 
@@ -253,6 +264,69 @@ async function saveProfile(): Promise<void> {
     profileNotice = '资料已保存在本机。';
   } catch (error) { profileNotice = typeof error === 'string' ? error : '无法保存资料'; }
   if (notice) notice.textContent = profileNotice;
+}
+
+function avatarMarkup(): string {
+  return avatarUrl ? `<img src="${avatarUrl}" alt="我的头像">` : '青';
+}
+
+/// Copies into a fresh ArrayBuffer so Blob accepts it under strict DOM typings.
+function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+  const buffer = new ArrayBuffer(bytes.byteLength);
+  new Uint8Array(buffer).set(bytes);
+  return buffer;
+}
+async function refreshAvatar(): Promise<void> {
+  if (!isTauri()) return;
+  try {
+    const bytes = await invoke<number[] | null>('v1_avatar');
+    setAvatarImage(bytes && bytes.length ? new Uint8Array(bytes) : null);
+  } catch { /* 保留占位字符，不阻塞界面 */ }
+}
+
+function setAvatarImage(bytes: Uint8Array | null): void {
+  if (avatarUrl) { URL.revokeObjectURL(avatarUrl); avatarUrl = null; }
+  avatarUrl = bytes && bytes.length ? URL.createObjectURL(new Blob([toArrayBuffer(bytes)], { type: 'image/png' })) : null;
+}
+
+/// Centre-crops any picked image into a square PNG so the saved avatar is bounded.
+async function cropSquare(source: Uint8Array, edge: number): Promise<Uint8Array> {
+  const bitmap = await createImageBitmap(new Blob([toArrayBuffer(source)]));
+  const side = Math.min(bitmap.width, bitmap.height);
+  const canvas = document.createElement('canvas');
+  canvas.width = edge; canvas.height = edge;
+  const context = canvas.getContext('2d');
+  if (!context) throw new Error('无法创建画布');
+  context.drawImage(bitmap, (bitmap.width - side) / 2, (bitmap.height - side) / 2, side, side, 0, 0, edge, edge);
+  const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, 'image/png'));
+  if (!blob) throw new Error('无法生成头像');
+  return new Uint8Array(await blob.arrayBuffer());
+}
+
+async function chooseAvatar(): Promise<void> {
+  if (!isTauri() || avatarBusy) return;
+  try {
+    const picked = await openFileDialog({ multiple: false, filters: [{ name: '图片', extensions: ['png', 'jpg', 'jpeg'] }] });
+    if (!picked || typeof picked !== 'string') return;
+    avatarBusy = true; avatarNotice = '正在裁剪头像…'; if (page === 'profile') render();
+    const source = new Uint8Array(await invoke<number[]>('v1_read_image_file', { path: picked }));
+    const cropped = await cropSquare(source, 512);
+    await invoke('v1_set_avatar', { bytes: Array.from(cropped) });
+    setAvatarImage(cropped);
+    avatarNotice = '头像已保存，仅本机可见。';
+  } catch (error) { avatarNotice = displayError(error); }
+  finally { avatarBusy = false; if (page === 'profile') render(); }
+}
+
+async function clearAvatar(): Promise<void> {
+  if (!isTauri() || avatarBusy) return;
+  avatarBusy = true;
+  try {
+    await invoke('v1_clear_avatar');
+    setAvatarImage(null);
+    avatarNotice = '头像已移除。';
+  } catch (error) { avatarNotice = displayError(error); }
+  finally { avatarBusy = false; if (page === 'profile') render(); }
 }
 
 function settingsView(): string {
@@ -550,7 +624,7 @@ function render(): void {
   app.innerHTML = `
     <div class="shell">
       <aside class="rail" aria-label="主导航">
-        <button class="profile" data-page="profile" aria-label="我的资料" title="我的资料">青</button>
+        <button class="profile" data-page="profile" aria-label="我的资料" title="我的资料">${avatarMarkup()}</button>
         <nav class="rail-nav" aria-label="主要功能">
           <button data-page="messages" class="${page === 'messages' ? 'active' : ''}" aria-label="消息" title="消息">${icon('messages')}</button>
           <button data-page="contacts" class="${page === 'contacts' ? 'active' : ''}" aria-label="联系人" title="联系人">${icon('contacts')}</button>
@@ -957,6 +1031,8 @@ app.addEventListener('click', (event) => {
   if (action?.dataset.action === 'backup-restore-merge') { void restoreBackup(false); return; }
   if (action?.dataset.action === 'backup-restore-overwrite') { void restoreBackup(true); return; }
   if (action?.dataset.action === 'save-profile') { void saveProfile(); return; }
+  if (action?.dataset.action === 'choose-avatar') { void chooseAvatar(); return; }
+  if (action?.dataset.action === 'clear-avatar') { void clearAvatar(); return; }
   if (action?.dataset.action === 'save-contact-profile' && action.dataset.peer) { void saveContactProfile(action.dataset.peer); return; }
   if (action?.dataset.action === 'save-direct-address') { void direct.saveAddress(); return; }
   if (action?.dataset.action === 'group-send') { void groupChat.send(); return; }
@@ -1009,6 +1085,7 @@ app.addEventListener('click', (event) => {
 });
 render();
 void initLock();
+void refreshAvatar().then(() => { if (!lockState.locked) render(); });
 for (const type of ['pointerdown', 'keydown', 'wheel', 'mousemove'] as const) {
   window.addEventListener(type, () => { lastActivity = Date.now(); }, { passive: true });
 }

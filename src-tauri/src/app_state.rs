@@ -1,4 +1,4 @@
-use std::{fs, io, path::Path, sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}}};
+use std::{fs, io, path::{Path, PathBuf}, sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}}};
 use tauri::Manager;
 use crate::{discovery::Discovery, identity::Identity, probe_service::{ProbeRequest, ProbeService}, storage::Store};
 
@@ -15,6 +15,8 @@ pub struct AppState {
     last_outbound_fingerprint: Arc<Mutex<Option<String>>>,
     /// Application lock state; set at startup when a lock password exists.
     locked: AtomicBool,
+    /// Data directory for local-only assets such as the profile avatar.
+    data_dir: Arc<PathBuf>,
 }
 
 #[tauri::command]
@@ -351,7 +353,7 @@ impl AppState {
         let store = Store::open(&database_path)?;
         // A configured lock always starts locked, even after a crash.
         let locked = crate::lock::is_configured(&store).unwrap_or(false);
-        Ok(Self { identity, store: Arc::new(Mutex::new(store)), discovery: Mutex::new(None), probe_service: Mutex::new(None), retry_queue: Mutex::new(None), outbound_probe: Arc::new(AtomicBool::new(false)), outbound_chat: Arc::new(AtomicBool::new(false)), last_outbound_fingerprint: Arc::new(Mutex::new(None)), locked: AtomicBool::new(locked) })
+        Ok(Self { identity, store: Arc::new(Mutex::new(store)), discovery: Mutex::new(None), probe_service: Mutex::new(None), retry_queue: Mutex::new(None), outbound_probe: Arc::new(AtomicBool::new(false)), outbound_chat: Arc::new(AtomicBool::new(false)), last_outbound_fingerprint: Arc::new(Mutex::new(None)), locked: AtomicBool::new(locked), data_dir: Arc::new(dir.to_path_buf()) })
     }
 }
 
@@ -373,6 +375,30 @@ pub fn v1_set_profile(state: tauri::State<'_, AppState>, nickname: String, email
         return Err("昵称不超过 64 字符；邮箱需包含一个 @ 或留空".into());
     }
     store.get_profile().map_err(|_| "无法读取个人资料".to_owned())
+}
+
+/// Returns the local avatar as raw PNG bytes, or `null` when none is saved.
+#[tauri::command]
+pub fn v1_avatar(state: tauri::State<'_, AppState>) -> Result<Option<Vec<u8>>, String> {
+    crate::avatar::load(&state.data_dir)
+}
+
+/// Replaces the avatar with a cropped square PNG produced by the front end.
+#[tauri::command]
+pub fn v1_set_avatar(state: tauri::State<'_, AppState>, bytes: Vec<u8>) -> Result<(), String> {
+    crate::avatar::save(&state.data_dir, &bytes)
+}
+
+#[tauri::command]
+pub fn v1_clear_avatar(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    crate::avatar::remove(&state.data_dir)
+}
+
+/// Reads a user-picked image for cropping; only PNG/JPEG and at most 8 MiB.
+/// The path comes from the system file picker, so no extra permission is granted.
+#[tauri::command]
+pub fn v1_read_image_file(path: String) -> Result<Vec<u8>, String> {
+    crate::avatar::read_source(Path::new(&path))
 }
 
 #[tauri::command]
