@@ -1273,7 +1273,7 @@ function render(): void {
         <button class="rail-bottom" data-action="lock-now" aria-label="临时离开锁定" title="临时离开锁定">${icon('lock')}</button>
         <button class="rail-bottom" data-action="menu" aria-label="更多" aria-expanded="${menuOpen}" title="更多">${icon('menu')}</button>
       </aside>
-      ${menuOpen ? '<div class="menu" role="menu"><button data-page="settings" role="menuitem">设置</button><button data-page="about" role="menuitem">关于</button><span>备份与还原 · 待实现</span></div>' : ''}
+      ${menuOpen ? '<div class="menu" role="menu"><button data-page="settings" role="menuitem">设置</button><button data-page="settings" data-settings-tab="privacy" role="menuitem">备份与聊天记录</button><button data-page="about" role="menuitem">关于</button></div>' : ''}
       <aside class="sidebar">
         <div class="team"><span class="team-mark">${teamLogoUrl ? `<img class="team-logo" src="${teamLogoUrl}" alt="团队 Logo">` : icon('spark')}</span><div><strong>${team.name ? escapeText(team.name) : 'Qbird 青鸟'}</strong><small>LOCAL NETWORK MESSENGER</small></div></div>
         <div class="side-heading"><div><span class="eyebrow">${current.eyebrow}</span><h1>${current.title}</h1></div></div>
