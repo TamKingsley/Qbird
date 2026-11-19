@@ -120,6 +120,67 @@ pub fn v1_read_attachment(state: tauri::State<'_, AppState>, message_id: String)
 }
 
 #[derive(serde::Serialize)]
+pub struct TextPreview {
+    pub name: String,
+    pub kind: String,
+    pub text: String,
+}
+
+/// Bounded text preview for TXT / Markdown / HTML attachments. Images use the
+/// data-URL command; other types return `None` so the UI can say preview is unsupported.
+#[tauri::command]
+pub fn v1_read_text_attachment(state: tauri::State<'_, AppState>, message_id: String) -> Result<Option<TextPreview>, String> {
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    let Some((name, path)) = store.attachment_path(&message_id).map_err(|_| "无法读取附件".to_owned())? else { return Ok(None); };
+    let kind = crate::files::preview_kind(&name);
+    if !matches!(kind, "text" | "markdown" | "html") { return Ok(None); }
+    let Some(text) = crate::files::read_text_preview(&path).map_err(|_| "无法读取附件".to_owned())? else { return Ok(None); };
+    Ok(Some(TextPreview { name, kind: kind.to_owned(), text }))
+}
+
+/// Opens the system file manager with the received/sent attachment selected.
+/// The path always comes from the local database, never from UI input.
+#[tauri::command]
+pub fn v1_reveal_attachment(state: tauri::State<'_, AppState>, message_id: String) -> Result<(), String> {
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    let Some((_, path)) = store.attachment_path(&message_id).map_err(|_| "无法读取附件".to_owned())? else {
+        return Err("附件尚未完成传输或已被移动".into());
+    };
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer")
+            .arg(format!("/select,{}", path.to_string_lossy()))
+            .spawn()
+            .map_err(|_| "无法打开文件所在目录".to_owned())?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open").arg("-R").arg(&path).spawn().map_err(|_| "无法打开文件所在目录".to_owned())?;
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let parent = path.parent().ok_or_else(|| "无法打开文件所在目录".to_owned())?;
+        std::process::Command::new("xdg-open").arg(parent).spawn().map_err(|_| "无法打开文件所在目录".to_owned())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn v1_storage_usage(state: tauri::State<'_, AppState>) -> Result<crate::storage::StorageUsage, String> {
+    state.store.lock().map_err(|_| "本地存储不可用".to_owned())?
+        .storage_status().map_err(|_| "无法读取存储占用".to_owned())
+}
+
+#[tauri::command]
+pub fn v1_set_storage_quota(state: tauri::State<'_, AppState>, bytes: u64) -> Result<crate::storage::StorageUsage, String> {
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    if !store.set_storage_quota(bytes).map_err(|_| "无法保存存储配额".to_owned())? {
+        return Err(format!("配额需在 {} MiB 到 {} GiB 之间", crate::storage::MIN_STORAGE_QUOTA / (1024 * 1024), crate::storage::MAX_STORAGE_QUOTA / (1024 * 1024 * 1024)));
+    }
+    store.storage_status().map_err(|_| "无法读取存储占用".to_owned())
+}
+
+#[derive(serde::Serialize)]
 pub struct ProbeStatus {
     pub running: bool,
     pub port: Option<u16>,

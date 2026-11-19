@@ -3,7 +3,18 @@ use std::path::{Path, PathBuf};
 use rusqlite::{params, Connection, OptionalExtension, Result};
 use serde::Serialize;
 
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
+
+/// Default cap for locally received attachments; the user may change it in settings.
+pub const DEFAULT_STORAGE_QUOTA: u64 = 2 * 1024 * 1024 * 1024;
+pub const MIN_STORAGE_QUOTA: u64 = 256 * 1024 * 1024;
+pub const MAX_STORAGE_QUOTA: u64 = 64 * 1024 * 1024 * 1024;
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct StorageUsage {
+    pub used: u64,
+    pub quota: u64,
+}
 
 /// Upper bound for a quoted snippet, kept short so it fits one compose bar.
 pub const REPLY_PREVIEW_MAX: usize = 160;
@@ -81,6 +92,8 @@ pub enum FileOfferDecision {
     Complete,
     Conflict,
     Untrusted,
+    /// Accepting the file would exceed the local storage quota.
+    NoSpace,
 }
 
 const MESSAGE_COLUMNS: &str = "m.id, m.peer, m.sender, m.body, m.created_at, m.logical, m.status, m.kind, m.file_name, m.file_size, m.file_sha256, f.status, f.transferred, f.error";
@@ -433,6 +446,18 @@ impl Store {
             )?;
             transaction.commit()?;
         }
+        if version < 8 {
+            let transaction = connection.transaction()?;
+            // Small key/value settings table; missing values fall back to code defaults.
+            transaction.execute_batch(
+                "CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY NOT NULL CHECK(length(key) <= 64),
+                    value TEXT NOT NULL CHECK(length(value) <= 4096)
+                );
+                PRAGMA user_version = 8;",
+            )?;
+            transaction.commit()?;
+        }
         Ok(Self { connection, data_dir, address_revision: std::cell::Cell::new(0) })
     }
 
@@ -701,6 +726,32 @@ impl Store {
 
     fn incoming_dir(&self) -> PathBuf { self.attachments_dir().join("in") }
 
+    /// Bytes currently held by received attachments, including partial downloads.
+    pub fn storage_used(&self) -> u64 { directory_usage(&self.attachments_dir()) }
+
+    pub fn storage_quota(&self) -> Result<u64> {
+        let stored: Option<String> = self.connection.query_row(
+            "SELECT value FROM settings WHERE key = 'storage_quota_bytes'", [], |row| row.get(0),
+        ).optional()?;
+        Ok(stored.and_then(|value| value.parse::<u64>().ok())
+            .filter(|bytes| (MIN_STORAGE_QUOTA..=MAX_STORAGE_QUOTA).contains(bytes))
+            .unwrap_or(DEFAULT_STORAGE_QUOTA))
+    }
+
+    pub fn set_storage_quota(&self, bytes: u64) -> Result<bool> {
+        if !(MIN_STORAGE_QUOTA..=MAX_STORAGE_QUOTA).contains(&bytes) { return Ok(false); }
+        self.connection.execute(
+            "INSERT INTO settings(key, value) VALUES ('storage_quota_bytes', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [bytes.to_string()],
+        )?;
+        Ok(true)
+    }
+
+    pub fn storage_status(&self) -> Result<StorageUsage> {
+        Ok(StorageUsage { used: self.storage_used(), quota: self.storage_quota()? })
+    }
+
     /// Queue an outgoing file. The file stays at `source`; the receiver verifies the hash.
     pub fn queue_direct_file(&self, sender: &str, peer: &str, name: &str, size: u64, sha256: &str, source: &Path, created_at: i64) -> Result<DirectMessage> {
         let clean = crate::files::sanitize_name(name).ok_or(rusqlite::Error::InvalidQuery)?;
@@ -781,6 +832,9 @@ impl Store {
         }
         let collision: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM messages WHERE id = ?1 UNION ALL SELECT 1 FROM local_messages WHERE id = ?1)", [id], |r| r.get(0))?;
         if collision { return Ok(FileOfferDecision::Conflict); }
+        if self.storage_used().saturating_add(size) > self.storage_quota()? {
+            return Ok(FileOfferDecision::NoSpace);
+        }
         if tx.execute("UPDATE logical_clock SET value = max(value, ?1) + 1 WHERE singleton = 1 AND value < 9223372036854775807", [logical])? != 1 {
             return Err(rusqlite::Error::InvalidQuery);
         }
@@ -1691,6 +1745,26 @@ impl Store {
     }
 }
 
+/// Sum of regular file sizes below `dir`; unreadable entries are ignored and the
+/// walk is depth-bounded so a hostile directory cannot stall the UI thread.
+fn directory_usage(dir: &Path) -> u64 {
+    fn walk(dir: &Path, depth: u8) -> u64 {
+        if depth > 8 { return 0; }
+        let Ok(entries) = std::fs::read_dir(dir) else { return 0; };
+        let mut total = 0u64;
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else { continue; };
+            if kind.is_file() {
+                total = total.saturating_add(entry.metadata().map(|meta| meta.len()).unwrap_or(0));
+            } else if kind.is_dir() {
+                total = total.saturating_add(walk(&entry.path(), depth + 1));
+            }
+        }
+        total
+    }
+    walk(dir, 0)
+}
+
 fn group_message_row(row: &rusqlite::Row<'_>) -> Result<GroupMessage> {
     Ok(GroupMessage {
         id: row.get(0)?, group_id: row.get(1)?, sender: row.get(2)?, sender_name: row.get(3)?,
@@ -2541,6 +2615,34 @@ mod tests {
         assert_eq!(store.search_group_messages(&group_id, "", "all", None, 50, 0).unwrap().len(), 2);
         assert!(store.search_group_messages(&group_id, "", "file", None, 50, 0).unwrap().is_empty());
         crate::files::remove_quietly(&path);
+    }
+    #[test]
+    fn storage_quota_defaults_bounds_and_blocks_oversized_offers() {
+        let store = memory_store();
+        assert_eq!(store.storage_status().unwrap(), StorageUsage { used: 0, quota: DEFAULT_STORAGE_QUOTA });
+        assert!(store.storage_quota().unwrap() >= MIN_STORAGE_QUOTA);
+        assert!(!store.set_storage_quota(MIN_STORAGE_QUOTA - 1).unwrap());
+        assert!(!store.set_storage_quota(MAX_STORAGE_QUOTA + 1).unwrap());
+        assert!(store.set_storage_quota(MIN_STORAGE_QUOTA).unwrap());
+        assert_eq!(store.storage_quota().unwrap(), MIN_STORAGE_QUOTA);
+
+        let me = "a".repeat(64);
+        let peer = "b".repeat(64);
+        store.add_candidate(&peer, "Bob").unwrap();
+        store.confirm_candidate(&peer).unwrap();
+        let hash = "c".repeat(64);
+        // An offer larger than the remaining quota is refused before anything is written.
+        assert_eq!(store.receive_file_offer(&peer, "f1", "a.bin", MIN_STORAGE_QUOTA + 1, &hash, 1, 1, 1).unwrap(), FileOfferDecision::NoSpace);
+        let fits = store.receive_file_offer(&peer, "f2", "a.bin", 4096, &hash, 2, 2, 2).unwrap();
+        assert!(matches!(fits, FileOfferDecision::Ready { offset: 0, .. }));
+        assert_eq!(store.storage_status().unwrap().quota, MIN_STORAGE_QUOTA);
+        // Usage counts partial files written under the attachments directory.
+        let incoming = store.attachments_dir().join("in");
+        std::fs::create_dir_all(&incoming).unwrap();
+        std::fs::write(incoming.join("sample.part"), b"12345").unwrap();
+        assert!(store.storage_used() >= 5);
+        let _ = std::fs::remove_dir_all(store.attachments_dir());
+        let _ = me;
     }
 }
 

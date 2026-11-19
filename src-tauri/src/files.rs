@@ -5,6 +5,34 @@ use sha2::{Digest, Sha256};
 
 pub use crate::protocol::MAX_FILE_BYTES;
 pub const MAX_PREVIEW_BYTES: u64 = 8 * 1024 * 1024;
+pub const MAX_TEXT_PREVIEW_BYTES: u64 = 256 * 1024;
+
+/// Preview class decided from the local name only; never from peer-supplied MIME.
+pub fn preview_kind(name: &str) -> &'static str {
+    let extension = Path::new(name).extension().and_then(|ext| ext.to_str()).map(|ext| ext.to_ascii_lowercase());
+    match extension.as_deref() {
+        Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp") => "image",
+        Some("html" | "htm") => "html",
+        Some("md" | "markdown") => "markdown",
+        Some("txt" | "log" | "csv" | "json" | "xml" | "ini" | "toml" | "yaml" | "yml") => "text",
+        _ => "other",
+    }
+}
+
+/// Read a bounded UTF-8 text preview; binary or oversized files are refused rather
+/// than truncated silently, so the UI can explain why there is no preview.
+pub fn read_text_preview(path: &Path) -> io::Result<Option<String>> {
+    let size = file_size(path)?;
+    if size == 0 || size > MAX_TEXT_PREVIEW_BYTES {
+        return Ok(None);
+    }
+    let data = fs::read(path)?;
+    if data.iter().take(8192).any(|byte| *byte == 0) {
+        return Ok(None);
+    }
+    let text = String::from_utf8_lossy(&data);
+    Ok(Some(text.strip_prefix('\u{feff}').unwrap_or(&text).to_owned()))
+}
 
 const RESERVED: [&str; 1] = ["."];
 
@@ -113,6 +141,34 @@ mod tests {
         assert_eq!(sanitize_name("a\u{0000}b"), None);
         assert_eq!(sanitize_name(&"x".repeat(201)), None);
         assert!(is_image("photo.JPG") && is_image("a.png") && !is_image("a.pdf"));
+    }
+
+    #[test]
+    fn preview_kind_is_decided_by_local_extension() {
+        assert_eq!(preview_kind("a.PNG"), "image");
+        assert_eq!(preview_kind("a.html"), "html");
+        assert_eq!(preview_kind("a.md"), "markdown");
+        assert_eq!(preview_kind("报告.TXT"), "text");
+        assert_eq!(preview_kind("a.exe"), "other");
+        assert_eq!(preview_kind("noext"), "other");
+    }
+
+    #[test]
+    fn text_preview_is_bounded_and_rejects_binary() {
+        let dir = std::env::temp_dir();
+        let base = format!("qbird-preview-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        let text = dir.join(format!("{base}.md"));
+        fs::write(&text, "# 标题\n正文").unwrap();
+        assert_eq!(read_text_preview(&text).unwrap().as_deref(), Some("# 标题\n正文"));
+        let binary = dir.join(format!("{base}.bin"));
+        fs::write(&binary, [0u8, 1, 2, 3]).unwrap();
+        assert_eq!(read_text_preview(&binary).unwrap(), None);
+        let large = dir.join(format!("{base}-large.txt"));
+        fs::write(&large, vec![b'a'; (MAX_TEXT_PREVIEW_BYTES + 1) as usize]).unwrap();
+        assert_eq!(read_text_preview(&large).unwrap(), None);
+        remove_quietly(&text);
+        remove_quietly(&binary);
+        remove_quietly(&large);
     }
 
     #[test]

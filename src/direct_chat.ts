@@ -8,6 +8,8 @@ type DirectMessage = {
   file_name: string | null; file_size: number | null; file_sha256: string | null;
   file_status: 'pending' | 'transferring' | 'completed' | 'failed' | null; file_transferred: number | null; file_error: string | null;
 };
+type TextPreview = { name: string; kind: string; text: string };
+type Panel = { id: string; name: string; kind: string };
 type Cursor = Pick<DirectMessage, 'logical' | 'sender' | 'id'>;
 const cursorOf = (message: DirectMessage): Cursor => ({ logical: message.logical, sender: message.sender, id: message.id });
 const compare = (a: Cursor, b: Cursor): number => a.logical - b.logical || (a.sender < b.sender ? -1 : a.sender > b.sender ? 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
@@ -29,19 +31,30 @@ export class DirectChat {
   private previews = new Map<string, string>();
   private previewPending = new Set<string>();
   private poll: number | null = null;
+  private panel: Panel | null = null;
+  private panelWidth = 380;
+  private panelBusy = false;
 
-  constructor(private root: HTMLElement, private onChange: () => void) {}
+  constructor(private root: HTMLElement, private onChange: () => void) {
+    // The resizer is re-created on every render, so a single delegated listener is enough.
+    root.addEventListener('pointerdown', (event) => this.startResize(event));
+  }
 
   view(): string {
     return `<section class="self-chat" aria-label="单聊">
       <header class="chat-header"><div><strong id="direct-name"></strong><small>端到端加密 · 指纹已确认</small></div><button class="outline" data-action="hide-direct">不显示此会话</button></header>
       <div class="chat-history" id="direct-history" aria-label="单聊记录"><div class="direct-address"><label for="direct-address">联系人地址（仅连接提示）</label><div class="probe-row"><input id="direct-address" type="text" placeholder="192.168.1.8:42853"><button class="outline" data-action="save-direct-address">保存地址</button></div><small>地址不代表身份，连接时仍核对指纹。请在发现页面启动聊天服务；离线消息与文件须双方同时在线才能补发或续传。</small><p id="direct-address-status" role="status"></p></div><button class="load-older" data-action="direct-older" hidden>加载更早消息</button><div id="direct-messages"></div></div>
       <div class="chat-compose"><label for="direct-input">消息</label><textarea id="direct-input" rows="3" maxlength="32768" placeholder="写点什么，或把文件/图片拖进窗口…"></textarea><div class="compose-footer"><span>Enter 发送 · Shift+Enter 换行</span><div class="compose-actions"><button class="outline" data-action="direct-image">发送图片</button><button class="outline" data-action="direct-file">发送文件</button><button data-action="direct-send">发送</button></div></div><p id="direct-file-status" role="status"></p><p id="direct-error" role="status"></p></div>
+      <aside class="file-panel" id="direct-panel" hidden aria-label="文件预览">
+        <div class="panel-resizer" data-role="panel-resizer" aria-hidden="true"></div>
+        <header class="panel-header"><strong id="panel-title"></strong><div class="panel-actions"><button class="outline" data-action="panel-reveal">打开所在目录</button><button class="outline" data-action="panel-close">关闭</button></div></header>
+        <div class="panel-body" id="panel-body"></div>
+      </aside>
       <div class="lightbox" id="direct-lightbox" hidden></div>
     </section>`;
   }
 
-  clear(): void { this.peer = ''; this.generation++; this.stopPolling(); }
+  clear(): void { this.peer = ''; this.generation++; this.stopPolling(); this.closePanel(); }
 
   draft(value: string): void { if (this.peer) this.drafts.set(this.peer, value); }
   addressDraft(value: string): void { if (this.peer) this.addressDrafts.set(this.peer, value); }
@@ -129,6 +142,107 @@ export class DirectChat {
     } catch (error) {
       if (generation === this.generation) this.status('#direct-file-status', typeof error === 'string' ? error : '无法加入文件');
     }
+  }
+
+  /// Show one completed attachment in the right workspace panel. Images reuse the
+  /// cached data URL; text-like files are fetched with a bounded backend read.
+  async openPreview(message: DirectMessage): Promise<void> {
+    if (!isTauri() || message.kind !== 'file' || message.file_status !== 'completed') return;
+    const name = message.file_name ?? message.body;
+    const kind = previewKind(name);
+    this.panel = { id: message.id, name, kind };
+    this.panelBusy = true;
+    this.paintPanel('正在读取…');
+    try {
+      if (kind === 'image') {
+        const preview = await invoke<{ name: string; data_url: string } | null>('v1_read_attachment', { messageId: message.id });
+        if (!preview) { this.paintPanel('图片过大或无法读取，未能预览'); return; }
+        this.previews.set(message.id, preview.data_url);
+        this.paintPanel('', preview.data_url);
+        return;
+      }
+      if (kind === 'other') { this.paintPanel('该类型暂不支持预览，可使用“打开所在目录”。'); return; }
+      const preview = await invoke<TextPreview | null>('v1_read_text_attachment', { messageId: message.id });
+      if (!preview) { this.paintPanel('文件过大、不是文本或无法读取，未能预览'); return; }
+      this.paintPanel('', preview.text);
+    } catch (error) {
+      this.paintPanel(typeof error === 'string' ? error : '无法读取附件');
+    } finally { this.panelBusy = false; }
+  }
+
+  get panelId(): string { return this.panel?.id ?? ''; }
+
+  openPreviewById(id: string): void {
+    const message = this.messages.find(item => item.id === id);
+    if (message) void this.openPreview(message);
+  }
+
+  closePanel(): void { this.panel = null; const panel = this.root.querySelector<HTMLElement>('#direct-panel'); if (panel) panel.hidden = true; }
+
+  async reveal(messageId: string): Promise<void> {
+    if (!isTauri()) return;
+    try { await invoke('v1_reveal_attachment', { messageId }); }
+    catch (error) { this.status('#direct-file-status', typeof error === 'string' ? error : '无法打开文件所在目录'); }
+  }
+
+  private paintPanel(message: string, content?: string): void {
+    const panel = this.root.querySelector<HTMLElement>('#direct-panel');
+    const title = this.root.querySelector<HTMLElement>('#panel-title');
+    const body = this.root.querySelector<HTMLElement>('#panel-body');
+    if (!panel || !title || !body) return;
+    if (!this.panel) { panel.hidden = true; return; }
+    panel.hidden = false;
+    panel.style.width = `${this.panelWidth}px`;
+    title.textContent = this.panel.name;
+    body.replaceChildren();
+    if (!content) {
+      const note = document.createElement('p'); note.className = 'panel-note'; note.textContent = message;
+      body.append(note);
+      return;
+    }
+    if (this.panel.kind === 'image') {
+      const image = document.createElement('img'); image.src = content; image.alt = this.panel.name;
+      body.append(image);
+      return;
+    }
+    if (this.panel.kind === 'markdown') {
+      const article = document.createElement('article'); article.className = 'markdown-body';
+      article.innerHTML = markdownToHtml(content);
+      body.append(article);
+      return;
+    }
+    if (this.panel.kind === 'html') {
+      const frame = document.createElement('iframe');
+      frame.className = 'html-preview';
+      frame.setAttribute('sandbox', '');
+      frame.setAttribute('referrerpolicy', 'no-referrer');
+      frame.srcdoc = content;
+      body.append(frame);
+      const note = document.createElement('p'); note.className = 'panel-note';
+      note.textContent = 'HTML 在禁用脚本的沙箱中预览；页面样式可能受应用安全策略限制。';
+      body.append(note);
+      return;
+    }
+    const pre = document.createElement('pre'); pre.className = 'text-preview'; pre.textContent = content;
+    body.append(pre);
+  }
+
+  private startResize(event: PointerEvent): void {
+    const target = event.target;
+    if (!(target instanceof HTMLElement) || target.dataset.role !== 'panel-resizer') return;
+    event.preventDefault();
+    const startX = event.clientX, startWidth = this.panelWidth;
+    const move = (moveEvent: PointerEvent) => {
+      this.panelWidth = Math.min(window.innerWidth * 0.7, Math.max(280, startWidth + (startX - moveEvent.clientX)));
+      const panel = this.root.querySelector<HTMLElement>('#direct-panel');
+      if (panel) panel.style.width = `${this.panelWidth}px`;
+    };
+    const stop = () => {
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', stop);
+    };
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', stop);
   }
 
   private onChangeConversations(): void { this.root.dispatchEvent(new CustomEvent('conversations-changed')); }
@@ -263,6 +377,17 @@ export class DirectChat {
         bubble.append(preview);
         const meta = document.createElement('small'); meta.className = 'file-meta'; meta.textContent = fileMeta(message, incoming);
         bubble.append(meta);
+        if (message.file_status === 'completed') {
+          const actions = document.createElement('div'); actions.className = 'file-actions';
+          const preview = document.createElement('button');
+          preview.className = 'linkish'; preview.textContent = '预览';
+          preview.dataset.action = 'direct-preview'; preview.dataset.id = message.id;
+          const reveal = document.createElement('button');
+          reveal.className = 'linkish'; reveal.textContent = '打开所在目录';
+          reveal.dataset.action = 'direct-reveal'; reveal.dataset.id = message.id;
+          actions.append(preview, reveal);
+          bubble.append(actions);
+        }
         column.append(bubble);
         this.ensurePreview(message);
       } else {
@@ -294,6 +419,59 @@ export class DirectChat {
     if (address) address.value = this.addressDrafts.get(this.peer) ?? this.address;
     this.paint('bottom');
   }
+}
+
+function previewKind(name: string): 'image' | 'html' | 'markdown' | 'text' | 'other' {
+  const extension = name.slice(name.lastIndexOf('.') + 1).toLowerCase();
+  if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp'].includes(extension)) return 'image';
+  if (['html', 'htm'].includes(extension)) return 'html';
+  if (['md', 'markdown'].includes(extension)) return 'markdown';
+  if (['txt', 'log', 'csv', 'json', 'xml', 'ini', 'toml', 'yaml', 'yml'].includes(extension)) return 'text';
+  return 'other';
+}
+
+function escapeHtml(value: string): string {
+  return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+/// Deliberately small Markdown renderer: only the structures a chat attachment needs.
+/// Everything is escaped first, so file content cannot inject markup or scripts.
+function markdownToHtml(source: string): string {
+  const inline = (text: string): string => escapeHtml(text)
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/(^|[^*])\*([^*]+)\*/g, '$1<em>$2</em>')
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '$1（$2）');
+  const lines = source.split(/\r?\n/);
+  const html: string[] = [];
+  let code: string[] | null = null;
+  let list: 'ul' | 'ol' | null = null;
+  const closeList = () => { if (list) { html.push(`</${list}>`); list = null; } };
+  for (const line of lines) {
+    if (line.trimStart().startsWith('```')) {
+      if (code) { html.push(`<pre><code>${escapeHtml(code.join('\n'))}</code></pre>`); code = null; }
+      else code = [];
+      continue;
+    }
+    if (code) { code.push(line); continue; }
+    const heading = /^(#{1,6})\s+(.*)$/.exec(line);
+    if (heading) { closeList(); html.push(`<h${heading[1].length}>${inline(heading[2])}</h${heading[1].length}>`); continue; }
+    if (/^\s*[-*]\s+/.test(line)) {
+      if (list !== 'ul') { closeList(); html.push('<ul>'); list = 'ul'; }
+      html.push(`<li>${inline(line.replace(/^\s*[-*]\s+/, ''))}</li>`); continue;
+    }
+    if (/^\s*\d+\.\s+/.test(line)) {
+      if (list !== 'ol') { closeList(); html.push('<ol>'); list = 'ol'; }
+      html.push(`<li>${inline(line.replace(/^\s*\d+\.\s+/, ''))}</li>`); continue;
+    }
+    closeList();
+    if (!line.trim()) continue;
+    if (line.trimStart().startsWith('>')) { html.push(`<blockquote>${inline(line.replace(/^\s*>\s?/, ''))}</blockquote>`); continue; }
+    html.push(`<p>${inline(line)}</p>`);
+  }
+  closeList();
+  if (code) html.push(`<pre><code>${escapeHtml(code.join('\n'))}</code></pre>`);
+  return html.join('');
 }
 
 function formatSize(bytes: number | null): string {

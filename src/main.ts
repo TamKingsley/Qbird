@@ -37,6 +37,10 @@ let selfMessages: LocalMessage[] = [];
 let selfHasOlder = false;
 let selfBusy = false;
 let selfDraft = '';
+type StorageUsage = { used: number; quota: number };
+let storageInfo: StorageUsage | null = null;
+let storageNotice = '';
+let storageBusy = false;
 const direct = new DirectChat(app, () => { groupChat.clear(); selfOpen = false; page = 'messages'; menuOpen = false; render(); });
 const groupChat = new GroupChat(app, () => { direct.clear(); selfOpen = false; page = 'messages'; menuOpen = false; render(); });
 
@@ -174,6 +178,66 @@ const pages: Record<Page, { title: string; eyebrow: string; heading: string; cop
   settings: { title: '设置', eyebrow: 'PREFERENCES', heading: '设置', copy: '网络、隐私、备份和应用锁功能将在后续阶段开放。' },
   about: { title: '设置', eyebrow: 'ABOUT', heading: 'Qbird 青鸟', copy: '本地优先的局域网聊天工具。' }
 };
+
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) return '未知';
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
+}
+
+function settingsView(): string {
+  const used = storageInfo ? formatBytes(storageInfo.used) : '读取中…';
+  const quota = storageInfo ? formatBytes(storageInfo.quota) : '读取中…';
+  const quotaMib = storageInfo ? Math.round(storageInfo.quota / (1024 * 1024)) : '';
+  return `<section class="card settings-card">
+    <span class="eyebrow">SETTINGS / 设置</span><h2>常规与网络</h2>
+    <p>消息列表、联系人、发现与聊天功能已开放；备份、应用锁和插件尚未接入。</p>
+    <div class="probe-box"><h3>存储配额</h3>
+      <p>已接收附件占用 <strong id="storage-used">${used}</strong>，上限 <strong id="storage-quota">${quota}</strong>。</p>
+      <label for="storage-quota-mib">配额上限（MiB，256–65536）</label>
+      <div class="probe-row"><input id="storage-quota-mib" type="number" min="256" max="65536" value="${quotaMib}" ${storageBusy ? 'disabled' : ''}><button class="outline" data-action="save-storage-quota" ${storageBusy ? 'disabled' : ''}>保存配额</button></div>
+      <p id="storage-notice" role="status">${storageNotice}</p>
+      <small>配额只限制本机接收的附件；未完成的分片也计入占用。超过上限的新文件会被拒绝，已保存的记录不受影响。</small>
+    </div>
+    <p>本机身份指纹（SHA-256）：<br><code class="fingerprint">${fingerprint}</code></p>
+    <button data-page="about" class="outline">关于 Qbird</button>
+  </section>`;
+}
+
+async function refreshStorage(): Promise<void> {
+  if (!isTauri()) return;
+  try {
+    const usage = await invoke<StorageUsage>('v1_storage_usage');
+    storageInfo = usage;
+    if (page === 'settings') {
+      const used = app.querySelector<HTMLElement>('#storage-used');
+      const quota = app.querySelector<HTMLElement>('#storage-quota');
+      const input = app.querySelector<HTMLInputElement>('#storage-quota-mib');
+      if (used) used.textContent = formatBytes(usage.used);
+      if (quota) quota.textContent = formatBytes(usage.quota);
+      if (input && document.activeElement !== input) input.value = String(Math.round(usage.quota / (1024 * 1024)));
+    }
+  } catch { if (page === 'settings') storageNotice = '无法读取存储占用'; }
+}
+
+async function saveQuota(): Promise<void> {
+  const input = app.querySelector<HTMLInputElement>('#storage-quota-mib');
+  const notice = app.querySelector<HTMLElement>('#storage-notice');
+  if (!isTauri() || !input || storageBusy) return;
+  const mib = Number(input.value);
+  if (!Number.isInteger(mib) || mib < 256 || mib > 65536) { if (notice) notice.textContent = '请输入 256–65536 之间的整数（MiB）'; return; }
+  storageBusy = true; if (notice) notice.textContent = '正在保存…';
+  try {
+    storageInfo = await invoke<StorageUsage>('v1_set_storage_quota', { bytes: mib * 1024 * 1024 });
+    storageNotice = '配额已保存；超过上限的新文件将被拒绝接收。';
+  } catch (error) { storageNotice = typeof error === 'string' ? error : '无法保存配额'; }
+  finally {
+    storageBusy = false;
+    if (page === 'settings') { render(); }
+  }
+}
 
 function discoveryView(): string {
   return `<section class="discovery-panel card">
@@ -323,10 +387,11 @@ function render(): void {
         <div class="side-foot"><span class="dot"></span>开发中 · 本地桌面版</div>
       </aside>
       <main class="workspace">
-        ${page === 'messages' && groupChat.groupId ? groupChat.view() : page === 'messages' && direct.peer ? direct.view() : page === 'messages' && selfOpen ? selfChatView() : page === 'discover' ? discoveryView() : page === 'contacts' ? `<section class="discovery-panel card"><h2>联系人</h2><button class="self-contact" data-action="open-self" ${isTauri() ? '' : 'disabled'}><strong>自己</strong><span>打开本地自聊</span></button><p>已确认的联系人保存在本机；双方须各自核对指纹后才能聊天。</p><p id="contacts-status" aria-live="polite"></p><ul id="contacts-list" class="discovery-results"></ul><div class="probe-box"><h3>我的群聊</h3><ul id="groups-list" class="discovery-results"></ul><label for="group-name">新建群聊名称</label><input id="group-name" type="text" maxlength="128" placeholder="例如：项目组"><div id="group-members-pick" class="group-pick"></div><button class="outline" data-action="create-group">创建群聊</button><p id="group-create-status" aria-live="polite"></p><small>只能邀请已确认的联系人；新成员只能看到加入之后的消息。</small></div></section>` : page === 'about' ? `<section class="card about"><span class="eyebrow">ABOUT / 关于</span><h2>Qbird 青鸟</h2><p>面向局域网的本地优先聊天与文件交流工具。</p><dl><div><dt>当前阶段</dt><dd>Windows 开发版 ${appVersion}</dd></div><div><dt>许可证</dt><dd>Apache License 2.0</dd></div><div><dt>平台规划</dt><dd>Windows 首发 · 后续 Linux / macOS</dd></div></dl><p class="notice">开发版未经安全审计，本地数据库未加密。</p></section>` : `<section class="empty"><div class="empty-mark">${icon(page === 'settings' ? 'settings' : 'spark')}</div><h2>${current.heading}</h2><p>${current.copy}</p>${page === 'settings' ? `<p>本机身份指纹（SHA-256）：<br><code class="fingerprint">${fingerprint}</code></p><button data-page="about" class="outline">关于 Qbird</button>` : ''}</section>`}
+        ${page === 'messages' && groupChat.groupId ? groupChat.view() : page === 'messages' && direct.peer ? direct.view() : page === 'messages' && selfOpen ? selfChatView() : page === 'discover' ? discoveryView() : page === 'settings' ? settingsView() : page === 'contacts' ? `<section class="discovery-panel card"><h2>联系人</h2><button class="self-contact" data-action="open-self" ${isTauri() ? '' : 'disabled'}><strong>自己</strong><span>打开本地自聊</span></button><p>已确认的联系人保存在本机；双方须各自核对指纹后才能聊天。</p><p id="contacts-status" aria-live="polite"></p><ul id="contacts-list" class="discovery-results"></ul><div class="probe-box"><h3>我的群聊</h3><ul id="groups-list" class="discovery-results"></ul><label for="group-name">新建群聊名称</label><input id="group-name" type="text" maxlength="128" placeholder="例如：项目组"><div id="group-members-pick" class="group-pick"></div><button class="outline" data-action="create-group">创建群聊</button><p id="group-create-status" aria-live="polite"></p><small>只能邀请已确认的联系人；新成员只能看到加入之后的消息。</small></div></section>` : page === 'about' ? `<section class="card about"><span class="eyebrow">ABOUT / 关于</span><h2>Qbird 青鸟</h2><p>面向局域网的本地优先聊天与文件交流工具。</p><dl><div><dt>当前阶段</dt><dd>Windows 开发版 ${appVersion}</dd></div><div><dt>许可证</dt><dd>Apache License 2.0</dd></div><div><dt>平台规划</dt><dd>Windows 首发 · 后续 Linux / macOS</dd></div></dl><p class="notice">开发版未经安全审计，本地数据库未加密。</p></section>` : `<section class="empty"><div class="empty-mark">${icon('spark')}</div><h2>${current.heading}</h2><p>${current.copy}</p></section>`}
       </main>
     </div>`;
   if (page === 'discover') paintDiscovery();
+  if (page === 'settings') void refreshStorage();
   if (page === 'messages') {
     void refreshConversations();
     if (direct.peer) direct.render();
@@ -508,6 +573,11 @@ app.addEventListener('click', (event) => {
   if (action?.dataset.action === 'direct-image') { void direct.pick('image'); return; }
   if (action?.dataset.action === 'direct-file') { void direct.pick('file'); return; }
   if (action?.dataset.action === 'direct-older') { void direct.load(true); return; }
+  if (action?.dataset.action === 'direct-preview' && action.dataset.id) { direct.openPreviewById(action.dataset.id); return; }
+  if (action?.dataset.action === 'direct-reveal' && action.dataset.id) { void direct.reveal(action.dataset.id); return; }
+  if (action?.dataset.action === 'panel-reveal' && direct.panelId) { void direct.reveal(direct.panelId); return; }
+  if (action?.dataset.action === 'panel-close') { direct.closePanel(); return; }
+  if (action?.dataset.action === 'save-storage-quota') { void saveQuota(); return; }
   if (action?.dataset.action === 'save-direct-address') { void direct.saveAddress(); return; }
   if (action?.dataset.action === 'group-send') { void groupChat.send(); return; }
   if (action?.dataset.action === 'group-older') { void groupChat.load(true); return; }
@@ -544,6 +614,7 @@ app.addEventListener('click', (event) => {
     menuOpen = false;
     render();
     if (page === 'discover') { void refreshDiscovery(); void refreshProbeStatus(); }
+    if (page === 'settings') void refreshStorage();
     if (page === 'contacts') void refreshContacts();
   }
 });

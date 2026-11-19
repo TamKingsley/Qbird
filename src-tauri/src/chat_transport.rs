@@ -208,6 +208,7 @@ fn receive_file(stream: &mut StreamOwned<ServerConnection, DeadlineStream>, gate
     let (offset, target, partial) = match decision {
         FileOfferDecision::Untrusted => { let _ = reject(stream, gate, &id, "untrusted"); return Err(invalid("untrusted file offer").into()); }
         FileOfferDecision::Conflict => { let _ = reject(stream, gate, &id, "conflict"); return Err(invalid("file offer conflict").into()); }
+        FileOfferDecision::NoSpace => { let _ = reject(stream, gate, &id, "no_space"); return Err(invalid("storage quota reached").into()); }
         FileOfferDecision::Complete => {
             let dir = store.lock().map_err(|_| invalid("store unavailable"))?.attachments_dir();
             let target = files::incoming_target(&dir.join("in"), &id, &files::sanitize_name(&name).ok_or_else(|| invalid("invalid name"))?);
