@@ -413,6 +413,38 @@ pub fn v1_set_profile(state: tauri::State<'_, AppState>, nickname: String, email
 }
 
 #[derive(serde::Serialize)]
+pub struct FileAcceptMode {
+    pub confirm: bool,
+}
+
+#[tauri::command]
+pub fn v1_file_accept_mode(state: tauri::State<'_, AppState>) -> Result<FileAcceptMode, String> {
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    Ok(FileAcceptMode { confirm: store.file_accept_confirm().map_err(|_| "无法读取接收设置".to_owned())? })
+}
+
+#[tauri::command]
+pub fn v1_set_file_accept_mode(state: tauri::State<'_, AppState>, confirm: bool) -> Result<FileAcceptMode, String> {
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    store.set_file_accept_confirm(confirm).map_err(|_| "无法保存接收设置".to_owned())?;
+    Ok(FileAcceptMode { confirm })
+}
+
+#[tauri::command]
+pub fn v1_file_offer_requests(state: tauri::State<'_, AppState>, peer: String)
+    -> Result<Vec<crate::storage::FileOfferRequest>, String> {
+    state.store.lock().map_err(|_| "本地存储不可用".to_owned())?
+        .list_file_offer_requests(&peer).map_err(|_| "无法读取待确认文件".to_owned())
+}
+
+/// Accepting a deferred offer lets the sender's next retry proceed automatically.
+#[tauri::command]
+pub fn v1_resolve_file_offer(state: tauri::State<'_, AppState>, id: String, accept: bool) -> Result<bool, String> {
+    state.store.lock().map_err(|_| "本地存储不可用".to_owned())?
+        .resolve_file_offer(&id, accept).map_err(|_| "无法更新文件确认状态".to_owned())
+}
+
+#[derive(serde::Serialize)]
 pub struct ScreenCaptureResult {
     pub data_url: String,
     pub width: u32,

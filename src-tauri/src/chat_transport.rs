@@ -208,6 +208,21 @@ fn reject(stream: &mut StreamOwned<ServerConnection, DeadlineStream>, gate: &mut
 
 fn receive_file(stream: &mut StreamOwned<ServerConnection, DeadlineStream>, gate: &mut ReadyGate, store: &Mutex<Store>, peer: &str, offer: FileOffer) -> ChatResult<()> {
     let FileOffer { id, name, size, sha256, created_at, logical } = offer;
+    {
+        let store = store.lock().map_err(|_| invalid("store unavailable"))?;
+        if store.file_accept_confirm()? {
+            match store.file_offer_status(&id)?.as_deref() {
+                Some("accepted") => {}
+                Some("rejected") => { drop(store); let _ = reject(stream, gate, &id, "declined"); return Err(invalid("declined").into()); }
+                _ => {
+                    store.record_file_offer_request(peer, &id, &name, size, created_at)?;
+                    drop(store);
+                    let _ = reject(stream, gate, &id, "defer");
+                    return Err(invalid("waiting for local confirmation").into());
+                }
+            }
+        }
+    }
     let decision = store.lock().map_err(|_| invalid("store unavailable"))?
         .receive_file_offer(peer, &id, &name, size, &sha256, created_at, logical, unix_now())?;
     let (offset, target, partial) = match decision {
@@ -308,6 +323,21 @@ struct GroupFilePayload {
 fn receive_group_file(stream: &mut StreamOwned<ServerConnection, DeadlineStream>, gate: &mut ReadyGate,
     store: &Mutex<Store>, self_id: &str, peer: &str, offer: GroupFilePayload) -> ChatResult<()> {
     let GroupFilePayload { id, group_id, name, owner, members, file_name, size, sha256, created_at, logical } = offer;
+    {
+        let store = store.lock().map_err(|_| invalid("store unavailable"))?;
+        if store.file_accept_confirm()? {
+            match store.file_offer_status(&id)?.as_deref() {
+                Some("accepted") => {}
+                Some("rejected") => { drop(store); let _ = reject(stream, gate, &id, "declined"); return Err(invalid("declined").into()); }
+                _ => {
+                    store.record_file_offer_request(peer, &id, &file_name, size, created_at)?;
+                    drop(store);
+                    let _ = reject(stream, gate, &id, "defer");
+                    return Err(invalid("waiting for local confirmation").into());
+                }
+            }
+        }
+    }
     let decision = store.lock().map_err(|_| invalid("store unavailable"))?
         .receive_group_file(self_id, peer, &group_id, &name, &owner, &members, &id, &file_name, size, &sha256, created_at, logical, unix_now())?;
     let (offset, target, partial) = match decision {
@@ -418,6 +448,10 @@ fn send_group_file(identity: &Identity, store: &Mutex<Store>, member: &str, addr
         gate.inbound(&reply)?;
         let offset = match reply {
             Payload::FileReject { id, reason } if id == message_id => {
+                if reason == "defer" {
+                    if let Ok(store) = store.lock() { let _ = store.pause_group_file_transfer(&message_id, "等待对方确认接收", unix_now()); }
+                    return Err(invalid("waiting for peer confirmation").into());
+                }
                 let text = reject_reason_text(&reason);
                 if let Ok(store) = store.lock() { let _ = store.fail_group_file_transfer(&message_id, text, unix_now()); }
                 return Err(invalid("group file rejected").into());
@@ -578,6 +612,8 @@ fn reject_reason_text(reason: &str) -> &'static str {
         "conflict" => "对方存在同 ID 的不同内容",
         "too_large" => "文件超出对方限制",
         "no_space" => "对方存储空间不足",
+        "defer" => "等待对方确认接收",
+        "declined" => "对方拒绝接收文件",
         _ => "对方拒绝了文件",
     }
 }
@@ -609,6 +645,10 @@ fn send_file(identity: &Identity, store: &Mutex<Store>, peer: &str, address: Soc
         gate.inbound(&reply)?;
         let offset = match reply {
             Payload::FileReject { id, reason } if id == message.id => {
+                if reason == "defer" {
+                    if let Ok(store) = store.lock() { let _ = store.pause_file_transfer(&message.id, "等待对方确认接收", unix_now()); }
+                    return Err(invalid("waiting for peer confirmation").into());
+                }
                 let text = reject_reason_text(&reason);
                 if let Ok(store) = store.lock() { let _ = store.fail_file_transfer(&message.id, text, unix_now()); }
                 return Err(invalid("file rejected").into());

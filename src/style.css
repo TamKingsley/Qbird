@@ -143,3 +143,10 @@
 .image-viewer{position:fixed;inset:0;z-index:40;display:flex;align-items:center;justify-content:center;overflow:hidden;background:rgba(38,32,27,.9);cursor:grab}.image-viewer[hidden]{display:none}.viewer-toolbar{position:absolute;top:16px;left:50%;transform:translateX(-50%);z-index:2;display:flex;gap:8px;align-items:center;padding:8px 12px;border-radius:12px;background:rgba(255,250,245,.96)}.viewer-toolbar button{border:0;border-radius:8px;padding:6px 10px;background:#f0e4d8;color:#6f4f3a}.viewer-scale{min-width:44px;text-align:center;font-size:12px;color:#7d6a58}.viewer-image{max-width:90vw;max-height:82vh;object-fit:contain;user-select:none;will-change:transform}.file-thumb{cursor:zoom-in}
 
 .capture-overlay{position:fixed;inset:0;z-index:50;cursor:crosshair;background:#000}.capture-shot{width:100%;height:100%;object-fit:fill;user-select:none}.capture-box{position:absolute;border:2px solid #6fb3a8;background:rgba(111,179,168,.18);pointer-events:none}.capture-hint{position:absolute;top:16px;left:50%;transform:translateX(-50%);padding:8px 14px;border-radius:10px;background:rgba(0,0,0,.6);color:#fff;font-size:13px}
+
+/* Pending file offers */
+.direct-offers{display:flex;flex-direction:column;gap:8px;margin:14px 0 4px}
+.direct-offers[hidden]{display:none}
+.offer-card{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:10px 12px;border:1px dashed #d9d1c7;border-radius:10px;background:#fbf8f2}
+.offer-text{display:flex;flex-direction:column;gap:2px;min-width:0}
+.offer-card .file-actions{align-items:center;margin-top:0}

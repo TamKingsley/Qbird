@@ -85,7 +85,7 @@ fn valid_file_name(name: &str) -> bool {
 
 /// Reasons are fixed codes so a peer cannot inject display text into diagnostics.
 pub fn valid_reject_reason(reason: &str) -> bool {
-    matches!(reason, "untrusted" | "conflict" | "too_large" | "invalid" | "no_space")
+    matches!(reason, "untrusted" | "conflict" | "too_large" | "invalid" | "no_space" | "defer" | "declined")
 }
 
 fn validate(payload: &Payload) -> io::Result<()> {

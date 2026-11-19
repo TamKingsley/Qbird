@@ -52,6 +52,9 @@ let experiments: ExperimentSettings = { group_file_quote: false };
 let experimentNotice = '';
 let composer: ComposerSettings = { send_shortcut: 'enter', rows: 3 };
 let composerNotice = '';
+type FileAcceptMode = { confirm: boolean };
+let fileAccept: FileAcceptMode = { confirm: false };
+let fileAcceptNotice = '';
 const COMMON_EMOJIS = ['😀', '😁', '😂', '🤣', '😊', '😍', '😘', '😜', '🤔', '😅', '😭', '😡', '👍', '👎', '👏', '🙏', '💪', '🎉', '❤️', '💔', '🔥', '✨', '⭐', '🌹', '🍀', '☕', '🍰', '🐱', '🐶', '🌙', '☀️', '💡', '✅', '❌', '⚠️', '📌', '📎', '🚀', '🎯', '💬', '🙌', '🤝', '😴', '😎', '🥳', '🤩', '😢', '😤'];
 let stickers: string[] = [];
 let stickersLoaded = false;
@@ -619,6 +622,13 @@ function privacySettingsHtml(): string {
       <p id="lock-notice" role="status">${lockNotice}</p>
       <small>应用锁只隐藏界面，不加密本地 SQLite 数据库；备份密码与应用锁密码相互独立。忘记应用锁密码时目前只能在本机设置中移除后重设；Windows 身份验证重置尚未实现。</small>
     </div>
+    <div class="probe-box"><h3>文件接收</h3>
+      <p>逐次确认：${fileAccept.confirm ? '已开启，收到文件时先保存在待确认列表，等你决定后再接收' : '已关闭，已确认联系人发来的文件自动接收'}。</p>
+      <p><label><input id="file-accept-confirm" type="checkbox" ${fileAccept.confirm ? 'checked' : ''}> 接收文件前逐次确认</label></p>
+      <div class="probe-row"><button class="outline" data-action="save-file-accept">保存接收设置</button></div>
+      <p id="file-accept-notice" role="status">${fileAcceptNotice}</p>
+      <small>开启后对方会暂停并等待；接受后对方下次重试自动续传，拒绝则不再重试。设置只影响本机，对单聊与群文件同时生效。</small>
+    </div>
     <div class="probe-box"><h3>聊天备份与恢复</h3>
       <p>备份使用密码加密并校验完整性；${backupInfo ? `已校验备份：${backupInfo.message_count} 条消息 · ${new Date(backupInfo.created_at * 1000).toLocaleString()}${backupInfo.include_chat ? ' · 含聊天记录' : ' · 不含聊天记录'}` : '尚未校验备份文件'}</p>
       <label for="backup-password">备份密码（8–256 字符）</label>
@@ -673,6 +683,22 @@ async function takeScreenshot(): Promise<void> {
     else if (groupChat.groupId) await groupChat.queuePaths([path]);
     else groupChat.notify('请先打开一个单聊或群聊再截图。');
   } catch (error) { groupChat.notify(displayError(error)); }
+}
+
+async function refreshFileAccept(): Promise<void> {
+  if (!isTauri()) return;
+  try { fileAccept = await invoke<FileAcceptMode>('v1_file_accept_mode'); }
+  catch { fileAcceptNotice = '无法读取接收设置'; }
+}
+
+async function saveFileAccept(): Promise<void> {
+  if (!isTauri()) return;
+  const confirm = app.querySelector<HTMLInputElement>('#file-accept-confirm')?.checked ?? false;
+  try {
+    fileAccept = await invoke<FileAcceptMode>('v1_set_file_accept_mode', { confirm });
+    fileAcceptNotice = confirm ? '已开启逐次确认：收到文件时先等待你确认。' : '已关闭逐次确认：已确认联系人发来的文件自动接收。';
+  } catch (error) { fileAcceptNotice = displayError(error); }
+  if (page === 'settings') render();
 }
 
 async function refreshExperiments(): Promise<void> {
@@ -1403,6 +1429,9 @@ app.addEventListener('click', (event) => {
     return;
   }
   if (action?.dataset.action === 'save-experiment') { void saveExperiments(); return; }
+  if (action?.dataset.action === 'save-file-accept') { void saveFileAccept(); return; }
+  if (action?.dataset.action === 'accept-file-offer' && action.dataset.id) { void direct.resolveOffer(action.dataset.id, true); return; }
+  if (action?.dataset.action === 'reject-file-offer' && action.dataset.id) { void direct.resolveOffer(action.dataset.id, false); return; }
   if (action?.dataset.action === 'group-older') { void groupChat.load(true); return; }
   if (action?.dataset.action === 'hide-group') { void groupChat.hide(); return; }
   if (action?.dataset.action === 'leave-group') { void groupChat.leave(); return; }
@@ -1466,6 +1495,7 @@ void refreshComposer().then(() => { if (!lockState.locked) render(); });
 void refreshNetwork().then(() => { if (!lockState.locked) render(); });
 void refreshScanState().then(() => { if (!lockState.locked) render(); });
 void refreshExperiments().then(() => { if (!lockState.locked) render(); });
+void refreshFileAccept().then(() => { if (!lockState.locked) render(); });
 for (const type of ['pointerdown', 'keydown', 'wheel', 'mousemove'] as const) {
   window.addEventListener(type, () => { lastActivity = Date.now(); }, { passive: true });
 }

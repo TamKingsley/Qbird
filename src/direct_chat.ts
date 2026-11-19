@@ -11,6 +11,7 @@ type DirectMessage = {
 };
 type TextPreview = { name: string; kind: string; text: string };
 type Panel = { id: string; name: string; kind: string };
+type FileOffer = { message_id: string; peer: string; name: string; total: number; created_at: number; status: string };
 type Cursor = Pick<DirectMessage, 'logical' | 'sender' | 'id'>;
 const cursorOf = (message: DirectMessage): Cursor => ({ logical: message.logical, sender: message.sender, id: message.id });
 const compare = (a: Cursor, b: Cursor): number => a.logical - b.logical || (a.sender < b.sender ? -1 : a.sender > b.sender ? 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
@@ -35,6 +36,7 @@ export class DirectChat {
   private panel: Panel | null = null;
   private panelWidth = 380;
   private panelBusy = false;
+  private offers: FileOffer[] = [];
 
   constructor(private root: HTMLElement, private onChange: () => void) {
     // The resizer is re-created on every render, so a single delegated listener is enough.
@@ -44,7 +46,7 @@ export class DirectChat {
   view(): string {
     return `<section class="self-chat" aria-label="单聊">
       <header class="chat-header"><div><strong id="direct-name"></strong><small>端到端加密 · 指纹已确认</small></div><div class="group-actions"><button class="outline" data-action="export-text" data-kind="direct">导出文本</button><button class="outline" data-action="hide-direct">不显示此会话</button></div></header>
-      <div class="chat-history" id="direct-history" aria-label="单聊记录"><div class="direct-address"><label for="direct-address">联系人地址（仅连接提示）</label><div class="probe-row"><input id="direct-address" type="text" placeholder="192.168.1.8:42853"><button class="outline" data-action="save-direct-address">保存地址</button></div><small>地址不代表身份，连接时仍核对指纹。请在发现页面启动聊天服务；离线消息与文件须双方同时在线才能补发或续传。</small><p id="direct-address-status" role="status"></p></div><button class="load-older" data-action="direct-older" hidden>加载更早消息</button><div id="direct-messages"></div></div>
+      <div class="chat-history" id="direct-history" aria-label="单聊记录"><div class="direct-address"><label for="direct-address">联系人地址（仅连接提示）</label><div class="probe-row"><input id="direct-address" type="text" placeholder="192.168.1.8:42853"><button class="outline" data-action="save-direct-address">保存地址</button></div><small>地址不代表身份，连接时仍核对指纹。请在发现页面启动聊天服务；离线消息与文件须双方同时在线才能补发或续传。</small><p id="direct-address-status" role="status"></p></div><button class="load-older" data-action="direct-older" hidden>加载更早消息</button><div id="direct-messages"></div><div id="direct-offers" class="direct-offers" hidden></div></div>
       <div class="chat-compose"><label for="direct-input">消息</label><textarea id="direct-input" rows="3" maxlength="32768" placeholder="写点什么，或把文件/图片拖进窗口…"></textarea><div class="compose-footer"><span>Enter 发送 · Shift+Enter 换行</span><div class="compose-actions"><button class="outline" data-action="direct-image">发送图片</button><button class="outline" data-action="direct-file">发送文件</button><button class="outline" data-action="direct-screenshot">截图</button><button data-action="direct-send">发送</button></div></div><p id="direct-file-status" role="status"></p><p id="direct-error" role="status"></p></div>
       <aside class="file-panel" id="direct-panel" hidden aria-label="文件预览">
         <div class="panel-resizer" data-role="panel-resizer" aria-hidden="true"></div>
@@ -54,7 +56,7 @@ export class DirectChat {
     </section>`;
   }
 
-  clear(): void { this.peer = ''; this.generation++; this.stopPolling(); this.closePanel(); }
+  clear(): void { this.peer = ''; this.generation++; this.offers = []; this.stopPolling(); this.closePanel(); }
 
   draft(value: string): void { if (this.peer) this.drafts.set(this.peer, value); }
   addressDraft(value: string): void { if (this.peer) this.addressDrafts.set(this.peer, value); }
@@ -254,7 +256,7 @@ export class DirectChat {
     await invoke('v1_open_direct', { peer });
     if (generation !== this.generation) return;
     this.peer = peer; this.name = name; this.messages = []; this.address = ''; this.hasOlder = false; this.refreshBefore = null;
-    this.loading = false; this.previews.clear(); this.previewPending.clear(); this.onChange();
+    this.loading = false; this.previews.clear(); this.previewPending.clear(); this.offers = []; this.onChange();
     try {
       const address = await invoke<string | null>('v1_contact_address', { peer });
       if (generation === this.generation) {
@@ -264,12 +266,13 @@ export class DirectChat {
       }
     } catch { this.status('#direct-address-status', '无法读取联系人地址'); }
     await this.load(false, true);
+    void this.loadOffers();
     this.startPolling();
   }
 
   private startPolling(): void {
     this.stopPolling();
-    this.poll = window.setInterval(() => { if (!document.hidden) void this.load(false); }, POLL_INTERVAL);
+    this.poll = window.setInterval(() => { if (!document.hidden) { void this.load(false); void this.loadOffers(); } }, POLL_INTERVAL);
   }
 
   private stopPolling(): void { if (this.poll !== null) { window.clearInterval(this.poll); this.poll = null; } }
@@ -358,6 +361,56 @@ export class DirectChat {
     image.src = url; image.alt = '聊天图片'; image.className = 'message-image';
     image.addEventListener('click', () => showImage(url, '聊天图片'));
     holder.append(image);
+  }
+
+  /// Pending file offers that the peer must wait on while per-file confirmation is on.
+  private async loadOffers(): Promise<void> {
+    if (!isTauri() || !this.peer) return;
+    const peer = this.peer, generation = this.generation;
+    try {
+      const offers = await invoke<FileOffer[]>('v1_file_offer_requests', { peer });
+      if (generation !== this.generation || peer !== this.peer) return;
+      const changed = offers.length !== this.offers.length
+        || offers.some((offer, index) => offer.message_id !== this.offers[index].message_id);
+      this.offers = offers;
+      if (changed) this.paintOffers();
+    } catch { /* polling; the next tick retries */ }
+  }
+
+  private paintOffers(): void {
+    const box = this.root.querySelector<HTMLElement>('#direct-offers');
+    if (!box) return;
+    box.replaceChildren();
+    box.hidden = this.offers.length === 0;
+    for (const offer of this.offers) {
+      const card = document.createElement('div'); card.className = 'offer-card';
+      const text = document.createElement('div'); text.className = 'offer-text';
+      const title = document.createElement('div'); title.className = 'file-title'; title.textContent = offer.name;
+      const meta = document.createElement('small'); meta.className = 'file-meta';
+      meta.textContent = `${formatSize(offer.total)} · ${new Date(offer.created_at * 1000).toLocaleString()} · 等待确认`;
+      text.append(title, meta);
+      const actions = document.createElement('div'); actions.className = 'file-actions';
+      const accept = document.createElement('button');
+      accept.className = 'outline'; accept.textContent = '接收';
+      accept.dataset.action = 'accept-file-offer'; accept.dataset.id = offer.message_id;
+      const reject = document.createElement('button');
+      reject.className = 'linkish'; reject.textContent = '拒绝';
+      reject.dataset.action = 'reject-file-offer'; reject.dataset.id = offer.message_id;
+      actions.append(accept, reject);
+      card.append(text, actions);
+      box.append(card);
+    }
+  }
+
+  /// Accepting only marks the local decision; the sender retries and then proceeds.
+  async resolveOffer(id: string, accept: boolean): Promise<void> {
+    if (!isTauri() || !id) return;
+    try {
+      await invoke('v1_resolve_file_offer', { id, accept });
+      this.offers = this.offers.filter(offer => offer.message_id !== id);
+      this.paintOffers();
+      this.status('#direct-file-status', accept ? '已接受，等待对方重新发送' : '已拒绝该文件');
+    } catch { this.status('#direct-error', '无法更新文件确认状态'); }
   }
 
   private paint(mode: 'bottom' | 'preserve' | 'auto'): void {

@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::{params, Connection, OptionalExtension, Result};
 use serde::Serialize;
 
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 
 /// Default cap for locally received attachments; the user may change it in settings.
 pub const DEFAULT_STORAGE_QUOTA: u64 = 2 * 1024 * 1024 * 1024;
@@ -242,6 +242,17 @@ pub struct GroupMessage {
     pub file_status: Option<String>,
     pub file_transferred: Option<i64>,
     pub file_error: Option<String>,
+}
+
+/// One received file offer waiting for a local yes/no.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct FileOfferRequest {
+    pub message_id: String,
+    pub peer: String,
+    pub name: String,
+    pub total: i64,
+    pub created_at: i64,
+    pub status: String,
 }
 
 /// Local transfer state for one group file message.
@@ -587,6 +598,23 @@ impl Store {
                  );
                  CREATE INDEX IF NOT EXISTS group_file_transfers_by_peer ON group_file_transfers(peer, status);
                  PRAGMA user_version = 11;",
+            )?;
+            transaction.commit()?;
+        }
+        if version < 12 {
+            let transaction = connection.transaction()?;
+            // Offers waiting for the local user are local state only; no bytes are stored yet.
+            transaction.execute_batch(
+                "CREATE TABLE IF NOT EXISTS file_offer_requests (
+                    message_id TEXT PRIMARY KEY NOT NULL,
+                    peer TEXT NOT NULL CHECK(length(peer) = 64),
+                    name TEXT NOT NULL,
+                    total INTEGER NOT NULL CHECK(total > 0 AND total <= 536870912),
+                    created_at INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'accepted', 'rejected'))
+                 );
+                 CREATE INDEX IF NOT EXISTS file_offer_requests_by_peer ON file_offer_requests(peer, status);
+                 PRAGMA user_version = 12;",
             )?;
             transaction.commit()?;
         }
@@ -1128,6 +1156,58 @@ impl Store {
             kind: "file".into(), file_name: Some(clean), file_size: Some(size), file_sha256: Some(sha256.into()),
             file_status: Some("pending".into()), file_transferred: Some(0), file_error: None,
         })
+    }
+
+    /// Whether incoming files must be confirmed one by one (default: automatic).
+    pub fn file_accept_confirm(&self) -> Result<bool> {
+        Ok(self.get_setting("file_accept_confirm")?.map(|value| value == "1").unwrap_or(false))
+    }
+
+    pub fn set_file_accept_confirm(&self, enabled: bool) -> Result<()> {
+        self.set_setting("file_accept_confirm", Some(if enabled { "1" } else { "0" }))?;
+        Ok(())
+    }
+
+    pub fn file_offer_status(&self, id: &str) -> Result<Option<String>> {
+        if !valid_message_id(id) { return Err(rusqlite::Error::InvalidQuery); }
+        self.connection.query_row(
+            "SELECT status FROM file_offer_requests WHERE message_id = ?1", [id],
+            |row| row.get(0),
+        ).optional()
+    }
+
+    /// Records a deferred offer; repeated attempts keep the original request row.
+    pub fn record_file_offer_request(&self, peer: &str, id: &str, name: &str, size: u64, created_at: i64) -> Result<()> {
+        let clean = crate::files::sanitize_name(name).ok_or(rusqlite::Error::InvalidQuery)?;
+        let size = i64::try_from(size).map_err(|_| rusqlite::Error::InvalidQuery)?;
+        if !valid_fingerprint(peer) || !valid_message_id(id) { return Err(rusqlite::Error::InvalidQuery); }
+        self.connection.execute(
+            "INSERT INTO file_offer_requests(message_id, peer, name, total, created_at, status)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'pending')
+             ON CONFLICT(message_id) DO NOTHING",
+            params![id, peer, clean, size, created_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_file_offer_requests(&self, peer: &str) -> Result<Vec<FileOfferRequest>> {
+        if !valid_fingerprint(peer) { return Err(rusqlite::Error::InvalidQuery); }
+        let mut statement = self.connection.prepare(
+            "SELECT message_id, peer, name, total, created_at, status FROM file_offer_requests
+             WHERE peer = ?1 AND status = 'pending' ORDER BY created_at DESC LIMIT 50")?;
+        let rows = statement.query_map([peer], |row| Ok(FileOfferRequest {
+            message_id: row.get(0)?, peer: row.get(1)?, name: row.get(2)?, total: row.get(3)?,
+            created_at: row.get(4)?, status: row.get(5)?,
+        }))?;
+        rows.collect()
+    }
+
+    pub fn resolve_file_offer(&self, id: &str, accept: bool) -> Result<bool> {
+        if !valid_message_id(id) { return Err(rusqlite::Error::InvalidQuery); }
+        Ok(self.connection.execute(
+            "UPDATE file_offer_requests SET status = ?2 WHERE message_id = ?1 AND status = 'pending'",
+            params![id, if accept { "accepted" } else { "rejected" }],
+        )? == 1)
     }
 
     /// Validate an offer against trust, existing records and any partial file.
