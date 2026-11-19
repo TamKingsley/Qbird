@@ -53,6 +53,9 @@ export class GroupChat {
   private attaching = false;
   private avatarUrl: string | null = null;
   private avatarBytes: Uint8Array | null = null;
+  private batches = new Map<string, string>();
+  private batchCaptions = new Map<string, string>();
+  private renderedBatches = new Set<string>();
   private panel: Panel | null = null;
   private panelWidth = 380;
   /// 'lightbox' keeps the in-app viewer; 'workspace' opens the right panel instead.
@@ -151,6 +154,7 @@ export class GroupChat {
         || item.file_status !== this.messages[i]?.file_status
         || item.file_transferred !== this.messages[i]?.file_transferred);
       this.messages = next;
+      await this.loadBatches();
       if (older || initial) this.hasOlder = batch.length === 200;
       if (changed || older || initial) this.paint(initial ? 'bottom' : older ? 'preserve' : 'auto');
     } catch { if (generation === this.generation) this.status('#group-error', '无法读取群聊记录'); }
@@ -182,17 +186,52 @@ export class GroupChat {
     this.attaching = true;
     try {
       const selected = await open({
-        multiple: false, directory: false,
+        multiple: kind === 'image', directory: false,
         title: kind === 'image' ? '选择图片' : '选择文件',
         filters: kind === 'image' ? [{ name: '图片', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp'] }] : undefined,
       });
-      if (!selected || typeof selected !== 'string') return;
-      await this.queuePaths([selected]);
+      if (!selected) return;
+      const paths = Array.isArray(selected) ? selected : [selected];
+      if (kind === 'image') await this.queueImages(paths);
+      else await this.queuePaths(paths);
     } catch (error) { this.status('#group-error', typeof error === 'string' ? error : '无法打开文件选择器'); }
     finally { this.attaching = false; }
   }
 
+  /// One bubble for the selected images, using the composer text as caption.
+  async queueImages(paths: string[]): Promise<void> {
+    if (!this.groupId || this.attaching || !paths.length) return;
+    const groupId = this.groupId, generation = this.generation;
+    const input = this.root.querySelector<HTMLTextAreaElement>('#group-input');
+    const caption = input?.value ?? '';
+    this.attaching = true;
+    try {
+      const messages = await invoke<GroupMessage[]>('v1_queue_group_images', { groupId, paths, caption });
+      if (generation !== this.generation) return;
+      for (const message of messages) {
+        if (!this.messages.some(item => item.id === message.id)) this.messages.push(message);
+      }
+      this.messages.sort(compare);
+      if (input && caption) input.value = '';
+      await this.loadBatches();
+      this.paint('bottom');
+      this.status('#group-file-status', `已加入待发送：${messages.length} 张图片（成员在线后自动发送）`);
+    } catch (error) { this.status('#group-error', typeof error === 'string' ? error : '无法加入图片'); }
+    finally { this.attaching = false; }
+  }
+
+  private async loadBatches(): Promise<void> {
+    if (!isTauri() || !this.groupId) return;
+    try {
+      const rows = await invoke<{ message_id: string; batch_id: string; caption: string }[]>('v1_image_batches', { kind: 'group', target: this.groupId });
+      this.batches.clear(); this.batchCaptions.clear();
+      for (const row of rows) { this.batches.set(row.message_id, row.batch_id); this.batchCaptions.set(row.batch_id, row.caption); }
+    } catch { /* keep the previous grouping */ }
+  }
+
   async queuePaths(paths: string[]): Promise<void> {
+    // A drop or pick that is all images becomes one bubble, same as the image button.
+    if (paths.length && paths.every(path => /\.(png|jpe?g|gif|webp|bmp)$/i.test(path))) { await this.queueImages(paths); return; }
     for (const path of paths) await this.queuePath(path);
   }
 
@@ -651,6 +690,7 @@ export class GroupChat {
     const anchorId = anchor?.dataset.id, anchorOffset = anchor ? anchor.getBoundingClientRect().top - top : 0;
     const previousTop = history.scrollTop, previousHeight = history.scrollHeight;
     list.replaceChildren();
+    this.renderedBatches.clear();
     for (const message of this.messages) {
       const incoming = message.sender !== this.self;
       const row = document.createElement('div'); row.className = `message-row${incoming ? ' incoming' : ''}`; row.dataset.id = message.id;
@@ -669,7 +709,33 @@ export class GroupChat {
         quote.textContent = `${message.reply_sender ?? '原消息'}：${message.reply_preview}`;
         bubble.append(quote);
       }
-      if (message.kind === 'file') {
+      const batch = this.batches.get(message.id);
+      if (batch) {
+        if (this.renderedBatches.has(batch)) continue;
+        this.renderedBatches.add(batch);
+        const caption = this.batchCaptions.get(batch) ?? '';
+        if (caption) { const text = document.createElement('div'); text.className = 'message-text'; text.textContent = caption; bubble.append(text); }
+        const grid = document.createElement('div'); grid.className = 'batch-grid';
+        for (const item of this.messages.filter(candidate => this.batches.get(candidate.id) === batch)) {
+          const cell = document.createElement('div'); cell.className = 'batch-item';
+          if (this.thumbs.has(item.id)) {
+            const image = document.createElement('img'); image.className = 'file-thumb'; image.src = this.thumbs.get(item.id) ?? '';
+            image.alt = item.file_name ?? '图片';
+            image.addEventListener('click', () => {
+              if (this.imageOpenMode === 'workspace') { void this.openPreview(item); return; }
+              showImage(image.src, item.file_name ?? '图片');
+            });
+            cell.append(image);
+          } else if (item.file_status === 'completed') {
+            this.loadThumbnail(item.id);
+          }
+          const meta = document.createElement('small'); meta.className = 'file-meta';
+          meta.textContent = `${this.formatSize(item.file_size ?? 0)} · ${this.fileStatusText(item)}`;
+          cell.append(meta);
+          grid.append(cell);
+        }
+        bubble.append(grid);
+      } else if (message.kind === 'file') {
         const card = document.createElement('div'); card.className = 'file-card';
         if (this.isImageMessage(message) && this.thumbs.has(message.id)) {
           const image = document.createElement('img'); image.className = 'file-thumb'; image.src = this.thumbs.get(message.id) ?? '';

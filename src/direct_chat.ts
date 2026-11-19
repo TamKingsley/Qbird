@@ -37,6 +37,9 @@ export class DirectChat {
   private panelWidth = 380;
   private panelBusy = false;
   private offers: FileOffer[] = [];
+  private batches = new Map<string, string>();
+  private batchCaptions = new Map<string, string>();
+  private renderedBatches = new Set<string>();
   /// 'lightbox' keeps the in-app viewer; 'workspace' opens the right panel instead.
   imageOpenMode: 'lightbox' | 'workspace' = 'lightbox';
 
@@ -113,20 +116,58 @@ export class DirectChat {
     this.attaching = true;
     try {
       const selected = await open({
-        multiple: kind === 'file',
+        multiple: true,
         directory: false,
         title: kind === 'image' ? '选择图片' : '选择文件',
         filters: kind === 'image' ? [{ name: '图片', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp'] }] : undefined,
       });
       if (!selected) return;
-      await this.queuePaths(Array.isArray(selected) ? selected : [selected]);
+      const paths = Array.isArray(selected) ? selected : [selected];
+      if (kind === 'image') await this.queueImages(paths);
+      else await this.queuePaths(paths);
     } catch (error) {
       this.status('#direct-error', typeof error === 'string' ? error : '无法打开文件选择器');
     } finally { this.attaching = false; }
   }
 
+  /// One bubble for the selected images, using the composer text as its caption.
+  async queueImages(paths: string[]): Promise<void> {
+    if (!this.peer || this.attaching) return;
+    if (!paths.length) return;
+    const peer = this.peer, generation = this.generation;
+    const input = this.root.querySelector<HTMLTextAreaElement>('#direct-input');
+    const caption = input?.value ?? '';
+    this.attaching = true;
+    this.status('#direct-file-status', '正在计算校验值…');
+    try {
+      const messages = await invoke<DirectMessage[]>('v1_queue_direct_images', { peer, paths, caption });
+      if (generation !== this.generation) return;
+      for (const message of messages) {
+        if (!this.messages.some(item => item.id === message.id)) this.messages.push(message);
+      }
+      this.messages.sort(compare);
+      if (input && caption) input.value = '';
+      await this.loadBatches();
+      this.paint('bottom'); this.onChangeConversations();
+      this.status('#direct-file-status', `已加入待发送：${messages.length} 张图片（对方在线后自动发送）`);
+    } catch (error) {
+      if (generation === this.generation) this.status('#direct-file-status', typeof error === 'string' ? error : '无法加入图片');
+    } finally { this.attaching = false; }
+  }
+
+  private async loadBatches(): Promise<void> {
+    if (!isTauri() || !this.peer) return;
+    try {
+      const rows = await invoke<{ message_id: string; batch_id: string; caption: string }[]>('v1_image_batches', { kind: 'direct', target: this.peer });
+      this.batches.clear(); this.batchCaptions.clear();
+      for (const row of rows) { this.batches.set(row.message_id, row.batch_id); this.batchCaptions.set(row.batch_id, row.caption); }
+    } catch { /* keep the previous grouping */ }
+  }
+
   /// Files dropped onto the window are queued in arrival order.
   async queuePaths(paths: string[]): Promise<void> {
+    // A drop or pick that is all images becomes one bubble, same as the image button.
+    if (paths.length && paths.every(path => /\.(png|jpe?g|gif|webp|bmp)$/i.test(path))) { await this.queueImages(paths); return; }
     if (!this.peer || this.attaching) return;
     this.attaching = true;
     try {
@@ -304,6 +345,7 @@ export class DirectChat {
       const next = [...merged.values()].sort(compare);
       const changed = !sameMessages(next, this.messages);
       this.messages = next;
+      await this.loadBatches();
       if (older || initial) this.hasOlder = batch.length === 200;
       if (changed || older || initial) this.paint(initial ? 'bottom' : older ? 'preserve' : 'auto');
     } catch { if (generation === this.generation) this.status('#direct-error', '无法读取单聊记录'); }
@@ -430,11 +472,32 @@ export class DirectChat {
     const anchorId = anchor?.dataset.id, anchorOffset = anchor ? anchor.getBoundingClientRect().top - top : 0;
     const previousTop = history.scrollTop, previousHeight = history.scrollHeight;
     list.replaceChildren();
+    this.renderedBatches.clear();
     for (const message of this.messages) {
       const incoming = message.sender === this.peer;
       const row = document.createElement('div'); row.className = `message-row${incoming ? ' incoming' : ''}`; row.dataset.id = message.id;
       const column = document.createElement('div'); column.className = 'message-column';
-      if (message.kind === 'file') {
+      const batch = this.batches.get(message.id);
+      if (batch) {
+        // Only the first child paints the shared bubble; the rest are skipped.
+        if (this.renderedBatches.has(batch)) continue;
+        this.renderedBatches.add(batch);
+        const bubble = document.createElement('div'); bubble.className = 'message-bubble image-batch';
+        const caption = this.batchCaptions.get(batch) ?? '';
+        if (caption) { const text = document.createElement('div'); text.className = 'message-text'; text.textContent = caption; bubble.append(text); }
+        const grid = document.createElement('div'); grid.className = 'batch-grid';
+        for (const item of this.messages.filter(candidate => this.batches.get(candidate.id) === batch)) {
+          const cell = document.createElement('div'); cell.className = 'batch-item';
+          const preview = document.createElement('div'); preview.className = 'file-preview'; preview.dataset.preview = item.id;
+          const meta = document.createElement('small'); meta.className = 'file-meta';
+          meta.textContent = item.file_status === 'completed' ? formatSize(item.file_size ?? 0) : fileStatus(item);
+          cell.append(preview, meta);
+          grid.append(cell);
+          this.ensurePreview(item);
+        }
+        bubble.append(grid);
+        column.append(bubble);
+      } else if (message.kind === 'file') {
         const bubble = document.createElement('div'); bubble.className = 'message-bubble file-bubble';
         const name = document.createElement('div'); name.className = 'file-title'; name.textContent = message.file_name ?? message.body;
         bubble.append(name);
@@ -484,6 +547,15 @@ export class DirectChat {
     if (address) address.value = this.addressDrafts.get(this.peer) ?? this.address;
     this.paint('bottom');
   }
+}
+
+function fileStatus(message: DirectMessage): string {
+  const status: string = message.file_status ?? 'pending';
+  if (status === 'transferring') return `传输中 ${formatSize(message.file_transferred ?? 0)} / ${formatSize(message.file_size ?? 0)}`;
+  if (status === 'completed') return '已完成';
+  if (status === 'failed') return message.file_error ?? '失败';
+  if (status === 'paused') return message.file_error ?? '已暂停';
+  return '等待对方';
 }
 
 function previewKind(name: string): 'image' | 'html' | 'markdown' | 'text' | 'other' {

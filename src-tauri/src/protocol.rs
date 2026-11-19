@@ -16,7 +16,11 @@ pub enum Payload {
     Text { id: String, body: String, created_at: i64, logical: i64 },
     Ack { id: String },
     /// Metadata only; the bytes follow as raw chunk frames after an accepted offer.
-    FileOffer { id: String, name: String, size: u64, sha256: String, created_at: i64, logical: i64 },
+    /// `batch_id`/`caption` group several images into one bubble with optional text.
+    FileOffer {
+        id: String, name: String, size: u64, sha256: String, created_at: i64, logical: i64,
+        batch_id: Option<String>, caption: Option<String>,
+    },
     FileAccept { id: String, offset: u64 },
     FileReject { id: String, reason: String },
     FileComplete { id: String },
@@ -36,6 +40,7 @@ pub enum Payload {
     GroupFileOffer {
         id: String, group_id: String, name: String, owner: String, members: Vec<String>,
         file_name: String, size: u64, sha256: String, created_at: i64, logical: i64,
+        batch_id: Option<String>, caption: Option<String>,
     },
     /// Owner handover, signed by the current owner like a roster update.
     GroupTransfer { id: String, group_id: String, name: String, owner: String, members: Vec<String> },
@@ -117,6 +122,22 @@ pub fn valid_reject_reason(reason: &str) -> bool {
 pub const MAX_SEARCH_QUERY: usize = 64;
 pub const MAX_SEARCH_RESULTS: usize = 64;
 
+/// A batch id is a 32-character hex token; captions are bounded text.
+pub const MAX_BATCH_CAPTION: usize = 8000;
+
+fn valid_batch(batch_id: Option<&str>, caption: Option<&str>) -> bool {
+    let batch_ok = match batch_id {
+        None => true,
+        Some(value) => value.len() == 32 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+    };
+    let caption_ok = match caption {
+        None => true,
+        Some(value) => value.len() <= MAX_BATCH_CAPTION && !value.chars().any(|c| c.is_control() && c != '\n' && c != '\t'),
+    };
+    // Either both are present or neither is.
+    batch_ok && caption_ok && batch_id.is_some() == caption.is_some()
+}
+
 fn valid_group_name(name: &str) -> bool {
     !name.trim().is_empty() && name.len() <= 128 && !name.chars().any(char::is_control)
 }
@@ -127,8 +148,9 @@ fn validate(payload: &Payload) -> io::Result<()> {
         Payload::Ready {} => Ok(()),
         Payload::Text { id, body, logical, .. } if valid_id(id) && !body.is_empty() && body.len() <= MAX_BODY && *logical > 0 => Ok(()),
         Payload::Ack { id } if valid_id(id) => Ok(()),
-        Payload::FileOffer { id, name, size, sha256, logical, .. }
-            if valid_id(id) && valid_file_name(name) && *size > 0 && *size <= MAX_FILE_BYTES && valid_sha256(sha256) && *logical > 0 => Ok(()),
+        Payload::FileOffer { id, name, size, sha256, logical, batch_id, caption, .. }
+            if valid_id(id) && valid_file_name(name) && *size > 0 && *size <= MAX_FILE_BYTES && valid_sha256(sha256)
+                && *logical > 0 && valid_batch(batch_id.as_deref(), caption.as_deref()) => Ok(()),
         Payload::FileAccept { id, offset } if valid_id(id) && *offset <= MAX_FILE_BYTES => Ok(()),
         Payload::FileReject { id, reason } if valid_id(id) && valid_reject_reason(reason) => Ok(()),
         Payload::FileComplete { id } if valid_id(id) => Ok(()),
@@ -141,10 +163,11 @@ fn validate(payload: &Payload) -> io::Result<()> {
                 && (reply_to.is_some() == reply_preview.is_some())
                 && mentions.len() <= MAX_GROUP_MEMBERS
                 && mentions.iter().all(|member| members.contains(member)) => Ok(()),
-        Payload::GroupFileOffer { id, group_id, name, owner, members, file_name, size, sha256, logical, .. }
+        Payload::GroupFileOffer { id, group_id, name, owner, members, file_name, size, sha256, logical, batch_id, caption, .. }
             if valid_id(id) && valid_group_id(group_id) && !name.is_empty() && name.len() <= 128
                 && valid_members(owner, members) && valid_file_name(file_name)
-                && *size > 0 && *size <= MAX_FILE_BYTES && valid_sha256(sha256) && *logical > 0 => Ok(()),
+                && *size > 0 && *size <= MAX_FILE_BYTES && valid_sha256(sha256) && *logical > 0
+                && valid_batch(batch_id.as_deref(), caption.as_deref()) => Ok(()),
         Payload::GroupTransfer { id, group_id, name, owner, members }
             if valid_id(id) && valid_group_id(group_id) && !name.is_empty() && name.len() <= 128
                 && valid_members(owner, members) => Ok(()),
@@ -260,16 +283,18 @@ mod tests {
     fn file_frames_enforce_metadata_bounds() {
         let offer = Payload::FileOffer {
             id: "m1".into(), name: "报告.pdf".into(), size: 1024, sha256: "a".repeat(64), created_at: 1, logical: 1,
+            batch_id: Some("b".repeat(32)), caption: Some("看图".into()),
         };
         let mut bytes = Vec::new();
         write_frame(&mut bytes, &offer).unwrap();
         assert_eq!(read_frame(Cursor::new(&bytes)).unwrap(), offer);
         let invalid_offers = [
-            Payload::FileOffer { id: "m1".into(), name: "../etc".into(), size: 1, sha256: "a".repeat(64), created_at: 1, logical: 1 },
-            Payload::FileOffer { id: "m1".into(), name: "a".into(), size: 0, sha256: "a".repeat(64), created_at: 1, logical: 1 },
-            Payload::FileOffer { id: "m1".into(), name: "a".into(), size: MAX_FILE_BYTES + 1, sha256: "a".repeat(64), created_at: 1, logical: 1 },
-            Payload::FileOffer { id: "m1".into(), name: "a".into(), size: 1, sha256: "g".repeat(64), created_at: 1, logical: 1 },
-            Payload::FileOffer { id: "m1".into(), name: "a".into(), size: 1, sha256: "a".repeat(64), created_at: 1, logical: 0 },
+            Payload::FileOffer { id: "m1".into(), name: "../etc".into(), size: 1, sha256: "a".repeat(64), created_at: 1, logical: 1, batch_id: None, caption: None },
+            Payload::FileOffer { id: "m1".into(), name: "a".into(), size: 0, sha256: "a".repeat(64), created_at: 1, logical: 1, batch_id: None, caption: None },
+            Payload::FileOffer { id: "m1".into(), name: "a".into(), size: MAX_FILE_BYTES + 1, sha256: "a".repeat(64), created_at: 1, logical: 1, batch_id: None, caption: None },
+            Payload::FileOffer { id: "m1".into(), name: "a".into(), size: 1, sha256: "g".repeat(64), created_at: 1, logical: 1, batch_id: None, caption: None },
+            Payload::FileOffer { id: "m1".into(), name: "a".into(), size: 1, sha256: "a".repeat(64), created_at: 1, logical: 0, batch_id: None, caption: None },
+            Payload::FileOffer { id: "m1".into(), name: "a".into(), size: 1, sha256: "a".repeat(64), created_at: 1, logical: 1, batch_id: Some("short".into()), caption: None },
         ];
         for payload in invalid_offers { assert!(write_frame(Vec::new(), &payload).is_err()); }
         assert!(write_frame(Vec::new(), &Payload::FileAccept { id: "m1".into(), offset: MAX_FILE_BYTES + 1 }).is_err());
@@ -297,6 +322,7 @@ mod tests {
             id: "m1".into(), group_id: "a".repeat(32), name: "team".into(),
             owner: "b".repeat(64), members: vec!["b".repeat(64)],
             file_name: "a.txt".into(), size: 5, sha256: "c".repeat(64), created_at: 1, logical: 1,
+            batch_id: None, caption: None,
         };
         let mut bytes = Vec::new();
         write_frame(&mut bytes, &offer).unwrap();

@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::{params, Connection, OptionalExtension, Result};
 use serde::{Deserialize, Serialize};
 
-const SCHEMA_VERSION: i64 = 14;
+const SCHEMA_VERSION: i64 = 15;
 
 /// Default cap for locally received attachments; the user may change it in settings.
 pub const DEFAULT_STORAGE_QUOTA: u64 = 2 * 1024 * 1024 * 1024;
@@ -281,6 +281,14 @@ pub struct ArchiveImportReport {
     pub inserted: u64,
     pub skipped: u64,
     pub conflicts: u64,
+}
+
+/// Links an image message to the bubble it belongs to.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct ImageBatch {
+    pub message_id: String,
+    pub batch_id: String,
+    pub caption: String,
 }
 
 /// One join application, either received (incoming) or sent by this device.
@@ -639,6 +647,22 @@ impl Store {
                  );
                  CREATE INDEX IF NOT EXISTS group_file_transfers_by_peer ON group_file_transfers(peer, status);
                  PRAGMA user_version = 11;",
+            )?;
+            transaction.commit()?;
+        }
+        if version < 15 {
+            let transaction = connection.transaction()?;
+            // Several images may share one bubble: the batch table links each image
+            // message to a batch id plus the caption typed with them.
+            transaction.execute_batch(
+                "CREATE TABLE IF NOT EXISTS image_batches (
+                    message_id TEXT PRIMARY KEY NOT NULL CHECK(length(message_id) <= 128),
+                    batch_id TEXT NOT NULL CHECK(length(batch_id) = 32),
+                    caption TEXT NOT NULL CHECK(length(caption) <= 8000),
+                    created_at INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS image_batches_by_batch ON image_batches(batch_id);
+                PRAGMA user_version = 15;",
             )?;
             transaction.commit()?;
         }
@@ -2562,6 +2586,58 @@ impl Store {
         Ok(report)
     }
 
+    /// Creates a fresh 32-character batch id for one bubble of images.
+    pub fn new_batch_id(&self) -> Result<String> {
+        self.connection.query_row("SELECT lower(hex(randomblob(16)))", [], |row| row.get(0))
+    }
+
+    /// Marks one image message as part of a batch. Called for both sent and received
+    /// offers, so a retransmit simply rewrites the same row.
+    pub fn attach_image_batch(&self, message_id: &str, batch_id: &str, caption: &str, now: i64) -> Result<bool> {
+        if !valid_message_id(message_id) || batch_id.len() != 32
+            || !batch_id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || caption.chars().count() > crate::protocol::MAX_BATCH_CAPTION
+            || caption.chars().any(|c| c.is_control() && c != '\n' && c != '\t') {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        let exists: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM direct_messages WHERE id = ?1 UNION ALL SELECT 1 FROM group_messages WHERE id = ?1)",
+            [message_id], |row| row.get(0))?;
+        if !exists { return Ok(false); }
+        self.connection.execute(
+            "INSERT INTO image_batches(message_id, batch_id, caption, created_at) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(message_id) DO UPDATE SET batch_id = excluded.batch_id, caption = excluded.caption",
+            params![message_id, batch_id, caption, now])?;
+        Ok(true)
+    }
+
+    /// Batch id and caption for one image message, if it belongs to a shared bubble.
+    pub fn image_batch_of(&self, message_id: &str) -> Result<Option<(String, String)>> {
+        self.connection.query_row(
+            "SELECT batch_id, caption FROM image_batches WHERE message_id = ?1", [message_id],
+            |row| Ok((row.get(0)?, row.get(1)?))).optional()
+    }
+
+    /// Batches for one conversation, bounded by the newest 2,000 images.
+    pub fn list_image_batches(&self, kind: &str, target: &str) -> Result<Vec<ImageBatch>> {
+        let sql = match kind {
+            "direct" => "SELECT b.message_id, b.batch_id, b.caption FROM image_batches b
+                         JOIN direct_messages m ON m.id = b.message_id WHERE m.peer = ?1
+                         ORDER BY b.created_at DESC LIMIT 2000",
+            "group" => "SELECT b.message_id, b.batch_id, b.caption FROM image_batches b
+                        JOIN group_messages m ON m.id = b.message_id WHERE m.group_id = ?1
+                        ORDER BY b.created_at DESC LIMIT 2000",
+            _ => return Err(rusqlite::Error::InvalidQuery),
+        };
+        if kind == "group" && !valid_group_id(target) { return Err(rusqlite::Error::InvalidQuery); }
+        if kind == "direct" && !valid_fingerprint(target) { return Err(rusqlite::Error::InvalidQuery); }
+        let mut statement = self.connection.prepare(sql)?;
+        let rows = statement.query_map([target], |row| Ok(ImageBatch {
+            message_id: row.get(0)?, batch_id: row.get(1)?, caption: row.get(2)?,
+        }))?;
+        rows.collect()
+    }
+
     /// Owner-only; `None` removes the avatar. The bytes must be a bounded square PNG.
     pub fn set_group_avatar(&self, actor: &str, group_id: &str, bytes: Option<&[u8]>, now: i64) -> Result<bool> {
         if !valid_fingerprint(actor) || !valid_group_id(group_id) { return Err(rusqlite::Error::InvalidQuery); }
@@ -3736,6 +3812,33 @@ mod tests {
         bytes.extend_from_slice(&edge.to_be_bytes());
         bytes.extend_from_slice(&edge.to_be_bytes());
         bytes
+    }
+
+    #[test]
+    fn image_batches_link_messages_into_one_bubble() {
+        let store = memory_store();
+        let me = "a".repeat(64);
+        let peer = "b".repeat(64);
+        store.add_candidate(&peer, "Bob").unwrap();
+        store.confirm_candidate(&peer).unwrap();
+        let first = store.queue_direct_file(&me, &peer, "a.png", 3, &"c".repeat(64), std::path::Path::new("C:/tmp/a.png"), 1).unwrap();
+        let second = store.queue_direct_file(&me, &peer, "b.png", 4, &"d".repeat(64), std::path::Path::new("C:/tmp/b.png"), 1).unwrap();
+        let batch = store.new_batch_id().unwrap();
+        assert_eq!(batch.len(), 32);
+        assert!(store.attach_image_batch(&first.id, &batch, "看这两张", 2).unwrap());
+        assert!(store.attach_image_batch(&second.id, &batch, "看这两张", 2).unwrap());
+        // A retransmit rewrites the same row instead of failing.
+        assert!(store.attach_image_batch(&first.id, &batch, "改个说明", 3).unwrap());
+        assert_eq!(store.image_batch_of(&first.id).unwrap(), Some((batch.clone(), "改个说明".to_owned())));
+        assert_eq!(store.image_batch_of(&second.id).unwrap(), Some((batch.clone(), "看这两张".to_owned())));
+        let listed = store.list_image_batches("direct", &peer).unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(listed.iter().all(|row| row.batch_id == batch));
+        // Unknown messages, bad ids and over-long captions are rejected.
+        assert!(!store.attach_image_batch("missing", &batch, "", 1).unwrap());
+        assert!(store.attach_image_batch(&first.id, "short", "", 1).is_err());
+        assert!(store.attach_image_batch(&first.id, &batch, &"x".repeat(crate::protocol::MAX_BATCH_CAPTION + 1), 1).is_err());
+        assert!(store.list_image_batches("self", &peer).is_err());
     }
 
     #[test]

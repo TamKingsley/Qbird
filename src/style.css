@@ -168,3 +168,11 @@
 .contact-tip{position:fixed;z-index:60;max-width:360px;padding:10px 12px;border:1px solid #e2d9cd;border-radius:10px;background:#fffdf9;box-shadow:0 10px 30px rgba(60,45,30,.14);display:flex;flex-direction:column;gap:4px;font-size:12px;color:#6f6357}
 .contact-tip[hidden]{display:none}
 .contact-tip code{font-size:11px;overflow-wrap:anywhere;color:#4f8178}
+
+/* One bubble with text and several images */
+.batch-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:6px;margin-top:6px;max-width:420px}
+.batch-item{display:flex;flex-direction:column;gap:2px;min-width:0}
+.batch-item .file-preview{min-height:60px}
+.batch-item .file-thumb{width:100%;max-height:160px;object-fit:cover;border-radius:8px;cursor:zoom-in}
+.batch-item .file-meta{font-size:10px;color:#9d8b7c;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.image-batch .message-text{white-space:pre-wrap}

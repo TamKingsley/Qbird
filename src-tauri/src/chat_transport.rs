@@ -124,8 +124,9 @@ pub fn accept_one(identity: &Identity, store: &Mutex<Store>, socket: TcpStream) 
                 gate.outbound(&ack)?;
                 protocol::write_frame(&mut stream, &ack)?;
             }
-            Payload::FileOffer { id, name, size, sha256, created_at, logical } => {
-                receive_file(&mut stream, &mut gate, store, &peer, FileOffer { id, name, size, sha256, created_at, logical })?;
+            Payload::FileOffer { id, name, size, sha256, created_at, logical, batch_id, caption } => {
+                receive_file(&mut stream, &mut gate, store, &peer,
+                    FileOffer { id, name, size, sha256, created_at, logical, batch_id, caption })?;
             }
             Payload::GroupText { id, group_id, name, owner, members, body, created_at, logical, reply_to, reply_sender, reply_preview, mentions } => {
                 let result = store.lock().map_err(|_| invalid("store unavailable"))?
@@ -137,9 +138,9 @@ pub fn accept_one(identity: &Identity, store: &Mutex<Store>, socket: TcpStream) 
                 }
                 acknowledge(&mut stream, &mut gate, &id)?;
             }
-            Payload::GroupFileOffer { id, group_id, name, owner, members, file_name, size, sha256, created_at, logical } => {
+            Payload::GroupFileOffer { id, group_id, name, owner, members, file_name, size, sha256, created_at, logical, batch_id, caption } => {
                 receive_group_file(&mut stream, &mut gate, store, &self_id, &peer, GroupFilePayload {
-                    id, group_id, name, owner, members, file_name, size, sha256, created_at, logical,
+                    id, group_id, name, owner, members, file_name, size, sha256, created_at, logical, batch_id, caption,
                 })?;
             }
             Payload::GroupUpdate { id, group_id, name, owner, members } => {
@@ -239,6 +240,17 @@ struct FileOffer {
     sha256: String,
     created_at: i64,
     logical: i64,
+    batch_id: Option<String>,
+    caption: Option<String>,
+}
+
+/// Records the shared bubble for a received image; a failure here never blocks the
+/// transfer, because the image itself is still usable on its own.
+fn attach_batch(store: &Mutex<Store>, message_id: &str, batch: Option<&str>, caption: Option<&str>) -> ChatResult<()> {
+    let (Some(batch), Some(caption)) = (batch, caption) else { return Ok(()); };
+    let store = store.lock().map_err(|_| invalid("store unavailable"))?;
+    store.attach_image_batch(message_id, batch, caption, unix_now())?;
+    Ok(())
 }
 
 fn reject(stream: &mut StreamOwned<ServerConnection, DeadlineStream>, gate: &mut ReadyGate, id: &str, reason: &'static str) -> io::Result<()> {
@@ -248,7 +260,7 @@ fn reject(stream: &mut StreamOwned<ServerConnection, DeadlineStream>, gate: &mut
 }
 
 fn receive_file(stream: &mut StreamOwned<ServerConnection, DeadlineStream>, gate: &mut ReadyGate, store: &Mutex<Store>, peer: &str, offer: FileOffer) -> ChatResult<()> {
-    let FileOffer { id, name, size, sha256, created_at, logical } = offer;
+    let FileOffer { id, name, size, sha256, created_at, logical, batch_id, caption } = offer;
     {
         let store = store.lock().map_err(|_| invalid("store unavailable"))?;
         if store.file_accept_confirm()? {
@@ -266,6 +278,7 @@ fn receive_file(stream: &mut StreamOwned<ServerConnection, DeadlineStream>, gate
     }
     let decision = store.lock().map_err(|_| invalid("store unavailable"))?
         .receive_file_offer(peer, &id, &name, size, &sha256, created_at, logical, unix_now())?;
+    attach_batch(store, &id, batch_id.as_deref(), caption.as_deref())?;
     let (offset, target, partial) = match decision {
         FileOfferDecision::Untrusted => { let _ = reject(stream, gate, &id, "untrusted"); return Err(invalid("untrusted file offer").into()); }
         FileOfferDecision::Conflict => { let _ = reject(stream, gate, &id, "conflict"); return Err(invalid("file offer conflict").into()); }
@@ -352,6 +365,8 @@ struct GroupFilePayload {
     name: String,
     owner: String,
     members: Vec<String>,
+    batch_id: Option<String>,
+    caption: Option<String>,
     file_name: String,
     size: u64,
     sha256: String,
@@ -363,7 +378,7 @@ struct GroupFilePayload {
 /// validates membership through `receive_group_file`.
 fn receive_group_file(stream: &mut StreamOwned<ServerConnection, DeadlineStream>, gate: &mut ReadyGate,
     store: &Mutex<Store>, self_id: &str, peer: &str, offer: GroupFilePayload) -> ChatResult<()> {
-    let GroupFilePayload { id, group_id, name, owner, members, file_name, size, sha256, created_at, logical } = offer;
+    let GroupFilePayload { id, group_id, name, owner, members, file_name, size, sha256, created_at, logical, batch_id, caption } = offer;
     {
         let store = store.lock().map_err(|_| invalid("store unavailable"))?;
         if store.file_accept_confirm()? {
@@ -381,6 +396,7 @@ fn receive_group_file(stream: &mut StreamOwned<ServerConnection, DeadlineStream>
     }
     let decision = store.lock().map_err(|_| invalid("store unavailable"))?
         .receive_group_file(self_id, peer, &group_id, &name, &owner, &members, &id, &file_name, size, &sha256, created_at, logical, unix_now())?;
+    attach_batch(store, &id, batch_id.as_deref(), caption.as_deref())?;
     let (offset, target, partial) = match decision {
         GroupFileDecision::NotMember => { let _ = reject(stream, gate, &id, "untrusted"); return Err(invalid("not a group member").into()); }
         GroupFileDecision::Conflict => { let _ = reject(stream, gate, &id, "conflict"); return Err(invalid("group file conflict").into()); }
@@ -477,11 +493,15 @@ fn send_group_file(identity: &Identity, store: &Mutex<Store>, member: &str, addr
     }
     let attempt = (|| -> ChatResult<()> {
         let (mut stream, mut gate) = connect(identity, member, address)?;
+        let (batch_id, caption) = store.lock().map_err(|_| invalid("store unavailable"))?
+            .image_batch_of(&message_id).ok().flatten()
+            .map(|(batch, caption)| (Some(batch), Some(caption))).unwrap_or((None, None));
         let offer = Payload::GroupFileOffer {
             id: message_id.clone(), group_id: dispatch.group_id.clone(), name: dispatch.group_name.clone(),
             owner: dispatch.owner.clone(), members: dispatch.members.clone(),
             file_name: dispatch.file_name.clone().unwrap_or_else(|| "file".into()),
             size, sha256: sha256.clone(), created_at: dispatch.created_at, logical: dispatch.logical,
+            batch_id, caption,
         };
         gate.outbound(&offer)?;
         protocol::write_frame(&mut stream, &offer)?;
@@ -750,9 +770,13 @@ fn send_file(identity: &Identity, store: &Mutex<Store>, peer: &str, address: Soc
     }
     let attempt = (|| -> ChatResult<()> {
         let (mut stream, mut gate) = connect(identity, peer, address)?;
+        let (batch_id, caption) = store.lock().map_err(|_| invalid("store unavailable"))?
+            .image_batch_of(&message.id).ok().flatten()
+            .map(|(batch, caption)| (Some(batch), Some(caption))).unwrap_or((None, None));
         let offer = Payload::FileOffer {
             id: message.id.clone(), name: message.file_name.clone().unwrap_or_else(|| "file".into()),
             size, sha256: sha256.clone(), created_at: message.created_at, logical: message.logical,
+            batch_id, caption,
         };
         gate.outbound(&offer)?;
         protocol::write_frame(&mut stream, &offer)?;

@@ -1036,6 +1036,94 @@ pub fn v1_queue_group(state: tauri::State<'_, AppState>, group_id: String, body:
 }
 
 /// Queue a file into a group; hashing and size checks run off the UI thread.
+/// One bubble of images with an optional caption; at most nine images per bubble.
+pub const MAX_BATCH_IMAGES: usize = 9;
+
+fn image_paths(paths: &[String]) -> Result<Vec<std::path::PathBuf>, String> {
+    if paths.is_empty() || paths.len() > MAX_BATCH_IMAGES { return Err(format!("每次可发送 1–{MAX_BATCH_IMAGES} 张图片")); }
+    let mut out = Vec::with_capacity(paths.len());
+    for path in paths {
+        if path.len() > 4096 { return Err("图片路径无效".to_owned()); }
+        let source = std::path::PathBuf::from(path);
+        let name = source.file_name().and_then(|name| name.to_str()).ok_or_else(|| "无法读取文件名".to_owned())?.to_owned();
+        if !crate::files::is_image(&name) { return Err(format!("不是支持的图片格式：{name}")); }
+        out.push(source);
+    }
+    Ok(out)
+}
+
+fn batch_caption(caption: &str) -> Result<String, String> {
+    let caption = caption.trim_matches(['\r', '\n']).to_owned();
+    if caption.chars().count() > crate::protocol::MAX_BATCH_CAPTION { return Err("图片说明过长".to_owned()); }
+    Ok(caption)
+}
+
+#[tauri::command]
+pub async fn v1_queue_direct_images(state: tauri::State<'_, AppState>, peer: String, paths: Vec<String>, caption: String)
+    -> Result<Vec<crate::storage::DirectMessage>, String> {
+    let store = Arc::clone(&state.store);
+    let sender = state.identity.fingerprint();
+    tauri::async_runtime::spawn_blocking(move || {
+        let sources = image_paths(&paths)?;
+        let caption = batch_caption(&caption)?;
+        let created_at = unix_now()?;
+        let batch = store.lock().map_err(|_| "本地存储不可用".to_owned())?.new_batch_id().map_err(|_| "无法创建图片批次".to_owned())?;
+        let mut messages = Vec::with_capacity(sources.len());
+        for source in sources {
+            let name = source.file_name().and_then(|name| name.to_str()).ok_or_else(|| "无法读取文件名".to_owned())?.to_owned();
+            let size = crate::files::file_size(&source).map_err(|_| "无法读取图片：请确认它是本地普通文件".to_owned())?;
+            if size == 0 { return Err("暂不支持空文件".to_owned()); }
+            if size > crate::protocol::MAX_FILE_BYTES { return Err("图片超过 512 MiB 限制".to_owned()); }
+            let sha256 = crate::files::sha256_file(&source).map_err(|_| "无法计算校验值".to_owned())?;
+            let message = store.lock().map_err(|_| "本地存储不可用".to_owned())?
+                .queue_direct_file(&sender, &peer, &name, size, &sha256, &source, created_at)
+                .map_err(|_| "对方须为已确认联系人".to_owned())?;
+            store.lock().map_err(|_| "本地存储不可用".to_owned())?
+                .attach_image_batch(&message.id, &batch, &caption, created_at)
+                .map_err(|_| "无法保存图片气泡".to_owned())?;
+            messages.push(message);
+        }
+        Ok(messages)
+    }).await.map_err(|_| "图片入队任务异常".to_owned())?
+}
+
+#[tauri::command]
+pub async fn v1_queue_group_images(state: tauri::State<'_, AppState>, group_id: String, paths: Vec<String>, caption: String)
+    -> Result<Vec<crate::storage::GroupMessage>, String> {
+    let store = Arc::clone(&state.store);
+    let sender = state.identity.fingerprint();
+    tauri::async_runtime::spawn_blocking(move || {
+        let sources = image_paths(&paths)?;
+        let caption = batch_caption(&caption)?;
+        let created_at = unix_now()?;
+        let batch = store.lock().map_err(|_| "本地存储不可用".to_owned())?.new_batch_id().map_err(|_| "无法创建图片批次".to_owned())?;
+        let mut messages = Vec::with_capacity(sources.len());
+        for source in sources {
+            let name = source.file_name().and_then(|name| name.to_str()).ok_or_else(|| "无法读取文件名".to_owned())?.to_owned();
+            let size = crate::files::file_size(&source).map_err(|_| "无法读取图片：请确认它是本地普通文件".to_owned())?;
+            if size == 0 { return Err("暂不支持空文件".to_owned()); }
+            if size > crate::protocol::MAX_FILE_BYTES { return Err("图片超过 512 MiB 限制".to_owned()); }
+            let sha256 = crate::files::sha256_file(&source).map_err(|_| "无法计算校验值".to_owned())?;
+            let message = store.lock().map_err(|_| "本地存储不可用".to_owned())?
+                .queue_group_file(&sender, &group_id, &name, size, &sha256, &source, created_at)
+                .map_err(|_| "群不存在或你不是活跃成员".to_owned())?;
+            store.lock().map_err(|_| "本地存储不可用".to_owned())?
+                .attach_image_batch(&message.id, &batch, &caption, created_at)
+                .map_err(|_| "无法保存图片气泡".to_owned())?;
+            messages.push(message);
+        }
+        Ok(messages)
+    }).await.map_err(|_| "图片入队任务异常".to_owned())?
+}
+
+/// Batches of the conversation so the UI can render one bubble per batch.
+#[tauri::command]
+pub fn v1_image_batches(state: tauri::State<'_, AppState>, kind: String, target: String)
+    -> Result<Vec<crate::storage::ImageBatch>, String> {
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    store.list_image_batches(&kind, &target).map_err(|_| "无法读取图片气泡信息".to_owned())
+}
+
 #[tauri::command]
 pub async fn v1_queue_group_file(state: tauri::State<'_, AppState>, group_id: String, path: String)
     -> Result<crate::storage::GroupMessage, String> {
