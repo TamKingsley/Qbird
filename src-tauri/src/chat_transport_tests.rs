@@ -262,7 +262,7 @@ fn group_message_reaches_member_and_clears_that_members_outbox_row() {
     let alice_id = alice.identity.fingerprint();
     let bob_id = bob.identity.fingerprint();
     let group = alice.store.lock().unwrap().create_group(&alice_id, "Team", &[bob_id.clone()], 1).unwrap();
-    let message = alice.store.lock().unwrap().queue_group(&alice_id, &group.id, "hello group", 2).unwrap();
+    let message = alice.store.lock().unwrap().queue_group(&alice_id, &group.id, "hello group", None, &[], 2).unwrap();
     assert_eq!(message.pending, 1);
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();

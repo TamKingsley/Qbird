@@ -466,6 +466,9 @@ app.addEventListener('input', (event) => {
   if (target.id === 'direct-address') { direct.addressDraft(target.value); return; }
   if (target.id === 'probe-port') probePort = target.value;
   if (target.id === 'probe-address') { manualAddress = target.value; remoteFingerprint = ''; observedAddress = ''; paintDiscovery(); }
+  if (target.id === 'group-search-query') { groupChat.searchDraft('query', target.value); return; }
+  if (target.id === 'group-search-member') { groupChat.searchDraft('member', target.value); return; }
+  if (target.id === 'group-search-category') { groupChat.searchDraft('category', target.value); return; }
 });
 app.addEventListener('keydown', (event) => {
   if (event.target instanceof HTMLTextAreaElement && event.target.id === 'direct-input' && event.key === 'Enter' && !event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey && !event.isComposing) {
@@ -477,6 +480,12 @@ app.addEventListener('keydown', (event) => {
   if (event.target instanceof HTMLTextAreaElement && event.target.id === 'self-input' && event.key === 'Enter' && !event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey && !event.isComposing) {
     event.preventDefault(); void sendSelf();
   }
+});
+app.addEventListener('change', (event) => {
+  const target = event.target;
+  if (!(target instanceof HTMLSelectElement)) return;
+  if (target.id === 'group-search-member') groupChat.searchDraft('member', target.value);
+  if (target.id === 'group-search-category') groupChat.searchDraft('category', target.value);
 });
 app.addEventListener('click', (event) => {
   const target = event.target;
@@ -520,6 +529,15 @@ app.addEventListener('click', (event) => {
   if (action?.dataset.action === 'select-outbound' && remoteFingerprint) { selectFingerprint(remoteFingerprint); return; }
   if (action?.dataset.action === 'select-inbound' && action.dataset.fingerprint) { selectFingerprint(action.dataset.fingerprint); return; }
   if (action?.dataset.action === 'confirm-contact') { void confirmContact(); return; }
+  if (action?.dataset.action === 'toggle-group-search') { groupChat.toggleSearch(); return; }
+  if (action?.dataset.action === 'group-search-close') { groupChat.closeSearch(); return; }
+  if (action?.dataset.action === 'group-search-run') { void groupChat.runSearch(); return; }
+  if (action?.dataset.action === 'group-reply' && action.dataset.id) { groupChat.quote(action.dataset.id); return; }
+  if (action?.dataset.action === 'group-cancel-reply') { groupChat.cancelQuote(); return; }
+  if (action?.dataset.action === 'group-jump' && action.dataset.id) { void groupChat.jumpTo(action.dataset.id); return; }
+  if (action?.dataset.action === 'group-mention' && action.dataset.member) { groupChat.selectMention(action.dataset.member); return; }
+  if (action?.dataset.action === 'group-transfer-owner' && action.dataset.member) { void groupChat.transferOwner(action.dataset.member); return; }
+  if (action?.dataset.action === 'group-dissolve') { void groupChat.dissolve(); return; }
   const nav = target.closest<HTMLButtonElement>('button[data-page]');
   if (nav?.dataset.page && nav.dataset.page in pages) {
     page = nav.dataset.page as Page;

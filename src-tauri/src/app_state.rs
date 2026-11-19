@@ -351,12 +351,47 @@ pub fn v1_hide_group(state: tauri::State<'_, AppState>, group_id: String) -> Res
 }
 
 #[tauri::command]
-pub fn v1_queue_group(state: tauri::State<'_, AppState>, group_id: String, body: String) -> Result<crate::storage::GroupMessage, String> {
+pub fn v1_queue_group(state: tauri::State<'_, AppState>, group_id: String, body: String,
+    reply_to: Option<String>, mentions: Option<Vec<String>>) -> Result<crate::storage::GroupMessage, String> {
     let sender = state.identity.fingerprint();
     let created_at = unix_now()?;
+    let mentions = mentions.unwrap_or_default();
     state.store.lock().map_err(|_| "本地存储不可用".to_owned())?
-        .queue_group(&sender, &group_id, &body, created_at)
-        .map_err(|_| "消息为空、过长或已不在该群中".to_owned())
+        .queue_group(&sender, &group_id, &body, reply_to.as_deref(), &mentions, created_at)
+        .map_err(|_| "消息为空、过长、引用的消息不存在或已不在该群中".to_owned())
+}
+
+#[tauri::command]
+pub fn v1_transfer_group_owner(state: tauri::State<'_, AppState>, group_id: String, member: String) -> Result<(), String> {
+    let actor = state.identity.fingerprint();
+    let now = unix_now()?;
+    let transferred = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?
+        .transfer_group_owner(&group_id, &actor, &member, now).map_err(|_| "无法转让群主".to_owned())?;
+    if transferred { Ok(()) } else { Err("只有群主可以把群主转让给已确认的群内成员".into()) }
+}
+
+#[tauri::command]
+pub fn v1_dissolve_group(state: tauri::State<'_, AppState>, group_id: String) -> Result<(), String> {
+    let actor = state.identity.fingerprint();
+    let now = unix_now()?;
+    let dissolved = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?
+        .dissolve_group(&group_id, &actor, now).map_err(|_| "无法解散群聊".to_owned())?;
+    if dissolved { Ok(()) } else { Err("只有群主可以解散该群".into()) }
+}
+
+#[tauri::command]
+pub fn v1_search_direct(state: tauri::State<'_, AppState>, peer: String, query: String,
+    category: String, limit: u32, offset: u32) -> Result<Vec<crate::storage::DirectMessage>, String> {
+    state.store.lock().map_err(|_| "本地存储不可用".to_owned())?
+        .search_direct(&peer, &query, &category, limit, offset).map_err(|_| "搜索条件无效".to_owned())
+}
+
+#[tauri::command]
+pub fn v1_search_group(state: tauri::State<'_, AppState>, group_id: String, query: String,
+    category: String, member: Option<String>, limit: u32, offset: u32) -> Result<Vec<crate::storage::GroupMessage>, String> {
+    state.store.lock().map_err(|_| "本地存储不可用".to_owned())?
+        .search_group_messages(&group_id, &query, &category, member.as_deref(), limit, offset)
+        .map_err(|_| "搜索条件无效".to_owned())
 }
 
 #[tauri::command]

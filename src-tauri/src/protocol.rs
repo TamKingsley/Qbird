@@ -21,8 +21,20 @@ pub enum Payload {
     FileReject { id: String, reason: String },
     FileComplete { id: String },
     /// One group message. `members` is the sender's local snapshot; receivers accept it
-    /// only from the group owner, so a member cannot rewrite the roster.
-    GroupText { id: String, group_id: String, name: String, owner: String, members: Vec<String>, body: String, created_at: i64, logical: i64 },
+    /// only from the group owner, so a member cannot rewrite the roster. `reply_to`/`reply_preview`
+    /// carry a short quote so the UI can show it before the original is paged in.
+    GroupText {
+        id: String, group_id: String, name: String, owner: String, members: Vec<String>,
+        body: String, created_at: i64, logical: i64,
+        #[serde(default)] reply_to: Option<String>,
+        #[serde(default)] reply_sender: Option<String>,
+        #[serde(default)] reply_preview: Option<String>,
+        #[serde(default)] mentions: Vec<String>,
+    },
+    /// Owner handover, signed by the current owner like a roster update.
+    GroupTransfer { id: String, group_id: String, name: String, owner: String, members: Vec<String> },
+    /// The owner dissolved the group; members keep local history but leave the roster.
+    GroupDissolve { id: String, group_id: String },
     /// Invite or member-list update; carries the same owner-controlled snapshot.
     GroupUpdate { id: String, group_id: String, name: String, owner: String, members: Vec<String> },
     /// The owner removed the receiver from the group.
@@ -81,9 +93,19 @@ fn validate(payload: &Payload) -> io::Result<()> {
         Payload::FileAccept { id, offset } if valid_id(id) && *offset <= MAX_FILE_BYTES => Ok(()),
         Payload::FileReject { id, reason } if valid_id(id) && valid_reject_reason(reason) => Ok(()),
         Payload::FileComplete { id } if valid_id(id) => Ok(()),
-        Payload::GroupText { id, group_id, name, owner, members, body, logical, .. }
+        Payload::GroupText { id, group_id, name, owner, members, body, logical, reply_to, reply_sender, reply_preview, mentions, .. }
             if valid_id(id) && valid_group_id(group_id) && !name.is_empty() && name.len() <= 128
-                && valid_members(owner, members) && !body.is_empty() && body.len() <= MAX_BODY && *logical > 0 => Ok(()),
+                && valid_members(owner, members) && !body.is_empty() && body.len() <= MAX_BODY && *logical > 0
+                && reply_to.as_deref().is_none_or(valid_id)
+                && reply_sender.as_deref().is_none_or(|value| !value.is_empty() && value.chars().count() <= 128 && !value.chars().any(char::is_control))
+                && reply_preview.as_deref().is_none_or(|value| value.chars().count() <= 320)
+                && (reply_to.is_some() == reply_preview.is_some())
+                && mentions.len() <= MAX_GROUP_MEMBERS
+                && mentions.iter().all(|member| members.contains(member)) => Ok(()),
+        Payload::GroupTransfer { id, group_id, name, owner, members }
+            if valid_id(id) && valid_group_id(group_id) && !name.is_empty() && name.len() <= 128
+                && valid_members(owner, members) => Ok(()),
+        Payload::GroupDissolve { id, group_id } if valid_id(id) && valid_group_id(group_id) => Ok(()),
         Payload::GroupUpdate { id, group_id, name, owner, members }
             if valid_id(id) && valid_group_id(group_id) && !name.is_empty() && name.len() <= 128
                 && valid_members(owner, members) => Ok(()),
@@ -218,6 +240,7 @@ mod tests {
         let text = Payload::GroupText {
             id: "m1".into(), group_id: group_id.clone(), name: "Team".into(), owner: owner.clone(),
             members: vec![owner.clone(), member.clone()], body: "hi".into(), created_at: 1, logical: 1,
+            reply_to: None, reply_sender: None, reply_preview: None, mentions: Vec::new(),
         };
         let mut bytes = Vec::new();
         write_frame(&mut bytes, &text).unwrap();
@@ -226,6 +249,7 @@ mod tests {
         let base = |members: Vec<String>| Payload::GroupText {
             id: "m1".into(), group_id: group_id.clone(), name: "Team".into(), owner: owner.clone(),
             members, body: "hi".into(), created_at: 1, logical: 1,
+            reply_to: None, reply_sender: None, reply_preview: None, mentions: Vec::new(),
         };
         // The owner must appear in the member snapshot.
         assert!(write_frame(Vec::new(), &base(vec![member.clone()])).is_err());
@@ -248,5 +272,32 @@ mod tests {
         assert!(write_frame(Vec::new(), &Payload::GroupRemove { id: "r1".into(), group_id: "x".repeat(31) }).is_err());
         assert!(write_frame(Vec::new(), &Payload::GroupLeave { id: "l1".into(), group_id: group_id.clone(), member: member.clone() }).is_ok());
         assert!(write_frame(Vec::new(), &Payload::GroupLeave { id: "l1".into(), group_id, member: "not-a-fingerprint".into() }).is_err());
+
+        // Quotes must pair an id with a preview, and mentions must stay inside the roster.
+        let reply = Payload::GroupText {
+            id: "m2".into(), group_id: "1".repeat(32), name: "Team".into(), owner: owner.clone(),
+            members: vec![owner.clone(), member.clone()], body: "reply".into(), created_at: 2, logical: 2,
+            reply_to: Some("m1".into()), reply_sender: Some("Owner".into()), reply_preview: Some("hi".into()),
+            mentions: vec![member.clone()],
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &reply).unwrap();
+        assert_eq!(read_frame(Cursor::new(&bytes)).unwrap(), reply);
+        let mut missing_preview = reply.clone();
+        if let Payload::GroupText { reply_preview, .. } = &mut missing_preview { *reply_preview = None; }
+        assert!(write_frame(Vec::new(), &missing_preview).is_err());
+        let mut outsider = reply.clone();
+        if let Payload::GroupText { mentions, .. } = &mut outsider { *mentions = vec!["c".repeat(64)]; }
+        assert!(write_frame(Vec::new(), &outsider).is_err());
+
+        let transfer = Payload::GroupTransfer {
+            id: "t1".into(), group_id: "1".repeat(32), name: "Team".into(), owner: member.clone(),
+            members: vec![owner.clone(), member.clone()],
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &transfer).unwrap();
+        assert_eq!(read_frame(Cursor::new(&bytes)).unwrap(), transfer);
+        assert!(write_frame(Vec::new(), &Payload::GroupDissolve { id: "d1".into(), group_id: "short".into() }).is_err());
+        assert!(write_frame(Vec::new(), &Payload::GroupDissolve { id: "d1".into(), group_id: "1".repeat(32) }).is_ok());
     }
 }

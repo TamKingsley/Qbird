@@ -127,9 +127,10 @@ pub fn accept_one(identity: &Identity, store: &Mutex<Store>, socket: TcpStream) 
             Payload::FileOffer { id, name, size, sha256, created_at, logical } => {
                 receive_file(&mut stream, &mut gate, store, &peer, FileOffer { id, name, size, sha256, created_at, logical })?;
             }
-            Payload::GroupText { id, group_id, name, owner, members, body, created_at, logical } => {
+            Payload::GroupText { id, group_id, name, owner, members, body, created_at, logical, reply_to, reply_sender, reply_preview, mentions } => {
                 let result = store.lock().map_err(|_| invalid("store unavailable"))?
-                    .receive_group(&self_id, &peer, &group_id, &name, &owner, &members, &id, &body, created_at, logical, unix_now())?;
+                    .receive_group(&self_id, &peer, &group_id, &name, &owner, &members, &id, &body, created_at, logical,
+                        reply_to.as_deref(), reply_sender.as_deref(), reply_preview.as_deref(), &mentions, unix_now())?;
                 // NotMember is acknowledged so a removed member stops being retried.
                 if !matches!(result, IncomingResult::Inserted | IncomingResult::Duplicate | IncomingResult::NotMember) {
                     return Err(invalid("group message rejected").into());
@@ -159,6 +160,23 @@ pub fn accept_one(identity: &Identity, store: &Mutex<Store>, socket: TcpStream) 
                     .receive_group_control(&self_id, &peer, "leave", &group_id, &payload, unix_now())?;
                 if !matches!(result, IncomingResult::Inserted | IncomingResult::Duplicate | IncomingResult::NotMember) {
                     return Err(invalid("group leave rejected").into());
+                }
+                acknowledge(&mut stream, &mut gate, &id)?;
+            }
+            Payload::GroupTransfer { id, group_id, name, owner, members } => {
+                let payload = serde_json::json!({ "name": name, "owner": owner, "members": members }).to_string();
+                let result = store.lock().map_err(|_| invalid("store unavailable"))?
+                    .receive_group_control(&self_id, &peer, "transfer", &group_id, &payload, unix_now())?;
+                if !matches!(result, IncomingResult::Inserted | IncomingResult::Duplicate | IncomingResult::NotMember) {
+                    return Err(invalid("group transfer rejected").into());
+                }
+                acknowledge(&mut stream, &mut gate, &id)?;
+            }
+            Payload::GroupDissolve { id, group_id } => {
+                let result = store.lock().map_err(|_| invalid("store unavailable"))?
+                    .receive_group_control(&self_id, &peer, "dissolve", &group_id, "{}", unix_now())?;
+                if !matches!(result, IncomingResult::Inserted | IncomingResult::Duplicate | IncomingResult::NotMember) {
+                    return Err(invalid("group dissolve rejected").into());
                 }
                 acknowledge(&mut stream, &mut gate, &id)?;
             }
@@ -282,6 +300,8 @@ pub fn send_group_one(identity: &Identity, store: &Mutex<Store>, member: &str, a
         id: dispatch.message_id.clone(), group_id: dispatch.group_id, name: dispatch.group_name,
         owner: dispatch.owner, members: dispatch.members, body: dispatch.body,
         created_at: dispatch.created_at, logical: dispatch.logical,
+        reply_to: dispatch.reply_to, reply_sender: dispatch.reply_sender,
+        reply_preview: dispatch.reply_preview, mentions: dispatch.mentions,
     };
     gate.outbound(&text)?;
     protocol::write_frame(&mut stream, &text)?;
@@ -307,6 +327,16 @@ pub fn send_control_one(identity: &Identity, store: &Mutex<Store>, target: &str,
                 .iter().filter_map(|v| v.as_str().map(str::to_owned)).collect();
             Payload::GroupUpdate { id: task.id.clone(), group_id: task.group_id.clone(), name, owner, members }
         }
+        "transfer" => {
+            let value: serde_json::Value = serde_json::from_str(&task.payload)?;
+            let name = value.get("name").and_then(|v| v.as_str()).ok_or_else(|| invalid("invalid control payload"))?.to_owned();
+            let owner = value.get("owner").and_then(|v| v.as_str()).ok_or_else(|| invalid("invalid control payload"))?.to_owned();
+            let members: Vec<String> = value.get("members").and_then(|v| v.as_array())
+                .ok_or_else(|| invalid("invalid control payload"))?
+                .iter().filter_map(|v| v.as_str().map(str::to_owned)).collect();
+            Payload::GroupTransfer { id: task.id.clone(), group_id: task.group_id.clone(), name, owner, members }
+        }
+        "dissolve" => Payload::GroupDissolve { id: task.id.clone(), group_id: task.group_id.clone() },
         "remove" => Payload::GroupRemove { id: task.id.clone(), group_id: task.group_id.clone() },
         "leave" => {
             let value: serde_json::Value = serde_json::from_str(&task.payload)?;

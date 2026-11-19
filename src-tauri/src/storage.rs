@@ -3,7 +3,18 @@ use std::path::{Path, PathBuf};
 use rusqlite::{params, Connection, OptionalExtension, Result};
 use serde::Serialize;
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
+
+/// Upper bound for a quoted snippet, kept short so it fits one compose bar.
+pub const REPLY_PREVIEW_MAX: usize = 160;
+
+/// One quoted message as stored alongside a reply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupReply {
+    pub message_id: String,
+    pub sender_name: String,
+    pub preview: String,
+}
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct Contact {
@@ -144,6 +155,12 @@ pub struct GroupMessage {
     pub logical: i64,
     /// Number of members this message is still waiting to reach (0 once delivered to all).
     pub pending: i64,
+    /// The quoted message this one replies to, if any.
+    pub reply_to: Option<String>,
+    pub reply_sender: Option<String>,
+    pub reply_preview: Option<String>,
+    /// Members explicitly mentioned with @; only active members are ever stored.
+    pub mentions: Vec<String>,
 }
 
 /// One member a stored group message still has to be delivered to.
@@ -165,6 +182,10 @@ pub struct GroupDispatch {
     pub body: String,
     pub created_at: i64,
     pub logical: i64,
+    pub reply_to: Option<String>,
+    pub reply_sender: Option<String>,
+    pub reply_preview: Option<String>,
+    pub mentions: Vec<String>,
 }
 
 /// A pending invite, member-list update, removal or leave notice.
@@ -376,6 +397,42 @@ impl Store {
             )?;
             transaction.commit()?;
         }
+        if version < 7 {
+            let transaction = connection.transaction()?;
+            // Replies quote a short local snippet so the UI can show it even before the
+            // original is paged in; mentions are stored as a JSON array of fingerprints.
+            for statement in [
+                "ALTER TABLE group_messages ADD COLUMN reply_to TEXT",
+                "ALTER TABLE group_messages ADD COLUMN reply_sender TEXT",
+                "ALTER TABLE group_messages ADD COLUMN reply_preview TEXT",
+                "ALTER TABLE group_messages ADD COLUMN mentions TEXT NOT NULL DEFAULT '[]'",
+                "ALTER TABLE groups ADD COLUMN active INTEGER NOT NULL DEFAULT 1",
+            ] {
+                if let Err(error) = transaction.execute_batch(statement) {
+                    if !error.to_string().contains("duplicate column name") { return Err(error); }
+                }
+            }
+            // Transfer and dissolve are new control kinds; SQLite cannot alter a CHECK
+            // constraint, so rebuild the table while keeping every pending row.
+            transaction.execute_batch(
+                "CREATE TABLE group_control_v7 (
+                    id TEXT PRIMARY KEY NOT NULL CHECK(length(id) = 32),
+                    group_id TEXT NOT NULL,
+                    target TEXT NOT NULL CHECK(length(target) = 64),
+                    kind TEXT NOT NULL CHECK(kind IN ('invite', 'members', 'remove', 'leave', 'transfer', 'dissolve')),
+                    payload TEXT NOT NULL CHECK(length(payload) <= 65536),
+                    status TEXT NOT NULL CHECK(status IN ('pending', 'delivered')),
+                    created_at INTEGER NOT NULL
+                );
+                INSERT INTO group_control_v7(id, group_id, target, kind, payload, status, created_at)
+                    SELECT id, group_id, target, kind, payload, status, created_at FROM group_control;
+                DROP TABLE group_control;
+                ALTER TABLE group_control_v7 RENAME TO group_control;
+                CREATE INDEX IF NOT EXISTS group_control_pending ON group_control(target, status);
+                PRAGMA user_version = 7;",
+            )?;
+            transaction.commit()?;
+        }
         Ok(Self { connection, data_dir, address_revision: std::cell::Cell::new(0) })
     }
 
@@ -431,6 +488,28 @@ impl Store {
              ORDER BY m.logical DESC, m.sender DESC, m.id DESC LIMIT ?5"
         ))?;
         let rows = statement.query_map(params![peer, before.map(|c| c.logical), before.map(|c| c.sender.as_str()), before.map(|c| c.id.as_str()), limit], map_message)?;
+        rows.collect()
+    }
+
+    /// Substring search within one direct conversation, newest first. Matching is
+    /// case-insensitive for ASCII and works as plain substring matching for Chinese.
+    pub fn search_direct(&self, peer: &str, query: &str, category: &str, limit: u32, offset: u32) -> Result<Vec<DirectMessage>> {
+        if !valid_fingerprint(peer) || !valid_search(&query, category, limit, offset) { return Err(rusqlite::Error::InvalidQuery); }
+        if !matches!(category, "all" | "text" | "file" | "image") { return Err(rusqlite::Error::InvalidQuery); }
+        let pattern = like_pattern(query);
+        let category_filter = match category {
+            "text" => "m.kind = 'text'",
+            "file" => "m.kind = 'file'",
+            "image" => "m.kind = 'file' AND (lower(m.file_name) LIKE '%.png' OR lower(m.file_name) LIKE '%.jpg' OR lower(m.file_name) LIKE '%.jpeg' OR lower(m.file_name) LIKE '%.gif' OR lower(m.file_name) LIKE '%.webp' OR lower(m.file_name) LIKE '%.bmp')",
+            _ => "1 = 1",
+        };
+        let mut statement = self.connection.prepare(&format!(
+            "SELECT {MESSAGE_COLUMNS} FROM direct_messages m LEFT JOIN file_transfers f ON f.message_id = m.id
+             WHERE m.peer = ?1 AND {category_filter}
+               AND (?2 = '' OR m.body LIKE ?3 ESCAPE '\\' OR COALESCE(m.file_name, '') LIKE ?3 ESCAPE '\\')
+             ORDER BY m.logical DESC, m.sender DESC, m.id DESC LIMIT ?4 OFFSET ?5"
+        ))?;
+        let rows = statement.query_map(params![peer, query, pattern, limit, offset], map_message)?;
         rows.collect()
     }
 
@@ -999,6 +1078,71 @@ impl Store {
         Ok(true)
     }
 
+    /// Hands the group over to another active member. Only the current owner may do this,
+    /// and the new owner is announced through an owner-signed roster update.
+    pub fn transfer_group_owner(&self, group_id: &str, actor: &str, new_owner: &str, now: i64) -> Result<bool> {
+        if !valid_group_id(group_id) || !valid_fingerprint(actor) || !valid_fingerprint(new_owner) || actor == new_owner {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        let tx = self.connection.unchecked_transaction()?;
+        let owner: Option<String> = tx.query_row("SELECT owner FROM groups WHERE id = ?1 AND active = 1", [group_id], |row| row.get(0)).optional()?;
+        let Some(owner) = owner else { return Ok(false); };
+        if owner != actor { return Ok(false); }
+        let active: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM group_members WHERE group_id = ?1 AND member = ?2 AND active = 1)",
+            params![group_id, new_owner], |row| row.get(0),
+        )?;
+        let verified: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM contacts WHERE fingerprint = ?1 AND trust_state = 'verified')",
+            [new_owner], |row| row.get(0),
+        )?;
+        if !active || !verified { return Ok(false); }
+        tx.execute("UPDATE groups SET owner = ?2 WHERE id = ?1", params![group_id, new_owner])?;
+        tx.execute(
+            "UPDATE group_members SET role = CASE WHEN member = ?2 THEN 'owner' ELSE 'member' END WHERE group_id = ?1",
+            params![group_id, new_owner])?;
+        let mut statement = tx.prepare("SELECT member FROM group_members WHERE group_id = ?1 AND active = 1 ORDER BY member")?;
+        let roster: Vec<String> = statement.query_map([group_id], |row| row.get(0))?.collect::<Result<Vec<String>>>()?;
+        drop(statement);
+        let name: String = tx.query_row("SELECT name FROM groups WHERE id = ?1", [group_id], |row| row.get(0))?;
+        let payload = serde_json::json!({ "name": name, "owner": new_owner, "members": roster }).to_string();
+        for member in &roster {
+            if member == actor { continue; }
+            tx.execute(
+                "INSERT INTO group_control(id, group_id, target, kind, payload, status, created_at)
+                 VALUES (lower(hex(randomblob(16))), ?1, ?2, 'transfer', ?3, 'pending', ?4)",
+                params![group_id, member, payload, now])?;
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Dissolves a group: every member is notified, local membership ends and undelivered
+    /// messages/cancelled notices are dropped, while history stays readable on this device.
+    pub fn dissolve_group(&self, group_id: &str, actor: &str, now: i64) -> Result<bool> {
+        if !valid_group_id(group_id) || !valid_fingerprint(actor) { return Err(rusqlite::Error::InvalidQuery); }
+        let tx = self.connection.unchecked_transaction()?;
+        let owner: Option<String> = tx.query_row("SELECT owner FROM groups WHERE id = ?1 AND active = 1", [group_id], |row| row.get(0)).optional()?;
+        let Some(owner) = owner else { return Ok(false); };
+        if owner != actor { return Ok(false); }
+        let mut statement = tx.prepare("SELECT member FROM group_members WHERE group_id = ?1 AND active = 1 ORDER BY member")?;
+        let roster: Vec<String> = statement.query_map([group_id], |row| row.get(0))?.collect::<Result<Vec<String>>>()?;
+        drop(statement);
+        for member in &roster {
+            if member == actor { continue; }
+            tx.execute(
+                "INSERT INTO group_control(id, group_id, target, kind, payload, status, created_at)
+                 VALUES (lower(hex(randomblob(16))), ?1, ?2, 'dissolve', '{}', 'pending', ?3)",
+                params![group_id, member, now])?;
+        }
+        tx.execute("UPDATE groups SET active = 0 WHERE id = ?1", [group_id])?;
+        tx.execute("UPDATE group_members SET active = 0, hidden = 1 WHERE group_id = ?1", [group_id])?;
+        tx.execute("DELETE FROM group_outbox WHERE group_id = ?1 AND status = 'pending'", [group_id])?;
+        tx.execute("DELETE FROM group_control WHERE group_id = ?1 AND kind != 'dissolve' AND status = 'pending'", [group_id])?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     pub fn open_group(&self, group_id: &str, self_id: &str) -> Result<bool> {
         if !valid_group_id(group_id) || !valid_fingerprint(self_id) { return Err(rusqlite::Error::InvalidQuery); }
         Ok(self.connection.execute(
@@ -1023,7 +1167,7 @@ impl Store {
                 COALESCE((SELECT m.logical FROM group_messages m WHERE m.group_id = g.id
                           ORDER BY m.logical DESC, m.sender DESC, m.id DESC LIMIT 1), 0)
              FROM groups g JOIN group_members gm ON gm.group_id = g.id
-             WHERE gm.member = ?1 AND gm.active = 1
+             WHERE gm.member = ?1 AND gm.active = 1 AND g.active = 1
              ORDER BY 7 DESC, g.id"
         )?;
         let rows = statement.query_map([self_id], |row| {
@@ -1052,16 +1196,49 @@ impl Store {
     }
 
     /// Stores a group message and queues one delivery row per other active member.
-    pub fn queue_group(&self, sender: &str, group_id: &str, body: &str, created_at: i64) -> Result<GroupMessage> {
+    /// Stores a group message with an optional quote and @ mentions, then queues one
+    /// delivery row per other active member. The quote is a short local snippet so the
+    /// UI never has to fetch the original before showing the reply.
+    pub fn queue_group(&self, sender: &str, group_id: &str, body: &str, reply_to: Option<&str>,
+        mentions: &[String], created_at: i64) -> Result<GroupMessage> {
         if !valid_fingerprint(sender) || !valid_group_id(group_id) || body.trim().is_empty() || body.len() > 32768 {
             return Err(rusqlite::Error::InvalidQuery);
         }
+        if let Some(id) = reply_to {
+            if !valid_message_id(id) || id.len() > 128 { return Err(rusqlite::Error::InvalidQuery); }
+        }
+        if mentions.len() > 256 { return Err(rusqlite::Error::InvalidQuery); }
         let tx = self.connection.unchecked_transaction()?;
         let active: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM group_members WHERE group_id = ?1 AND member = ?2 AND active = 1)",
             params![group_id, sender], |row| row.get(0),
         )?;
         if !active { return Err(rusqlite::Error::InvalidQuery); }
+        let mut unique_mentions = Vec::new();
+        for member in mentions {
+            if !valid_fingerprint(member) || unique_mentions.contains(member) { return Err(rusqlite::Error::InvalidQuery); }
+            let member_active: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM group_members WHERE group_id = ?1 AND member = ?2 AND active = 1)",
+                params![group_id, member], |row| row.get(0),
+            )?;
+            if !member_active { return Err(rusqlite::Error::InvalidQuery); }
+            unique_mentions.push(member.clone());
+        }
+        let (reply_sender, reply_preview) = match reply_to {
+            Some(id) => {
+                let quoted: Option<(String, String)> = tx.query_row(
+                    "SELECT sender, body FROM group_messages WHERE id = ?1 AND group_id = ?2",
+                    params![id, group_id], |row| Ok((row.get(0)?, row.get(1)?)),
+                ).optional()?;
+                let Some((quoted_sender, quoted_body)) = quoted else { return Err(rusqlite::Error::InvalidQuery); };
+                let quote_name: String = tx.query_row(
+                    "SELECT COALESCE(display_name, substr(?1, 1, 8)) FROM contacts WHERE fingerprint = ?1",
+                    [&quoted_sender], |row| row.get(0),
+                ).unwrap_or_else(|_| quoted_sender[..8.min(quoted_sender.len())].to_owned());
+                (Some(quote_name), Some(quote_preview(&quoted_body)))
+            }
+            None => (None, None),
+        };
         if tx.execute("UPDATE logical_clock SET value = value + 1 WHERE singleton = 1 AND value < 9223372036854775807", [])? != 1 {
             return Err(rusqlite::Error::InvalidQuery);
         }
@@ -1075,8 +1252,11 @@ impl Store {
                 UNION ALL SELECT 1 FROM group_messages WHERE id = ?1)", [&id], |row| row.get(0),
         )?;
         if collision { return Err(rusqlite::Error::InvalidQuery); }
-        tx.execute("INSERT INTO group_messages(id, group_id, sender, body, created_at, logical) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![id, group_id, sender, body, created_at, logical])?;
+        tx.execute(
+            "INSERT INTO group_messages(id, group_id, sender, body, created_at, logical, reply_to, reply_sender, reply_preview, mentions)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![id, group_id, sender, body, created_at, logical, reply_to, reply_sender, reply_preview,
+                serde_json::to_string(&unique_mentions).unwrap_or_else(|_| "[]".to_owned())])?;
         tx.execute("UPDATE group_members SET hidden = 0 WHERE group_id = ?1 AND member = ?2", params![group_id, sender])?;
         let pending = tx.execute(
             "INSERT INTO group_outbox(message_id, group_id, member, status)
@@ -1091,6 +1271,8 @@ impl Store {
         Ok(GroupMessage {
             id, group_id: group_id.into(), sender: sender.into(), sender_name,
             body: body.into(), created_at, logical, pending,
+            reply_to: reply_to.map(str::to_owned), reply_sender, reply_preview,
+            mentions: unique_mentions,
         })
     }
 
@@ -1102,15 +1284,38 @@ impl Store {
         }
         let mut statement = self.connection.prepare(
             "SELECT m.id, m.group_id, m.sender, COALESCE(c.display_name, substr(m.sender, 1, 8)), m.body, m.created_at, m.logical,
-                (SELECT count(*) FROM group_outbox o WHERE o.message_id = m.id AND o.status = 'pending')
+                (SELECT count(*) FROM group_outbox o WHERE o.message_id = m.id AND o.status = 'pending'),
+                m.reply_to, m.reply_sender, m.reply_preview, m.mentions
              FROM group_messages m LEFT JOIN contacts c ON c.fingerprint = m.sender
              WHERE m.group_id = ?1 AND (?2 IS NULL OR (m.logical, m.sender, m.id) < (?2, ?3, ?4))
              ORDER BY m.logical DESC, m.sender DESC, m.id DESC LIMIT ?5"
         )?;
-        let rows = statement.query_map(params![group_id, before.map(|c| c.logical), before.map(|c| c.sender.as_str()), before.map(|c| c.id.as_str()), limit], |row| Ok(GroupMessage {
-            id: row.get(0)?, group_id: row.get(1)?, sender: row.get(2)?, sender_name: row.get(3)?,
-            body: row.get(4)?, created_at: row.get(5)?, logical: row.get(6)?, pending: row.get(7)?,
-        }))?;
+        let rows = statement.query_map(params![group_id, before.map(|c| c.logical), before.map(|c| c.sender.as_str()), before.map(|c| c.id.as_str()), limit],
+            group_message_row)?;
+        rows.collect()
+    }
+
+    /// Substring search within one group, newest first. Category `file`/`image` is
+    /// reserved for group files and returns nothing until those exist.
+    pub fn search_group_messages(&self, group_id: &str, query: &str, category: &str,
+        member: Option<&str>, limit: u32, offset: u32) -> Result<Vec<GroupMessage>> {
+        if !valid_group_id(group_id) || !valid_search(&query, category, limit, offset)
+            || member.is_some_and(|value| !valid_fingerprint(value)) {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        if !matches!(category, "all" | "text") { return Ok(Vec::new()); }
+        let pattern = like_pattern(query);
+        let mut statement = self.connection.prepare(
+            "SELECT m.id, m.group_id, m.sender, COALESCE(c.display_name, substr(m.sender, 1, 8)), m.body, m.created_at, m.logical,
+                0, m.reply_to, m.reply_sender, m.reply_preview, m.mentions
+             FROM group_messages m LEFT JOIN contacts c ON c.fingerprint = m.sender
+             WHERE m.group_id = ?1
+               AND (?2 = '' OR m.body LIKE ?3 ESCAPE '\\')
+               AND (?4 IS NULL OR m.sender = ?4)
+             ORDER BY m.logical DESC, m.sender DESC, m.id DESC LIMIT ?5 OFFSET ?6"
+        )?;
+        let rows = statement.query_map(
+            params![group_id, query, pattern, member, limit, offset], group_message_row)?;
         rows.collect()
     }
 
@@ -1141,28 +1346,41 @@ impl Store {
     /// Snapshot of a group message plus the member list used when sending it.
     pub fn group_dispatch(&self, message_id: &str) -> Result<Option<GroupDispatch>> {
         if message_id.is_empty() || message_id.len() > 128 { return Err(rusqlite::Error::InvalidQuery); }
-        let found: Option<(String, String, String, String, String, i64, i64)> = self.connection.query_row(
-            "SELECT m.id, m.group_id, g.name, g.owner, m.body, m.created_at, m.logical
+        let found: Option<(String, String, String, String, String, i64, i64, Option<String>, Option<String>, Option<String>, String)> = self.connection.query_row(
+            "SELECT m.id, m.group_id, g.name, g.owner, m.body, m.created_at, m.logical,
+                m.reply_to, m.reply_sender, m.reply_preview, m.mentions
              FROM group_messages m JOIN groups g ON g.id = m.group_id WHERE m.id = ?1", [message_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?,
+                row.get(7)?, row.get(8)?, row.get(9)?, row.get(10)?)),
         ).optional()?;
-        let Some((message_id, group_id, group_name, owner, body, created_at, logical)) = found else { return Ok(None); };
+        let Some((message_id, group_id, group_name, owner, body, created_at, logical, reply_to, reply_sender, reply_preview, mentions)) = found else { return Ok(None); };
         let mut statement = self.connection.prepare(
             "SELECT member FROM group_members WHERE group_id = ?1 AND active = 1 ORDER BY member")?;
         let rows = statement.query_map([&group_id], |row| row.get(0))?;
         let members: Vec<String> = rows.collect::<Result<Vec<String>>>()?;
-        Ok(Some(GroupDispatch { message_id, group_id, group_name, owner, members, body, created_at, logical }))
+        Ok(Some(GroupDispatch { message_id, group_id, group_name, owner, members, body, created_at, logical,
+            reply_to, reply_sender, reply_preview, mentions: parse_mentions(&mentions) }))
     }
 
     /// Applies one inbound group text. The member snapshot is only trusted from the owner;
     /// other members may create the group for us but cannot rewrite its member list.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn receive_group(&self, self_id: &str, peer: &str, group_id: &str, name: &str, owner: &str,
-        members: &[String], id: &str, body: &str, created_at: i64, logical: i64, now: i64) -> Result<IncomingResult> {
+        members: &[String], id: &str, body: &str, created_at: i64, logical: i64,
+        reply_to: Option<&str>, reply_sender: Option<&str>, reply_preview: Option<&str>,
+        mentions: &[String], now: i64) -> Result<IncomingResult> {
         if !valid_fingerprint(self_id) || !valid_fingerprint(peer) || !valid_fingerprint(owner) || !valid_group_id(group_id)
             || name.is_empty() || name.len() > 128 || id.is_empty() || id.len() > 128
             || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
             || body.is_empty() || body.len() > 32768 || logical <= 0 || logical == i64::MAX {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        if reply_to.is_some_and(|value| !valid_message_id(value) || value.len() > 128)
+            || reply_sender.is_some_and(|value| value.is_empty() || value.chars().count() > 128 || value.chars().any(char::is_control))
+            || reply_preview.is_some_and(|value| value.chars().count() > REPLY_PREVIEW_MAX * 2)
+            || (reply_to.is_some() != reply_preview.is_some())
+            || mentions.len() > 256 {
             return Err(rusqlite::Error::InvalidQuery);
         }
         let mut roster = std::collections::BTreeSet::new();
@@ -1170,6 +1388,13 @@ impl Store {
             if !valid_fingerprint(member) || !roster.insert(member.as_str()) { return Err(rusqlite::Error::InvalidQuery); }
         }
         if roster.len() > 256 || !roster.contains(owner) { return Err(rusqlite::Error::InvalidQuery); }
+        let mut unique_mentions: Vec<String> = Vec::new();
+        for member in mentions {
+            if !valid_fingerprint(member) || !roster.contains(member.as_str()) || unique_mentions.contains(member) {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            unique_mentions.push(member.clone());
+        }
         let tx = self.connection.unchecked_transaction()?;
         let verified: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM contacts WHERE fingerprint = ?1 AND trust_state = 'verified')",
@@ -1226,14 +1451,15 @@ impl Store {
             params![group_id, peer], |row| row.get(0),
         )?;
         if !sender_active { return Ok(IncomingResult::NotMember); }
-        let existing: Option<(String, String, String, i64, i64)> = tx.query_row(
-            "SELECT group_id, sender, body, created_at, logical FROM group_messages WHERE id = ?1", [id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        let existing: Option<(String, String, String, i64, i64, Option<String>, String)> = tx.query_row(
+            "SELECT group_id, sender, body, created_at, logical, reply_to, mentions FROM group_messages WHERE id = ?1", [id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
         ).optional()?;
-        if let Some((old_group, sender, old_body, time, old_logical)) = existing {
-            return Ok(if old_group == group_id && sender == peer && old_body == body && time == created_at && old_logical == logical {
-                IncomingResult::Duplicate
-            } else { IncomingResult::IdConflict });
+        if let Some((old_group, sender, old_body, time, old_logical, old_reply, old_mentions)) = existing {
+            let same = old_group == group_id && sender == peer && old_body == body && time == created_at
+                && old_logical == logical && old_reply.as_deref() == reply_to
+                && parse_mentions(&old_mentions) == unique_mentions;
+            return Ok(if same { IncomingResult::Duplicate } else { IncomingResult::IdConflict });
         }
         let collision: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM local_messages WHERE id = ?1
@@ -1243,8 +1469,11 @@ impl Store {
         if tx.execute("UPDATE logical_clock SET value = max(value, ?1) + 1 WHERE singleton = 1 AND value < 9223372036854775807", [logical])? != 1 {
             return Err(rusqlite::Error::InvalidQuery);
         }
-        tx.execute("INSERT INTO group_messages(id, group_id, sender, body, created_at, logical) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![id, group_id, peer, body, created_at, logical])?;
+        tx.execute(
+            "INSERT INTO group_messages(id, group_id, sender, body, created_at, logical, reply_to, reply_sender, reply_preview, mentions)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![id, group_id, peer, body, created_at, logical, reply_to, reply_sender, reply_preview,
+                serde_json::to_string(&unique_mentions).unwrap_or_else(|_| "[]".to_owned())])?;
         tx.execute("UPDATE group_members SET hidden = 0 WHERE group_id = ?1 AND member = ?2", params![group_id, self_id])?;
         tx.commit()?;
         Ok(IncomingResult::Inserted)
@@ -1347,6 +1576,58 @@ impl Store {
                 tx.commit()?;
                 Ok(IncomingResult::Inserted)
             }
+            "transfer" => {
+                // Only the current owner may hand the group over, and the new owner must
+                // be part of the announced roster, including us if we are to stay.
+                let current: Option<String> = tx.query_row("SELECT owner FROM groups WHERE id = ?1 AND active = 1", [group_id], |row| row.get(0)).optional()?;
+                let Some(current) = current else { return Ok(IncomingResult::NotMember); };
+                if current != peer { return Ok(IncomingResult::Unverified); }
+                let value: serde_json::Value = serde_json::from_str(payload).map_err(|_| rusqlite::Error::InvalidQuery)?;
+                let owner = value.get("owner").and_then(|v| v.as_str()).ok_or(rusqlite::Error::InvalidQuery)?;
+                let name = value.get("name").and_then(|v| v.as_str()).ok_or(rusqlite::Error::InvalidQuery)?;
+                let members: Vec<String> = value.get("members").and_then(|v| v.as_array())
+                    .ok_or(rusqlite::Error::InvalidQuery)?
+                    .iter().filter_map(|v| v.as_str().map(str::to_owned)).collect();
+                if !valid_fingerprint(owner) || owner == peer || name.is_empty() || name.len() > 128
+                    || members.len() > 256 || !members.iter().all(|m| valid_fingerprint(m))
+                    || !members.iter().any(|m| m == owner) || !members.iter().any(|m| m == self_id) {
+                    return Err(rusqlite::Error::InvalidQuery);
+                }
+                tx.execute("UPDATE groups SET name = ?2, owner = ?3 WHERE id = ?1",
+                    params![group_id, name, owner])?;
+                let previous: Vec<String> = {
+                    let mut statement = tx.prepare("SELECT member FROM group_members WHERE group_id = ?1")?;
+                    let rows = statement.query_map([group_id], |row| row.get(0))?;
+                    rows.collect::<Result<Vec<String>>>()?
+                };
+                for member in &members {
+                    let role = if member == owner { "owner" } else { "member" };
+                    tx.execute(
+                        "INSERT INTO group_members(group_id, member, role, joined_at, active, hidden) VALUES (?1, ?2, ?3, ?4, 1, 0)
+                         ON CONFLICT(group_id, member) DO UPDATE SET active = 1, role = excluded.role",
+                        params![group_id, member, role, now])?;
+                }
+                for member in previous {
+                    if !members.contains(&member) {
+                        tx.execute("UPDATE group_members SET active = 0 WHERE group_id = ?1 AND member = ?2",
+                            params![group_id, member])?;
+                        tx.execute("DELETE FROM group_outbox WHERE group_id = ?1 AND member = ?2 AND status = 'pending'",
+                            params![group_id, member])?;
+                    }
+                }
+                tx.commit()?;
+                Ok(IncomingResult::Inserted)
+            }
+            "dissolve" => {
+                let current: Option<String> = tx.query_row("SELECT owner FROM groups WHERE id = ?1 AND active = 1", [group_id], |row| row.get(0)).optional()?;
+                let Some(current) = current else { return Ok(IncomingResult::NotMember); };
+                if current != peer { return Ok(IncomingResult::Unverified); }
+                tx.execute("UPDATE groups SET active = 0 WHERE id = ?1", [group_id])?;
+                tx.execute("UPDATE group_members SET active = 0, hidden = 1 WHERE group_id = ?1", [group_id])?;
+                tx.execute("DELETE FROM group_outbox WHERE group_id = ?1 AND status = 'pending'", [group_id])?;
+                tx.commit()?;
+                Ok(IncomingResult::Inserted)
+            }
             _ => Err(rusqlite::Error::InvalidQuery),
         }
     }
@@ -1408,6 +1689,45 @@ impl Store {
             params![id, peer, body, created_at],
         )? == 1)
     }
+}
+
+fn group_message_row(row: &rusqlite::Row<'_>) -> Result<GroupMessage> {
+    Ok(GroupMessage {
+        id: row.get(0)?, group_id: row.get(1)?, sender: row.get(2)?, sender_name: row.get(3)?,
+        body: row.get(4)?, created_at: row.get(5)?, logical: row.get(6)?, pending: row.get(7)?,
+        reply_to: row.get(8)?, reply_sender: row.get(9)?, reply_preview: row.get(10)?,
+        mentions: parse_mentions(&row.get::<_, String>(11)?),
+    })
+}
+
+/// One-line quote snippet: whitespace collapsed, trimmed and cut on a character boundary.
+fn quote_preview(body: &str) -> String {
+    let collapsed = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut preview: String = collapsed.chars().take(REPLY_PREVIEW_MAX).collect();
+    if collapsed.chars().count() > REPLY_PREVIEW_MAX { preview.push('…'); }
+    preview
+}
+
+fn parse_mentions(value: &str) -> Vec<String> {
+    serde_json::from_str::<Vec<String>>(value).unwrap_or_default()
+}
+
+/// LIKE pattern with the escape character protected, so `%` and `_` stay literal.
+fn like_pattern(query: &str) -> String {
+    let mut escaped = String::with_capacity(query.len() + 2);
+    escaped.push('%');
+    for character in query.chars() {
+        if matches!(character, '\\' | '%' | '_') { escaped.push('\\'); }
+        escaped.push(character);
+    }
+    escaped.push('%');
+    escaped
+}
+
+fn valid_search(query: &str, category: &str, limit: u32, offset: u32) -> bool {
+    matches!(category, "all" | "text" | "file" | "image")
+        && limit > 0 && limit <= 200 && offset <= 100_000
+        && query.chars().count() <= 200 && !query.chars().any(char::is_control)
 }
 
 fn map_message(row: &rusqlite::Row<'_>) -> Result<DirectMessage> {
@@ -1985,7 +2305,7 @@ mod tests {
         let group = store.create_group(&me, "Team", &[bob.clone(), carol.clone()], 1).unwrap();
         store.set_contact_address(&bob, "127.0.0.1:1").unwrap();
         store.set_contact_address(&carol, "127.0.0.1:2").unwrap();
-        let message = store.queue_group(&me, &group.id, "hello", 20).unwrap();
+        let message = store.queue_group(&me, &group.id, "hello", None, &[], 20).unwrap();
         assert_eq!(message.pending, 2);
         assert_eq!(store.list_group_messages(&group.id, 10, None).unwrap()[0].pending, 2);
         let dispatch = store.group_dispatch(&message.id).unwrap().unwrap();
@@ -2000,7 +2320,7 @@ mod tests {
         assert_eq!(store.next_pending_group_delivery(None).unwrap(), None);
         assert_eq!(store.list_group_messages(&group.id, 10, None).unwrap()[0].pending, 0);
         // A non-member cannot post into the group.
-        assert!(store.queue_group(&"d".repeat(64), &group.id, "nope", 21).is_err());
+        assert!(store.queue_group(&"d".repeat(64), &group.id, "nope", None, &[], 21).is_err());
     }
 
     #[test]
@@ -2016,32 +2336,32 @@ mod tests {
         }
         let gid = "1".repeat(32);
         assert_eq!(
-            store.receive_group(&me, &owner, &gid, "Team", &owner, &[owner.clone(), me.clone()], "m1", "hi", 1, 5, 100).unwrap(),
+            store.receive_group(&me, &owner, &gid, "Team", &owner, &[owner.clone(), me.clone()], "m1", "hi", 1, 5, None, None, None, &[], 100).unwrap(),
             IncomingResult::Inserted,
         );
         assert_eq!(
-            store.receive_group(&me, &owner, &gid, "Team", &owner, &[owner.clone(), me.clone()], "m1", "hi", 1, 5, 101).unwrap(),
+            store.receive_group(&me, &owner, &gid, "Team", &owner, &[owner.clone(), me.clone()], "m1", "hi", 1, 5, None, None, None, &[], 101).unwrap(),
             IncomingResult::Duplicate,
         );
         assert_eq!(
-            store.receive_group(&me, &owner, &gid, "Team", &owner, &[owner.clone(), me.clone()], "m1", "changed", 1, 5, 102).unwrap(),
+            store.receive_group(&me, &owner, &gid, "Team", &owner, &[owner.clone(), me.clone()], "m1", "changed", 1, 5, None, None, None, &[], 102).unwrap(),
             IncomingResult::IdConflict,
         );
         // Carol is not a member yet: her frame cannot add her to the roster.
         assert_eq!(
-            store.receive_group(&me, &carol, &gid, "Team", &owner, &[owner.clone(), carol.clone(), me.clone()], "m2", "hey", 2, 6, 103).unwrap(),
+            store.receive_group(&me, &carol, &gid, "Team", &owner, &[owner.clone(), carol.clone(), me.clone()], "m2", "hey", 2, 6, None, None, None, &[], 103).unwrap(),
             IncomingResult::NotMember,
         );
         assert!(store.list_group_members(&gid).unwrap().iter().all(|member| member.member != carol));
         // Only the owner can extend the roster.
         assert_eq!(
-            store.receive_group(&me, &owner, &gid, "Team", &owner, &[owner.clone(), carol.clone(), me.clone()], "m3", "join", 3, 7, 104).unwrap(),
+            store.receive_group(&me, &owner, &gid, "Team", &owner, &[owner.clone(), carol.clone(), me.clone()], "m3", "join", 3, 7, None, None, None, &[], 104).unwrap(),
             IncomingResult::Inserted,
         );
         assert_eq!(store.list_group_members(&gid).unwrap().iter().filter(|member| member.active).count(), 3);
         // A roster without us means we were removed.
         assert_eq!(
-            store.receive_group(&me, &owner, &gid, "Team", &owner, &[owner.clone(), carol.clone()], "m4", "bye", 4, 8, 105).unwrap(),
+            store.receive_group(&me, &owner, &gid, "Team", &owner, &[owner.clone(), carol.clone()], "m4", "bye", 4, 8, None, None, None, &[], 105).unwrap(),
             IncomingResult::NotMember,
         );
         assert_eq!(store.list_group_members(&gid).unwrap().iter().filter(|member| member.active).count(), 2);
@@ -2061,7 +2381,7 @@ mod tests {
         let group = store.create_group(&owner, "Team", &[me.clone(), carol.clone()], 1).unwrap();
         store.set_contact_address(&me, "127.0.0.1:1").unwrap();
         store.set_contact_address(&carol, "127.0.0.1:2").unwrap();
-        let message = store.queue_group(&owner, &group.id, "hi", 2).unwrap();
+        let message = store.queue_group(&owner, &group.id, "hi", None, &[], 2).unwrap();
         assert_eq!(message.pending, 2);
         assert!(store.remove_group_member(&group.id, &owner, &me, 3).unwrap());
         assert!(!store.remove_group_member(&group.id, &owner, &me, 3).unwrap());
@@ -2095,10 +2415,132 @@ mod tests {
         assert!(list.iter().any(|conversation| conversation.id == group.id && conversation.kind == "group"));
         assert!(store.hide_group(&group.id, &me).unwrap());
         assert!(!store.list_conversations(&me).unwrap().iter().any(|conversation| conversation.id == group.id));
-        store.queue_group(&me, &group.id, "back", 2).unwrap();
+        store.queue_group(&me, &group.id, "back", None, &[], 2).unwrap();
         assert!(store.list_conversations(&me).unwrap().iter().any(|conversation| conversation.id == group.id));
         assert!(store.open_group(&group.id, &me).unwrap());
         assert!(store.open_group(&group.id, &bob).unwrap());
         assert!(!store.open_group(&group.id, &"d".repeat(64)).unwrap());
     }
+
+    fn group_with_two_members(store: &Store, me: &str) -> (String, String, String) {
+        let bob = "b".repeat(64);
+        let carol = "c".repeat(64);
+        for (peer, name) in [(&bob, "Bob"), (&carol, "Carol")] {
+            store.add_candidate(peer, name).unwrap();
+            store.confirm_candidate(peer).unwrap();
+        }
+        let group = store.create_group(me, "Team", &[bob.clone(), carol.clone()], 1).unwrap();
+        (group.id, bob, carol)
+    }
+
+    #[test]
+    fn group_reply_and_mentions_roundtrip_with_validation() {
+        let store = memory_store();
+        let me = "a".repeat(64);
+        let (group_id, bob, carol) = group_with_two_members(&store, &me);
+        let original = store.queue_group(&me, &group_id, "第一行\n第二行", None, &[], 10).unwrap();
+        let reply = store.queue_group(&me, &group_id, "收到", Some(&original.id), &[bob.clone()], 11).unwrap();
+        assert_eq!(reply.reply_to.as_deref(), Some(original.id.as_str()));
+        // Without a local contact row the quote falls back to the fingerprint prefix.
+        assert_eq!(reply.reply_sender.as_deref(), Some("aaaaaaaa"));
+        assert_eq!(reply.reply_preview.as_deref(), Some("第一行 第二行"));
+        assert_eq!(reply.mentions, vec![bob.clone()]);
+        let listed = store.list_group_messages(&group_id, 10, None).unwrap();
+        let stored = listed.iter().find(|message| message.id == reply.id).unwrap();
+        assert_eq!(stored.reply_preview.as_deref(), Some("第一行 第二行"));
+        assert_eq!(stored.mentions, vec![bob.clone()]);
+        assert_eq!(store.group_dispatch(&reply.id).unwrap().unwrap().mentions, vec![bob]);
+        // Unknown quote, non-member mention and duplicate mentions are rejected.
+        assert!(store.queue_group(&me, &group_id, "x", Some("missing"), &[], 12).is_err());
+        assert!(store.queue_group(&me, &group_id, "x", None, &["d".repeat(64)], 12).is_err());
+        assert!(store.queue_group(&me, &group_id, "x", None, &[carol.clone(), carol.clone()], 12).is_err());
+    }
+
+    #[test]
+    fn group_owner_transfer_and_dissolve_follow_owner_rules() {
+        let store = memory_store();
+        let me = "a".repeat(64);
+        let (group_id, bob, carol) = group_with_two_members(&store, &me);
+        for (peer, port) in [(&bob, "127.0.0.1:1"), (&carol, "127.0.0.1:2")] {
+            store.set_contact_address(peer, port).unwrap();
+        }
+        assert!(!store.transfer_group_owner(&group_id, &bob, &carol, 5).unwrap());
+        assert!(!store.transfer_group_owner(&group_id, &me, &"d".repeat(64), 5).unwrap());
+        assert!(store.transfer_group_owner(&group_id, &me, &bob, 5).unwrap());
+        let members = store.list_group_members(&group_id).unwrap();
+        assert_eq!(members.iter().find(|member| member.member == bob).unwrap().role, "owner");
+        assert_eq!(members.iter().find(|member| member.member == me).unwrap().role, "member");
+        assert!(store.list_groups(&bob).unwrap().iter().any(|group| group.id == group_id && group.is_owner));
+        let mut statement = store.connection.prepare(
+            "SELECT target, kind, payload FROM group_control WHERE group_id = ?1 AND status = 'pending' ORDER BY target").unwrap();
+        let queued: Vec<(String, String, String)> = statement.query_map([&group_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        }).unwrap().collect::<Result<Vec<_>>>().unwrap();
+        assert!(queued.iter().any(|(target, kind, payload)| target == &bob && kind == "transfer" && payload.contains(&bob)));
+        assert!(queued.iter().any(|(target, kind, _)| target == &carol && kind == "transfer"));
+        // The previous owner may no longer dissolve; the new owner can.
+        assert!(!store.dissolve_group(&group_id, &me, 6).unwrap());
+        assert!(store.dissolve_group(&group_id, &bob, 6).unwrap());
+        assert!(store.list_groups(&me).unwrap().is_empty());
+        assert!(store.list_groups(&bob).unwrap().is_empty());
+        assert!(store.queue_group(&me, &group_id, "after", None, &[], 7).is_err());
+    }
+
+    #[test]
+    fn inbound_transfer_and_dissolve_respect_local_owner() {
+        let store = memory_store();
+        let me = "e".repeat(64);
+        let owner = "b".repeat(64);
+        let new_owner = "c".repeat(64);
+        for (peer, name) in [(&owner, "Owner"), (&new_owner, "Next")] {
+            store.add_candidate(peer, name).unwrap();
+            store.confirm_candidate(peer).unwrap();
+        }
+        let group_id = "2".repeat(32);
+        let roster = vec![owner.clone(), new_owner.clone(), me.clone()];
+        assert_eq!(
+            store.receive_group(&me, &owner, &group_id, "Team", &owner, &roster, "g1", "hi", 1, 5, None, None, None, &[], 100).unwrap(),
+            IncomingResult::Inserted);
+        let payload = serde_json::json!({ "name": "Team", "owner": new_owner, "members": roster }).to_string();
+        // A non-owner cannot hand the group over.
+        assert_eq!(store.receive_group_control(&me, &new_owner, "transfer", &group_id, &payload, 101).unwrap(), IncomingResult::Unverified);
+        assert_eq!(store.receive_group_control(&me, &owner, "transfer", &group_id, &payload, 101).unwrap(), IncomingResult::Inserted);
+        assert_eq!(store.list_group_members(&group_id).unwrap().iter().find(|member| member.member == new_owner).unwrap().role, "owner");
+        assert_eq!(store.receive_group_control(&me, &owner, "dissolve", &group_id, "{}", 102).unwrap(), IncomingResult::Unverified);
+        assert_eq!(store.receive_group_control(&me, &new_owner, "dissolve", &group_id, "{}", 102).unwrap(), IncomingResult::Inserted);
+        assert!(store.list_groups(&me).unwrap().is_empty());
+        assert!(!store.open_group(&group_id, &me).unwrap());
+    }
+
+    #[test]
+    fn search_matches_text_files_and_escapes_like_wildcards() {
+        let store = memory_store();
+        let me = "a".repeat(64);
+        let peer = "b".repeat(64);
+        store.add_candidate(&peer, "Bob").unwrap();
+        store.confirm_candidate(&peer).unwrap();
+        store.queue_direct(&me, &peer, "alpha 报告 100% done", 1).unwrap();
+        store.queue_direct(&me, &peer, "plain text", 2).unwrap();
+        let path = std::env::temp_dir().join(format!("qbird-search-{}-{}.pdf", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::write(&path, b"x").unwrap();
+        let hash = crate::files::sha256_file(&path).unwrap();
+        store.queue_direct_file(&me, &peer, "报告.pdf", 1, &hash, &path, 3).unwrap();
+        assert_eq!(store.search_direct(&peer, "报告", "all", 50, 0).unwrap().len(), 2);
+        assert_eq!(store.search_direct(&peer, "报告", "text", 50, 0).unwrap().len(), 1);
+        assert_eq!(store.search_direct(&peer, "报告", "file", 50, 0).unwrap().len(), 1);
+        assert_eq!(store.search_direct(&peer, "报告", "image", 50, 0).unwrap().len(), 0);
+        assert_eq!(store.search_direct(&peer, "100%", "all", 50, 0).unwrap().len(), 1);
+        assert_eq!(store.search_direct(&peer, "100_", "all", 50, 0).unwrap().len(), 0);
+        assert!(store.search_direct(&peer, "x", "unknown", 50, 0).is_err());
+
+        let (group_id, bob, _) = group_with_two_members(&store, &me);
+        store.queue_group(&me, &group_id, "hello 报告", None, &[], 4).unwrap();
+        store.queue_group(&me, &group_id, "second", None, &[], 5).unwrap();
+        assert_eq!(store.search_group_messages(&group_id, "报告", "all", None, 50, 0).unwrap().len(), 1);
+        assert_eq!(store.search_group_messages(&group_id, "", "all", Some(&bob), 50, 0).unwrap().len(), 0);
+        assert_eq!(store.search_group_messages(&group_id, "", "all", None, 50, 0).unwrap().len(), 2);
+        assert!(store.search_group_messages(&group_id, "", "file", None, 50, 0).unwrap().is_empty());
+        crate::files::remove_quietly(&path);
+    }
 }
+
