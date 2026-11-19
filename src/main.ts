@@ -65,6 +65,8 @@ let fileAcceptNotice = '';
 let team = { name: '', has_logo: false };
 let teamLogoUrl: string | null = null;
 let teamNotice = '';
+let chatArchiveNotice = '';
+let chatArchiveBusy = false;
 const COMMON_EMOJIS = ['😀', '😁', '😂', '🤣', '😊', '😍', '😘', '😜', '🤔', '😅', '😭', '😡', '👍', '👎', '👏', '🙏', '💪', '🎉', '❤️', '💔', '🔥', '✨', '⭐', '🌹', '🍀', '☕', '🍰', '🐱', '🐶', '🌙', '☀️', '💡', '✅', '❌', '⚠️', '📌', '📎', '🚀', '🎯', '💬', '🙌', '🤝', '😴', '😎', '🥳', '🤩', '😢', '😤'];
 let stickers: string[] = [];
 let stickersLoaded = false;
@@ -649,6 +651,14 @@ function privacySettingsHtml(): string {
       <div class="probe-row"><button class="outline" data-action="backup-restore-merge" ${backupBusy || !backupPath ? 'disabled' : ''}>合并恢复</button><button class="outline danger" data-action="backup-restore-overwrite" ${backupBusy || !backupPath ? 'disabled' : ''}>覆盖恢复</button></div>
       <p id="backup-notice" role="status">${backupNotice}</p>
       <small>备份不包含身份私钥与附件文件；在新设备恢复会使用新身份，附件需另行拷贝。恢复不会改动本机存储配额。密码丢失后备份无法解密。</small>
+    </div>
+    <div class="probe-box"><h3>聊天记录导入导出</h3>
+      <p>加密导出当前打开会话（单聊、群聊或自聊）的纯文字记录；附件文件不包含在内。</p>
+      <label for="chat-archive-password">聊天记录密码（8–256 字符）</label>
+      <input id="chat-archive-password" type="password" maxlength="256" autocomplete="new-password">
+      <div class="probe-row"><button class="outline" data-action="export-chat-archive" ${chatArchiveBusy ? 'disabled' : ''}>导出当前会话…</button><button class="outline" data-action="import-chat-archive" ${chatArchiveBusy ? 'disabled' : ''}>导入聊天记录…</button></div>
+      <p id="chat-archive-notice" role="status">${chatArchiveNotice}</p>
+      <small>导入只合并文字消息：相同 ID 且内容一致会跳过，内容不同的记录不会被覆盖；单聊需对方已确认，群聊需你仍是成员。密码丢失后文件无法解密。</small>
     </div>`;
 }
 
@@ -767,6 +777,53 @@ async function saveQuota(): Promise<void> {
     storageBusy = false;
     if (page === 'settings') { render(); }
   }
+}
+
+function currentConversation(): { kind: 'direct' | 'group' | 'self'; target: string; name: string } | null {
+  if (groupChat.groupId) return { kind: 'group', target: groupChat.groupId, name: '群聊' };
+  if (direct.peer) return { kind: 'direct', target: direct.peer, name: '单聊' };
+  if (selfOpen) return { kind: 'self', target: 'self', name: '自己' };
+  return null;
+}
+
+async function exportChatArchive(): Promise<void> {
+  if (!isTauri() || chatArchiveBusy) return;
+  const password = app.querySelector<HTMLInputElement>('#chat-archive-password')?.value ?? '';
+  if (password.length < 8) { chatArchiveNotice = '聊天记录密码至少 8 个字符'; render(); return; }
+  const conversation = currentConversation();
+  if (!conversation) { chatArchiveNotice = '请先打开一个单聊、群聊或自聊'; render(); return; }
+  const date = new Date();
+  const stamp = `${date.getFullYear()}${String(date.getMonth() + 1).padStart(2, '0')}${String(date.getDate()).padStart(2, '0')}`;
+  const target = await saveFileDialog({
+    title: '导出加密聊天记录',
+    defaultPath: `qbird-chat-${stamp}.qchat`,
+    filters: [{ name: 'Qbird 聊天记录', extensions: ['qchat'] }],
+  }).catch(() => null);
+  if (!target) return;
+  chatArchiveBusy = true; chatArchiveNotice = '正在导出…'; render();
+  try {
+    const info = await invoke<{ kind: string; name: string; message_count: number }>('v1_export_chat_archive',
+      { kind: conversation.kind, target: conversation.target, password, path: target });
+    chatArchiveNotice = `已导出 ${info.message_count} 条消息（${info.name}），附件未包含。`;
+  } catch (error) { chatArchiveNotice = displayError(error); }
+  finally { chatArchiveBusy = false; if (page === 'settings') render(); }
+}
+
+async function importChatArchive(): Promise<void> {
+  if (!isTauri() || chatArchiveBusy) return;
+  const password = app.querySelector<HTMLInputElement>('#chat-archive-password')?.value ?? '';
+  if (password.length < 8) { chatArchiveNotice = '请输入导出时使用的密码'; render(); return; }
+  const picked = await openFileDialog({ multiple: false, filters: [{ name: 'Qbird 聊天记录', extensions: ['qchat'] }] }).catch(() => null);
+  if (!picked || typeof picked !== 'string') return;
+  chatArchiveBusy = true; chatArchiveNotice = '正在导入…'; render();
+  try {
+    const report = await invoke<{ kind: string; name: string; inserted: number; skipped: number; conflicts: number }>('v1_import_chat_archive',
+      { password, path: picked });
+    chatArchiveNotice = `已导入「${report.name}」：新增 ${report.inserted} 条，跳过重复 ${report.skipped} 条${report.conflicts ? `，冲突 ${report.conflicts} 条（未覆盖）` : ''}。`;
+    if (groupChat.groupId) void groupChat.load(false, true);
+    if (direct.peer) void direct.load(false, true);
+  } catch (error) { chatArchiveNotice = displayError(error); }
+  finally { chatArchiveBusy = false; if (page === 'settings') render(); }
 }
 
 async function exportBackup(): Promise<void> {
@@ -1701,6 +1758,8 @@ app.addEventListener('click', (event) => {
   if (action?.dataset.action === 'add-group-member') { void groupChat.addMember(); return; }
   if (action?.dataset.action === 'remove-group-member' && action.dataset.member) { void groupChat.removeMember(action.dataset.member); return; }
   if (action?.dataset.action === 'create-group') { void createGroup(); return; }
+  if (action?.dataset.action === 'export-chat-archive') { void exportChatArchive(); return; }
+  if (action?.dataset.action === 'import-chat-archive') { void importChatArchive(); return; }
   if (action?.dataset.action === 'save-team-name') { void saveTeamName(); return; }
   if (action?.dataset.action === 'choose-team-logo') { void chooseTeamLogo(); return; }
   if (action?.dataset.action === 'clear-team-logo') { void clearTeamLogo(); return; }

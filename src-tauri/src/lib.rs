@@ -7,6 +7,7 @@ mod auto_address;
 pub mod certificate;
 pub mod capture;
 pub mod chat_transport;
+pub mod chatfile;
 pub mod discovery;
 pub mod files;
 pub mod identity;
@@ -59,6 +60,8 @@ pub fn run() {
             app_state::v1_sticker_path,
             app_state::v1_remove_sticker,
             app_state::v1_set_composer_settings,
+            app_state::v1_export_chat_archive,
+            app_state::v1_import_chat_archive,
             app_state::v1_team_profile,
             app_state::v1_set_team_name,
             app_state::v1_team_logo,

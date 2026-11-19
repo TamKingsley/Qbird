@@ -660,6 +660,31 @@ pub fn v1_avatar(state: tauri::State<'_, AppState>) -> Result<Option<Vec<u8>>, S
 }
 
 /// Replaces the avatar with a cropped square PNG produced by the front end.
+/// Encrypted per-conversation archive; attachments are not included.
+#[tauri::command]
+pub async fn v1_export_chat_archive(state: tauri::State<'_, AppState>, kind: String, target: String, password: String, path: String)
+    -> Result<crate::chatfile::ChatArchiveInfo, String> {
+    let store = Arc::clone(&state.store);
+    let self_id = state.identity.fingerprint();
+    tauri::async_runtime::spawn_blocking(move || {
+        if path.len() > 4096 { return Err("导出路径无效".to_owned()); }
+        let guard = store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+        crate::chatfile::export(&kind, &target, &password, &guard, &self_id, std::path::Path::new(&path))
+    }).await.map_err(|_| "聊天记录导出任务异常".to_owned())?
+}
+
+#[tauri::command]
+pub async fn v1_import_chat_archive(state: tauri::State<'_, AppState>, password: String, path: String)
+    -> Result<crate::storage::ArchiveImportReport, String> {
+    let store = Arc::clone(&state.store);
+    let self_id = state.identity.fingerprint();
+    tauri::async_runtime::spawn_blocking(move || {
+        if path.len() > 4096 { return Err("聊天记录路径无效".to_owned()); }
+        let guard = store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+        crate::chatfile::import(&password, std::path::Path::new(&path), &guard, &self_id)
+    }).await.map_err(|_| "聊天记录导入任务异常".to_owned())?
+}
+
 const TEAM_NAME_KEY: &str = "team_name";
 const TEAM_LOGO_FILE: &str = "team-logo.png";
 

@@ -61,16 +61,16 @@ fn derive_key(password: &str, salt: &[u8]) -> Result<[u8; KEY_LEN], String> {
     Ok(key)
 }
 
-fn aad(iterations: u32, salt: &[u8]) -> Vec<u8> {
-    let mut value = Vec::with_capacity(MAGIC.len() + 5 + salt.len());
-    value.extend_from_slice(MAGIC);
+fn aad(magic: &[u8], iterations: u32, salt: &[u8]) -> Vec<u8> {
+    let mut value = Vec::with_capacity(magic.len() + 5 + salt.len());
+    value.extend_from_slice(magic);
     value.push(FORMAT_VERSION);
     value.extend_from_slice(&iterations.to_be_bytes());
     value.extend_from_slice(salt);
     value
 }
 
-fn encrypt(password: &str, payload: &[u8]) -> Result<Vec<u8>, String> {
+pub(crate) fn encrypt_with(magic: &[u8], password: &str, payload: &[u8]) -> Result<Vec<u8>, String> {
     let rng = SystemRandom::new();
     let mut salt = [0u8; SALT_LEN];
     let mut nonce_bytes = [0u8; NONCE_LEN];
@@ -82,10 +82,10 @@ fn encrypt(password: &str, payload: &[u8]) -> Result<Vec<u8>, String> {
     let key = aead::LessSafeKey::new(unbound);
     let mut buffer = payload.to_vec();
     let nonce = aead::Nonce::assume_unique_for_key(nonce_bytes);
-    key.seal_in_place_append_tag(nonce, aead::Aad::from(aad(ITERATIONS, &salt)), &mut buffer)
+    key.seal_in_place_append_tag(nonce, aead::Aad::from(aad(magic, ITERATIONS, &salt)), &mut buffer)
         .map_err(|_| invalid("加密失败"))?;
-    let mut output = Vec::with_capacity(MAGIC.len() + 1 + 4 + SALT_LEN + NONCE_LEN + buffer.len());
-    output.extend_from_slice(MAGIC);
+    let mut output = Vec::with_capacity(magic.len() + 1 + 4 + SALT_LEN + NONCE_LEN + buffer.len());
+    output.extend_from_slice(magic);
     output.push(FORMAT_VERSION);
     output.extend_from_slice(&ITERATIONS.to_be_bytes());
     output.extend_from_slice(&salt);
@@ -94,19 +94,19 @@ fn encrypt(password: &str, payload: &[u8]) -> Result<Vec<u8>, String> {
     Ok(output)
 }
 
-fn decrypt(password: &str, data: &[u8]) -> Result<Vec<u8>, String> {
-    let header = MAGIC.len() + 1 + 4 + SALT_LEN + NONCE_LEN;
-    if data.len() <= header || data.len() as u64 > MAX_BACKUP {
-        return Err("备份文件不完整或超出大小限制".into());
+pub(crate) fn decrypt_with(magic: &[u8], password: &str, data: &[u8], max: u64) -> Result<Vec<u8>, String> {
+    let header = magic.len() + 1 + 4 + SALT_LEN + NONCE_LEN;
+    if data.len() <= header || data.len() as u64 > max {
+        return Err("文件不完整或超出大小限制".into());
     }
-    if &data[..MAGIC.len()] != MAGIC {
-        return Err("不是 Qbird 备份文件".into());
+    if !data.starts_with(magic) {
+        return Err("不是 Qbird 加密文件".into());
     }
-    let version = data[MAGIC.len()];
+    let version = data[magic.len()];
     if version != FORMAT_VERSION {
         return Err("不支持的备份格式版本".into());
     }
-    let mut cursor = MAGIC.len() + 1;
+    let mut cursor = magic.len() + 1;
     let iterations = u32::from_be_bytes(data[cursor..cursor + 4].try_into().map_err(|_| invalid("备份头损坏"))?);
     cursor += 4;
     if !(10_000..=1_000_000).contains(&iterations) {
@@ -124,9 +124,17 @@ fn decrypt(password: &str, data: &[u8]) -> Result<Vec<u8>, String> {
     let key = aead::LessSafeKey::new(unbound);
     let mut buffer = data[cursor..].to_vec();
     let plaintext = key.open_in_place(aead::Nonce::assume_unique_for_key(nonce_bytes),
-        aead::Aad::from(aad(iterations, salt)), &mut buffer)
-        .map_err(|_| invalid("密码错误或备份已损坏"))?;
+        aead::Aad::from(aad(magic, iterations, salt)), &mut buffer)
+        .map_err(|_| invalid("密码错误或文件已损坏"))?;
     Ok(plaintext.to_vec())
+}
+
+fn encrypt(password: &str, payload: &[u8]) -> Result<Vec<u8>, String> {
+    encrypt_with(MAGIC, password, payload)
+}
+
+fn decrypt(password: &str, data: &[u8]) -> Result<Vec<u8>, String> {
+    decrypt_with(MAGIC, password, data, MAX_BACKUP)
 }
 
 fn build_payload(snapshot: &[u8], include_chat: bool, message_count: u64, created_at: i64) -> (BackupInfo, Vec<u8>) {

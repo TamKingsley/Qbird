@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection, OptionalExtension, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 const SCHEMA_VERSION: i64 = 14;
 
@@ -253,6 +253,34 @@ pub struct FileOfferRequest {
     pub total: i64,
     pub created_at: i64,
     pub status: String,
+}
+
+/// One text message inside a chat archive; attachments stay on the original device.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArchiveMessage {
+    pub id: String,
+    pub sender: String,
+    pub body: String,
+    pub created_at: i64,
+    pub logical: i64,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct ArchiveExport {
+    pub kind: String,
+    pub target: String,
+    pub name: String,
+    pub owner: Option<String>,
+    pub messages: Vec<ArchiveMessage>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct ArchiveImportReport {
+    pub kind: String,
+    pub name: String,
+    pub inserted: u64,
+    pub skipped: u64,
+    pub conflicts: u64,
 }
 
 /// One join application, either received (incoming) or sent by this device.
@@ -2389,6 +2417,151 @@ impl Store {
         Ok(self.connection.execute("UPDATE group_control SET status = 'delivered' WHERE id = ?1 AND status = 'pending'", [id])? == 1)
     }
 
+    /// Reads the text history of one conversation for an encrypted archive export.
+    /// Permissions mirror the UI: only verified direct peers and active groups.
+    pub fn archive_export(&self, kind: &str, target: &str, self_id: &str) -> Result<ArchiveExport> {
+        if !valid_fingerprint(self_id) { return Err(rusqlite::Error::InvalidQuery); }
+        match kind {
+            "self" => {
+                let mut statement = self.connection.prepare(
+                    "SELECT id, sender, body, created_at, logical FROM local_messages
+                     WHERE conversation_id = 'self' ORDER BY logical, sender, id LIMIT 50000")?;
+                let rows = statement.query_map([], row_message)?;
+                let messages = rows.collect::<Result<Vec<_>>>()?;
+                Ok(ArchiveExport { kind: "self".into(), target: "self".into(), name: "自己".into(), owner: None, messages })
+            }
+            "direct" => {
+                if !valid_fingerprint(target) { return Err(rusqlite::Error::InvalidQuery); }
+                let verified: bool = self.connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM contacts WHERE fingerprint = ?1 AND trust_state = 'verified')",
+                    [target], |row| row.get(0))?;
+                if !verified { return Err(rusqlite::Error::InvalidQuery); }
+                let name: String = self.connection.query_row(
+                    "SELECT COALESCE(NULLIF(trim(COALESCE(remark, '')), ''), display_name) FROM contacts WHERE fingerprint = ?1",
+                    [target], |row| row.get(0))?;
+                let mut statement = self.connection.prepare(
+                    "SELECT id, sender, body, created_at, logical FROM direct_messages
+                     WHERE peer = ?1 AND kind = 'text' ORDER BY logical, sender, id LIMIT 50000")?;
+                let rows = statement.query_map([target], row_message)?;
+                let messages = rows.collect::<Result<Vec<_>>>()?;
+                Ok(ArchiveExport { kind: "direct".into(), target: target.into(), name, owner: None, messages })
+            }
+            "group" => {
+                if !valid_group_id(target) { return Err(rusqlite::Error::InvalidQuery); }
+                let info: Option<(String, String)> = self.connection.query_row(
+                    "SELECT g.name, g.owner FROM groups g JOIN group_members m ON m.group_id = g.id
+                     WHERE g.id = ?1 AND m.member = ?2 AND m.active = 1", params![target, self_id],
+                    |row| Ok((row.get(0)?, row.get(1)?))).optional()?;
+                let Some((name, owner)) = info else { return Err(rusqlite::Error::InvalidQuery); };
+                let mut statement = self.connection.prepare(
+                    "SELECT id, sender, body, created_at, logical FROM group_messages
+                     WHERE group_id = ?1 AND kind = 'text' ORDER BY logical, sender, id LIMIT 50000")?;
+                let rows = statement.query_map([target], row_message)?;
+                let messages = rows.collect::<Result<Vec<_>>>()?;
+                Ok(ArchiveExport { kind: "group".into(), target: target.into(), name, owner: Some(owner), messages })
+            }
+            _ => Err(rusqlite::Error::InvalidQuery),
+        }
+    }
+
+    /// Merges archived text messages into the local history. Existing ids are compared
+    /// so identical rows are skipped and different content is reported, never overwritten.
+    pub fn archive_import(&self, kind: &str, target: &str, self_id: &str, messages: &[ArchiveMessage], now: i64) -> Result<ArchiveImportReport> {
+        if !valid_fingerprint(self_id) || messages.len() > 50_000 { return Err(rusqlite::Error::InvalidQuery); }
+        for message in messages {
+            if !valid_message_id(&message.id) || !valid_fingerprint(&message.sender)
+                || message.body.is_empty() || message.body.len() > 32768 || message.logical <= 0 {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+        }
+        let mut report = ArchiveImportReport { kind: kind.to_owned(), name: String::new(), inserted: 0, skipped: 0, conflicts: 0 };
+        let tx = self.connection.unchecked_transaction()?;
+        let mut max_logical: i64 = 0;
+        match kind {
+            "self" => {
+                let exists: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM conversations WHERE id = 'self')", [], |row| row.get(0))?;
+                if !exists { return Err(rusqlite::Error::InvalidQuery); }
+                report.name = "自己".into();
+                for message in messages {
+                    match existing_text(&tx, "local_messages", &message.id)? {
+                        Some(existing) if existing == (message.body.clone(), message.sender.clone(), message.logical) => {
+                            report.skipped += 1; continue;
+                        }
+                        Some(_) => { report.conflicts += 1; continue; }
+                        None => {}
+                    }
+                    tx.execute(
+                        "INSERT INTO local_messages(id, conversation_id, sender, body, created_at, logical)
+                         VALUES (?1, 'self', ?2, ?3, ?4, ?5)",
+                        params![message.id, message.sender, message.body, message.created_at, message.logical])?;
+                    report.inserted += 1;
+                    max_logical = max_logical.max(message.logical);
+                }
+            }
+            "direct" => {
+                if !valid_fingerprint(target) { return Err(rusqlite::Error::InvalidQuery); }
+                let verified: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM contacts WHERE fingerprint = ?1 AND trust_state = 'verified')",
+                    [target], |row| row.get(0))?;
+                if !verified { return Err(rusqlite::Error::InvalidQuery); }
+                report.name = tx.query_row(
+                    "SELECT COALESCE(NULLIF(trim(COALESCE(remark, '')), ''), display_name) FROM contacts WHERE fingerprint = ?1",
+                    [target], |row| row.get(0))?;
+                tx.execute("INSERT INTO direct_conversations(peer, hidden) VALUES (?1, 0) ON CONFLICT(peer) DO NOTHING", [target])?;
+                for message in messages {
+                    match existing_text(&tx, "direct_messages", &message.id)? {
+                        Some(existing) if existing == (message.body.clone(), message.sender.clone(), message.logical) => {
+                            report.skipped += 1; continue;
+                        }
+                        Some(_) => { report.conflicts += 1; continue; }
+                        None => {}
+                    }
+                    let status = if message.sender == self_id { "delivered" } else { "received" };
+                    tx.execute(
+                        "INSERT INTO direct_messages(id, peer, sender, body, created_at, logical, status, kind)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'text')",
+                        params![message.id, target, message.sender, message.body, message.created_at, message.logical, status])?;
+                    report.inserted += 1;
+                    max_logical = max_logical.max(message.logical);
+                }
+            }
+            "group" => {
+                if !valid_group_id(target) { return Err(rusqlite::Error::InvalidQuery); }
+                let info: Option<String> = tx.query_row(
+                    "SELECT g.name FROM groups g JOIN group_members m ON m.group_id = g.id
+                     WHERE g.id = ?1 AND m.member = ?2 AND m.active = 1", params![target, self_id],
+                    |row| row.get(0)).optional()?;
+                let Some(name) = info else { return Err(rusqlite::Error::InvalidQuery); };
+                report.name = name;
+                for message in messages {
+                    match existing_text(&tx, "group_messages", &message.id)? {
+                        Some(existing) if existing == (message.body.clone(), message.sender.clone(), message.logical) => {
+                            report.skipped += 1; continue;
+                        }
+                        Some(_) => { report.conflicts += 1; continue; }
+                        None => {}
+                    }
+                    tx.execute(
+                        "INSERT INTO group_messages(id, group_id, sender, body, created_at, logical, mentions, kind)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, '[]', 'text')",
+                        params![message.id, target, message.sender, message.body, message.created_at, message.logical])?;
+                    report.inserted += 1;
+                    max_logical = max_logical.max(message.logical);
+                }
+                tx.execute("UPDATE group_members SET hidden = 0 WHERE group_id = ?1 AND member = ?2", params![target, self_id])?;
+            }
+            _ => return Err(rusqlite::Error::InvalidQuery),
+        }
+        if max_logical > 0 {
+            tx.execute(
+                "UPDATE logical_clock SET value = ?2 WHERE singleton = 1 AND value < ?2",
+                params![now.min(0), max_logical])?;
+        }
+        tx.commit()?;
+        Ok(report)
+    }
+
     /// Owner-only; `None` removes the avatar. The bytes must be a bounded square PNG.
     pub fn set_group_avatar(&self, actor: &str, group_id: &str, bytes: Option<&[u8]>, now: i64) -> Result<bool> {
         if !valid_fingerprint(actor) || !valid_group_id(group_id) { return Err(rusqlite::Error::InvalidQuery); }
@@ -2835,6 +3008,16 @@ fn quote_preview(body: &str) -> String {
 
 fn parse_mentions(value: &str) -> Vec<String> {
     serde_json::from_str::<Vec<String>>(value).unwrap_or_default()
+}
+
+fn row_message(row: &rusqlite::Row<'_>) -> Result<ArchiveMessage> {
+    Ok(ArchiveMessage { id: row.get(0)?, sender: row.get(1)?, body: row.get(2)?, created_at: row.get(3)?, logical: row.get(4)? })
+}
+
+/// Body/sender/logical of an existing message id, used to detect identical archived rows.
+fn existing_text(tx: &rusqlite::Transaction<'_>, table: &str, id: &str) -> Result<Option<(String, String, i64)>> {
+    let sql = format!("SELECT body, sender, logical FROM {table} WHERE id = ?1");
+    tx.query_row(&sql, [id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).optional()
 }
 
 /// LIKE pattern with the escape character protected, so `%` and `_` stay literal.
