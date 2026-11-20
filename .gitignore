@@ -35,3 +35,9 @@ releases/
 scripts/tmp_patch_*.py
 scripts/build-nsis.bat
 scripts/probe-cl.bat
+.lingxi/
+.tmp-close-test/
+.tmp-crop-test/
+.tmp-shots/
+Tencent/WeType/
+scripts/build-nsis-*.bat

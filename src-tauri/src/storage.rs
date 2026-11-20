@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::{params, Connection, OptionalExtension, Result};
 use serde::{Deserialize, Serialize};
 
-const SCHEMA_VERSION: i64 = 20;
+const SCHEMA_VERSION: i64 = 21;
 /// Upper bound on remembered "do not ask again" senders.
 const MAX_REMEMBERED_SOURCES: usize = 200;
 
@@ -191,6 +191,8 @@ pub struct Conversation {
     pub kind: String,
     /// Incoming messages not yet read in this conversation.
     pub unread: u32,
+    /// Local "do not disturb" flag; the UI shows a dot instead of a count.
+    pub muted: bool,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -1006,6 +1008,24 @@ impl Store {
         Ok(self.connection.execute("UPDATE direct_conversations SET hidden = 1 WHERE peer = ?1 AND hidden = 0", [peer])? == 1)
     }
 
+    /// Toggles "do not disturb" for one direct conversation. Muting never stops the
+    /// unread counter; it only asks the list to show a dot instead of a number.
+    pub fn set_direct_muted(&self, peer: &str, muted: bool) -> Result<bool> {
+        if !valid_fingerprint(peer) { return Err(rusqlite::Error::InvalidQuery); }
+        Ok(self.connection.execute(
+            "UPDATE direct_conversations SET muted = ?2 WHERE peer = ?1", params![peer, i64::from(muted)],
+        )? == 1)
+    }
+
+    /// Marks a conversation unread by hand. The existing count is kept when it is larger,
+    /// and a hidden row is brought back so the mark is visible.
+    pub fn mark_direct_unread(&self, peer: &str) -> Result<bool> {
+        if !valid_fingerprint(peer) { return Err(rusqlite::Error::InvalidQuery); }
+        Ok(self.connection.execute(
+            "UPDATE direct_conversations SET unread = (CASE WHEN unread < 1 THEN 1 ELSE unread END), hidden = 0 WHERE peer = ?1",
+            [peer])? == 1)
+    }
+
     /// A peer may acknowledge only its own outgoing pending messages.
     pub fn ack_direct(&self, peer: &str, id: &str) -> Result<bool> {
         if !valid_fingerprint(peer) || id.is_empty() || id.len() > 128 { return Err(rusqlite::Error::InvalidQuery); }
@@ -1042,6 +1062,15 @@ impl Store {
         Ok(self.connection.execute(
             "UPDATE contacts SET trust_state = 'verified' WHERE fingerprint = ?1 AND trust_state = 'pending'",
             params![fingerprint],
+        )? == 1)
+    }
+
+    /// Removes an inbound pending contact request; verified contacts are never touched.
+    pub fn decline_candidate(&self, fingerprint: &str) -> Result<bool> {
+        if !valid_fingerprint(fingerprint) { return Err(rusqlite::Error::InvalidQuery); }
+        Ok(self.connection.execute(
+            "DELETE FROM contacts WHERE fingerprint = ?1 AND trust_state = 'pending'",
+            [fingerprint],
         )? == 1)
     }
 
@@ -1816,23 +1845,29 @@ impl Store {
         Ok(self.connection.execute("UPDATE conversations SET hidden = 1 WHERE id = 'self' AND hidden = 0", [])? == 1)
     }
 
+    /// The self conversation has no unread counter, but it can still be muted so the row
+    /// looks consistent with the other conversations.
+    pub fn set_self_muted(&self, muted: bool) -> Result<bool> {
+        Ok(self.connection.execute("UPDATE conversations SET muted = ?1 WHERE id = 'self'", [i64::from(muted)])? == 1)
+    }
+
     pub fn list_conversations(&self, self_id: &str) -> Result<Vec<Conversation>> {
         if !valid_fingerprint(self_id) { return Err(rusqlite::Error::InvalidQuery); }
         let mut statement = self.connection.prepare(
-            "SELECT c.id AS id, c.hidden AS hidden, m.body AS body, m.logical AS logical, 'self' AS kind, 0 AS unread FROM conversations c
+            "SELECT c.id AS id, c.hidden AS hidden, m.body AS body, m.logical AS logical, 'self' AS kind, 0 AS unread, c.muted AS muted FROM conversations c
              JOIN local_messages m ON m.id = (
                SELECT id FROM local_messages WHERE conversation_id = c.id
                ORDER BY logical DESC, sender DESC, id DESC LIMIT 1
              ) WHERE c.hidden = 0
              UNION ALL
-             SELECT c.peer AS id, c.hidden AS hidden, m.body AS body, m.logical AS logical, 'direct' AS kind, c.unread AS unread FROM direct_conversations c
+             SELECT c.peer AS id, c.hidden AS hidden, m.body AS body, m.logical AS logical, 'direct' AS kind, c.unread AS unread, c.muted AS muted FROM direct_conversations c
              JOIN direct_messages m ON m.id = (
                SELECT id FROM direct_messages WHERE peer = c.peer
                ORDER BY logical DESC, sender DESC, id DESC LIMIT 1
              ) WHERE c.hidden = 0
              UNION ALL
              SELECT g.id AS id, gm.hidden AS hidden, COALESCE(m.body, '') AS body,
-                    COALESCE(m.logical, 0) AS logical, 'group' AS kind, gm.unread AS unread
+                    COALESCE(m.logical, 0) AS logical, 'group' AS kind, gm.unread AS unread, gm.muted AS muted
              FROM groups g JOIN group_members gm ON gm.group_id = g.id
              LEFT JOIN group_messages m ON m.id = (
                SELECT id FROM group_messages WHERE group_id = g.id
@@ -1842,7 +1877,8 @@ impl Store {
              ORDER BY logical DESC, id"
         )?;
         let rows = statement.query_map([self_id], |row| Ok(Conversation {
-            id: row.get(0)?, hidden: row.get(1)?, last_body: row.get(2)?, last_logical: row.get(3)?, kind: row.get(4)?, unread: row.get(5)?,
+            id: row.get(0)?, hidden: row.get(1)?, last_body: row.get(2)?, last_logical: row.get(3)?, kind: row.get(4)?,
+            unread: row.get(5)?, muted: row.get(6)?,
         }))?;
         rows.collect()
     }
@@ -2114,6 +2150,22 @@ impl Store {
             params![group_id, self_id])? == 1)
     }
 
+    /// Per-member mute flag; other members are unaffected and history stays intact.
+    pub fn set_group_muted(&self, group_id: &str, self_id: &str, muted: bool) -> Result<bool> {
+        if !valid_group_id(group_id) || !valid_fingerprint(self_id) { return Err(rusqlite::Error::InvalidQuery); }
+        Ok(self.connection.execute(
+            "UPDATE group_members SET muted = ?3 WHERE group_id = ?1 AND member = ?2 AND active = 1",
+            params![group_id, self_id, i64::from(muted)])? == 1)
+    }
+
+    pub fn mark_group_unread(&self, group_id: &str, self_id: &str) -> Result<bool> {
+        if !valid_group_id(group_id) || !valid_fingerprint(self_id) { return Err(rusqlite::Error::InvalidQuery); }
+        Ok(self.connection.execute(
+            "UPDATE group_members SET unread = (CASE WHEN unread < 1 THEN 1 ELSE unread END), hidden = 0
+             WHERE group_id = ?1 AND member = ?2 AND active = 1",
+            params![group_id, self_id])? == 1)
+    }
+
     pub fn list_groups(&self, self_id: &str) -> Result<Vec<GroupSummary>> {
         if !valid_fingerprint(self_id) { return Err(rusqlite::Error::InvalidQuery); }
         let mut statement = self.connection.prepare(
@@ -2188,10 +2240,15 @@ impl Store {
                     params![id, group_id], |row| Ok((row.get(0)?, row.get(1)?)),
                 ).optional()?;
                 let Some((quoted_sender, quoted_body)) = quoted else { return Err(rusqlite::Error::InvalidQuery); };
+                // A raw fingerprint prefix is not a name: prefer the group member name,
+                // then the local remark/nickname, and only then a neutral label.
                 let quote_name: String = tx.query_row(
-                    "SELECT COALESCE(display_name, substr(?1, 1, 8)) FROM contacts WHERE fingerprint = ?1",
+                    "SELECT COALESCE(NULLIF(display_name, ''), '群成员') FROM group_members WHERE group_id = ?1 AND member = ?2",
+                    params![group_id, &quoted_sender], |row| row.get(0),
+                ).or_else(|_| tx.query_row(
+                    "SELECT COALESCE(NULLIF(remark, ''), display_name) FROM contacts WHERE fingerprint = ?1",
                     [&quoted_sender], |row| row.get(0),
-                ).unwrap_or_else(|_| quoted_sender[..8.min(quoted_sender.len())].to_owned());
+                )).unwrap_or_else(|_| "群成员".to_owned());
                 (Some(quote_name), Some(quote_preview(&quoted_body)))
             }
             None => (None, None),
@@ -3636,10 +3693,13 @@ fn valid_group_id_is(value: &str) -> bool {
 
 const MAX_GROUP_MEMBERS_LOCAL: usize = 256;
 
-/// Usernames are 2-20 lowercase ASCII letters, digits, `-` or `_`.
+/// Usernames are 2-20 ASCII letters, digits or `_`, and never start with a digit.
 fn valid_username(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    let Some(first) = bytes.next() else { return false };
     (2..=20).contains(&value.len())
-        && value.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+        && (first.is_ascii_alphabetic() || first == b'_')
+        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
 /// Group ids are random 128-bit values, never derived from a fingerprint.
@@ -4652,8 +4712,8 @@ mod tests {
         let original = store.queue_group(&me, &group_id, "第一行\n第二行", None, &[], 10).unwrap();
         let reply = store.queue_group(&me, &group_id, "收到", Some(&original.id), &[bob.clone()], 11).unwrap();
         assert_eq!(reply.reply_to.as_deref(), Some(original.id.as_str()));
-        // Without a local contact row the quote falls back to the fingerprint prefix.
-        assert_eq!(reply.reply_sender.as_deref(), Some("aaaaaaaa"));
+        // Without a local contact row the quote uses a generic label, not a fingerprint.
+        assert_eq!(reply.reply_sender.as_deref(), Some("群成员"));
         assert_eq!(reply.reply_preview.as_deref(), Some("第一行 第二行"));
         assert_eq!(reply.mentions, vec![bob.clone()]);
         let listed = store.list_group_messages(&group_id, 10, None).unwrap();
@@ -4810,6 +4870,12 @@ mod tests {
         assert!(!store.set_username("Bad Name").unwrap());
         assert!(!store.set_username("a").unwrap());
         assert!(!store.set_username(&"x".repeat(21)).unwrap());
+        // Letters, digits and underscores only, and the first character cannot be a digit.
+        assert!(!store.set_username("1abc").unwrap());
+        assert!(!store.set_username("bob-1").unwrap());
+        assert!(!store.set_username("青鸟").unwrap());
+        assert!(store.set_username("_Tam_01").unwrap());
+        assert_eq!(store.get_profile().unwrap().username, "_Tam_01");
         assert!(!store.onboarding_done().unwrap());
         store.set_onboarding_done().unwrap();
         assert!(store.onboarding_done().unwrap());

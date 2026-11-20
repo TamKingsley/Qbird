@@ -2,8 +2,12 @@ import { invoke, isTauri } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
 import { composerTools } from './ui_icons';
 import { showImage } from './image_viewer';
-import { base64ToBytes, createPluginFrame } from './plugin_view';
+import { base64ToBytes } from './plugin_view';
 import { showContextMenu } from './context_menu';
+import { workspace, type LoadedTab } from './workspace';
+import { linkifiedText } from './linkify';
+
+type TextPreview = { name: string; kind: string; text: string };
 
 type GroupMessage = {
   id: string; group_id: string; sender: string; sender_name: string; body: string;
@@ -20,8 +24,8 @@ const cursorOf = (message: GroupMessage): Cursor => ({ logical: message.logical,
 const compare = (a: Cursor, b: Cursor): number => a.logical - b.logical || (a.sender < b.sender ? -1 : a.sender > b.sender ? 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
 type SearchCategory = 'all' | 'text' | 'file' | 'image';
 type Quoted = { id: string; name: string; preview: string };
-type Panel = { id: string; name: string; kind: string };
 type FileOffer = { message_id: string; peer: string; name: string; total: number; created_at: number; status: string; group_id?: string | null };
+type Staged = { path: string; name: string; image: boolean; preview: string | null };
 
 /// Group chat: outbound messages are queued per member by the backend, so the UI only
 /// shows the pending count and never claims delivery on its own. Replies keep a short
@@ -61,17 +65,16 @@ export class GroupChat {
   private batches = new Map<string, string>();
   private batchCaptions = new Map<string, string>();
   private renderedBatches = new Set<string>();
-  private panelBytes: Uint8Array | null = null;
-  private panel: Panel | null = null;
   private offers: FileOffer[] = [];
-  private panelWidth = 380;
+  /// Attachments picked, dropped or pasted but not sent yet, so text and files
+  /// leave together only when the user presses Send.
+  private staged: Staged[] = [];
   /// 'lightbox' keeps the in-app viewer; 'workspace' opens the right panel instead.
   imageOpenMode: 'lightbox' | 'workspace' = 'lightbox';
+  /// What clicking a file card does; the workspace previews it or the system app opens it.
+  fileOpenMode: 'workspace' | 'system' = 'workspace';
 
-  constructor(private root: HTMLElement, private onChange: () => void) {
-    // The panel resizer is recreated on every render, so one delegated listener suffices.
-    root.addEventListener('pointerdown', (event) => this.startResize(event));
-  }
+  constructor(private root: HTMLElement, private onChange: () => void) {}
 
   view(): string {
     return `<section class="self-chat" aria-label="群聊">
@@ -92,25 +95,21 @@ export class GroupChat {
       <div class="chat-compose" ${this.readOnly ? 'hidden' : ''}>
         <div class="reply-bar" id="reply-bar" hidden><span id="reply-bar-text"></span><button class="outline" data-action="group-cancel-reply">取消引用</button></div>
         <label for="group-input">消息</label>
+        <div class="compose-staging" id="group-staging" aria-label="待发送附件" hidden></div>
         <textarea id="group-input" rows="3" maxlength="32768" placeholder="发消息给群里的人…输入 @ 可选择成员"></textarea>
         <div class="mention-picker" id="mention-picker" hidden></div>
         ${composerTools('group', 'Enter 发送 · Shift+Enter 换行')}
         <p id="group-file-status" role="status"></p>
         <p id="group-error" role="status"></p>
       </div>
-      <aside class="file-panel" id="group-panel" hidden aria-label="文件预览">
-        <div class="panel-resizer" data-role="panel-resizer" aria-hidden="true"></div>
-        <header class="panel-header"><strong id="group-panel-title"></strong><div class="panel-actions"><button class="outline" data-action="group-panel-reveal">打开所在目录</button><button class="outline" data-action="group-panel-close">关闭</button></div></header>
-        <div class="panel-body" id="group-panel-body"></div>
-      </aside>
     </section>`;
   }
 
   clear(): void {
     this.groupId = ''; this.readOnly = false; this.generation++; this.membersOpen = false; this.quoted = null;
-    this.closePanel();
     this.setGroupAvatar(null);
     this.thumbs.clear(); this.thumbPending.clear(); this.offers = [];
+    this.staged = []; this.paintStaging();
     this.mentionQuery = null; this.mentioned.clear(); this.closeSearch();
   }
 
@@ -265,10 +264,48 @@ export class GroupChat {
       });
       if (!selected) return;
       const paths = Array.isArray(selected) ? selected : [selected];
-      if (kind === 'image') await this.queueImages(paths);
-      else await this.queuePaths(paths);
+      await this.stagePaths(paths);
     } catch (error) { this.status('#group-error', typeof error === 'string' ? error : '无法打开文件选择器'); }
     finally { this.attaching = false; }
+  }
+
+  /// Puts picked, dropped or pasted files into the composer staging area so the
+  /// user can review them and mix them with text before anything is queued.
+  async stagePaths(paths: string[]): Promise<void> {
+    if (!isTauri() || !this.groupId || !paths.length) return;
+    this.attaching = true;
+    this.status('#group-file-status', '正在准备预览…');
+    try {
+      for (const path of paths) {
+        const name = path.split(/[\\/]/).pop() ?? path;
+        const image = /\.(png|jpe?g|gif|webp|bmp)$/i.test(path);
+        let preview: string | null = null;
+        if (image) preview = await invoke<string>('v1_local_preview', { path }).catch(() => null);
+        if (!this.staged.some((item) => item.path === path)) this.staged.push({ path, name, image, preview });
+      }
+      this.paintStaging();
+      this.status('#group-file-status', this.staged.length
+        ? `已添加 ${this.staged.length} 个附件：可继续写文字，点「发送」一起发出。`
+        : '');
+    } finally { this.attaching = false; }
+  }
+
+  unstage(index: number): void {
+    if (index < 0 || index >= this.staged.length) return;
+    this.staged.splice(index, 1);
+    this.paintStaging();
+    this.status('#group-file-status', this.staged.length ? `还剩 ${this.staged.length} 个附件` : '已清空附件');
+  }
+
+  private paintStaging(): void {
+    const box = this.root.querySelector<HTMLElement>('#group-staging');
+    if (!box) return;
+    box.hidden = this.staged.length === 0;
+    if (!this.staged.length) { box.innerHTML = ''; return; }
+    box.innerHTML = this.staged.map((item, index) => item.image
+      ? `<div class="staged-item is-image" title="${escapeHtml(item.name)}"><img src="${item.preview ?? ''}" alt=""><button type="button" class="staged-remove" data-action="group-unstage" data-index="${index}" aria-label="移除 ${escapeHtml(item.name)}">×</button></div>`
+      : `<div class="staged-item is-file" title="${escapeHtml(item.name)}"><span class="staged-name">${escapeHtml(item.name)}</span><button type="button" class="staged-remove" data-action="group-unstage" data-index="${index}" aria-label="移除 ${escapeHtml(item.name)}">×</button></div>`
+    ).join('') + '<span class="staged-hint">发送时随文字一起发出</span>';
   }
 
   /// One bubble for the selected images, using the composer text as caption.
@@ -364,14 +401,42 @@ export class GroupChat {
     const button = this.root.querySelector<HTMLButtonElement>('button[data-action="group-send"]');
     if (!this.groupId || this.readOnly || !input || this.sending) return;
     const groupId = this.groupId, generation = this.generation, body = input.value;
+    const staged = this.staged.slice();
     if (!this.members.some(member => member.member === this.self && member.active)) {
       this.status('#group-error', '该群聊已解散，或你已不在群中'); return;
     }
-    if (!body.trim()) { this.status('#group-error', '请输入消息'); return; }
+    if (!body.trim() && !staged.length) { this.status('#group-error', '请输入消息，或先添加图片/文件'); return; }
     const mentions = [...this.mentioned.entries()]
       .filter(([, name]) => body.includes(`@${name}`)).map(([member]) => member);
     this.sending = true; if (button) button.disabled = true; this.status('#group-error', '');
     try {
+      if (staged.length) {
+        const images = staged.filter((item) => item.image).map((item) => item.path);
+        const files = staged.filter((item) => !item.image).map((item) => item.path);
+        if (images.length) {
+          const sent = await invoke<GroupMessage[]>('v1_queue_group_images', { groupId, paths: images, caption: body });
+          for (const item of sent) { if (!this.messages.some(existing => existing.id === item.id)) this.messages.push(item); }
+          this.messages.sort(compare);
+          await this.loadBatches();
+        }
+        for (const path of files) await invoke<GroupMessage>('v1_queue_group_file', { groupId, path });
+        // Plain files cannot carry a caption yet, so the typed text goes out separately.
+        if (!images.length && body.trim()) {
+          await invoke<GroupMessage>('v1_queue_group', { groupId, body, replyTo: this.quoted?.id ?? null, mentions });
+        }
+        this.staged = []; this.paintStaging();
+        if (this.drafts.get(groupId) === body) this.drafts.set(groupId, '');
+        if (generation === this.generation) {
+          if (input.isConnected && input.value === body) input.value = '';
+          this.quoted = null; this.mentioned.clear(); this.mentionQuery = null;
+          await this.load(false, true);
+          this.paint('bottom'); this.paintReplyBar(); this.paintMentionPicker(); this.dispatchChanged();
+          this.status('#group-file-status', images.length
+            ? `已加入待发送：${images.length} 张图片${body.trim() ? '与文字' : ''}（成员在线后自动发送）`
+            : `已加入待发送：${files.length} 个文件${body.trim() ? '，文字已单独发送' : ''}（成员在线后自动发送）`);
+        }
+        return;
+      }
       const message = await invoke<GroupMessage>('v1_queue_group', {
         groupId, body, replyTo: this.quoted?.id ?? null, mentions,
       });
@@ -683,39 +748,71 @@ export class GroupChat {
     }
   }
 
-  /// Show one completed group attachment in the right workspace panel.
-  async openPreview(message: GroupMessage): Promise<void> {
+  /// Opens one completed group attachment in the global workspace panel.
+  openPreview(message: GroupMessage): void {
     if (!isTauri() || message.kind !== 'file' || message.file_status !== 'completed') return;
-    const name = message.file_name ?? message.body;
-    const kind = previewKind(name);
-    this.panel = { id: message.id, name, kind };
-    this.paintPanel('正在读取…');
-    try {
-      if (kind !== 'image') {
-        if (await this.openWithPlugin(message, name)) { return; }
-        this.paintPanel('该类型暂不支持预览，也未安装对应插件；可使用“打开所在目录”。');
-        return;
-      }
-      const preview = await invoke<{ name: string; data_url: string } | null>('v1_read_group_attachment', { groupId: this.groupId, messageId: message.id });
-      if (!preview) { this.paintPanel('图片过大或无法读取，未能预览'); return; }
-      this.thumbs.set(message.id, preview.data_url);
-      this.paintPanel('', preview.data_url);
-    } catch (error) { this.paintPanel(typeof error === 'string' ? error : '无法读取群文件'); }
+    workspace.open({
+      kind: 'group-file', groupId: this.groupId, messageId: message.id,
+      name: message.file_name ?? message.body,
+    });
   }
 
-  /// Hands the file bytes to an installed read-only preview plugin, if one claims it.
-  private async openWithPlugin(message: GroupMessage, name: string): Promise<boolean> {
-    try {
+  /// Resolver entry used by the workspace for live opens and restored tabs.
+  async loadWorkspaceFile(source: { messageId: string; name: string }): Promise<LoadedTab> {
+    try { return await this.loadPreview(source.messageId, source.name); }
+    catch (error) { return { kind: 'error', message: typeof error === 'string' ? error : '无法读取该文件' }; }
+  }
+
+  private async loadPreview(messageId: string, name: string): Promise<LoadedTab> {
+    const kind = previewKind(name);
+    if (kind === 'image') {
+      const preview = await invoke<{ name: string; data_url: string } | null>('v1_read_group_attachment', { groupId: this.groupId, messageId });
+      if (!preview) return { kind: 'unsupported', reason: '图片过大或无法读取，未能预览' };
+      this.thumbs.set(messageId, preview.data_url);
+      return { kind: 'image', src: preview.data_url };
+    }
+    if (kind === 'pdf') {
+      const bytes = await invoke<ArrayBuffer>('v1_group_attachment_bytes', { groupId: this.groupId, messageId });
+      return { kind: 'pdf', bytes };
+    }
+    if (kind === 'other') {
       const plugin = await invoke<{ plugin_id: string; html: string } | null>('v1_plugin_preview', { fileName: name });
-      if (!plugin) return false;
-      const data = await invoke<string>('v1_group_attachment_base64', { groupId: this.groupId, messageId: message.id });
-      this.panel = { id: message.id, name, kind: 'plugin' };
-      this.panelBytes = base64ToBytes(data);
-      this.paintPanel('', plugin.html);
-      return true;
-    } catch (error) {
-      this.paintPanel(typeof error === 'string' ? error : '插件预览失败');
-      return true;
+      if (!plugin) return { kind: 'unsupported', reason: '该类型暂不支持内置预览；可用“用默认程序打开”或“打开所在目录”，安装预览插件后也可在此查看。' };
+      const data = await invoke<string>('v1_group_attachment_base64', { groupId: this.groupId, messageId });
+      return { kind: 'plugin', html: plugin.html, bytes: base64ToBytes(data) };
+    }
+    const preview = await invoke<TextPreview | null>('v1_read_group_text_attachment', { groupId: this.groupId, messageId });
+    if (!preview) return { kind: 'unsupported', reason: '文件过大、不是文本或无法读取，未能预览' };
+    const textKind = preview.kind === 'markdown' ? 'markdown' : preview.kind === 'html' ? 'html' : 'text';
+    return { kind: textKind, text: preview.text };
+  }
+
+  /// Click behaviour for a completed file card, governed by the workspace setting.
+  private activateFile(message: GroupMessage): void {
+    if (message.kind !== 'file' || message.file_status !== 'completed') return;
+    if (this.fileOpenMode === 'system') { void this.openWithSystem(message); return; }
+    this.openPreview(message);
+  }
+
+  async openSystemById(messageId: string): Promise<void> {
+    try { await invoke('v1_open_group_attachment', { groupId: this.groupId, messageId }); }
+    catch (error) {
+      const text = typeof error === 'string' ? error : '无法打开文件';
+      this.status('#group-file-status', text);
+      workspace.notify(text);
+    }
+  }
+
+  private openWithSystem(message: GroupMessage): Promise<void> {
+    return this.openSystemById(message.id);
+  }
+
+  async reveal(messageId: string): Promise<void> {
+    try { await invoke('v1_reveal_group_attachment', { groupId: this.groupId, messageId }); }
+    catch (error) {
+      const text = typeof error === 'string' ? error : '无法打开所在目录';
+      this.status('#group-error', text);
+      workspace.notify(text);
     }
   }
 
@@ -727,76 +824,19 @@ export class GroupChat {
       return;
     }
     showContextMenu(event, [
-      { label: '用默认程序打开', run: () => {
-        void invoke('v1_open_group_attachment', { groupId: this.groupId, messageId: message.id })
-          .catch((error) => this.status('#group-file-status', typeof error === 'string' ? error : '无法打开文件'));
-      } },
+      { label: '用默认程序打开', run: () => { void this.openWithSystem(message); } },
       { label: '打开所在目录', run: () => {
         void invoke('v1_reveal_group_attachment', { groupId: this.groupId, messageId: message.id })
           .catch((error) => this.status('#group-error', typeof error === 'string' ? error : '无法打开所在目录'));
       } },
-      { label: '预览', run: () => { void this.openPreview(message); } },
+      { label: '预览', run: () => { this.openPreview(message); } },
       { label: '复制文件名', run: () => { void navigator.clipboard?.writeText(name).catch(() => {}); } },
     ]);
   }
 
-  get panelId(): string { return this.panel?.id ?? ''; }
-
   openPreviewById(id: string): void {
-    const message = this.messages.find(item => item.id === id);
-    if (message) void this.openPreview(message);
-  }
-
-  closePanel(): void {
-    this.panel = null;
-    const panel = this.root.querySelector<HTMLElement>('#group-panel');
-    if (panel) panel.hidden = true;
-  }
-
-  private paintPanel(message: string, content?: string): void {
-    const panel = this.root.querySelector<HTMLElement>('#group-panel');
-    const title = this.root.querySelector<HTMLElement>('#group-panel-title');
-    const body = this.root.querySelector<HTMLElement>('#group-panel-body');
-    if (!panel || !title || !body) return;
-    if (!this.panel) { panel.hidden = true; return; }
-    panel.hidden = false;
-    panel.style.width = `${this.panelWidth}px`;
-    title.textContent = this.panel.name;
-    body.replaceChildren();
-    if (!content) {
-      const note = document.createElement('p'); note.className = 'panel-note'; note.textContent = message;
-      body.append(note);
-      return;
-    }
-    if (this.panel.kind === 'plugin') {
-      body.append(createPluginFrame(content, this.panelBytes ?? new Uint8Array(), this.panel.name));
-      const note = document.createElement('p'); note.className = 'panel-note';
-      note.textContent = '插件在沙箱中运行，只能读取这个文件的字节；第一版为只读预览。';
-      body.append(note);
-      return;
-    }
-    if (this.panel.kind === 'image') {
-      const image = document.createElement('img'); image.src = content; image.alt = this.panel.name;
-      body.append(image);
-      return;
-    }
-    const note = document.createElement('p'); note.className = 'panel-note'; note.textContent = message;
-    body.append(note);
-  }
-
-  private startResize(event: PointerEvent): void {
-    const target = event.target;
-    if (!(target instanceof HTMLElement) || target.dataset.role !== 'panel-resizer') return;
-    event.preventDefault();
-    const startX = event.clientX, startWidth = this.panelWidth;
-    const move = (moveEvent: PointerEvent) => {
-      this.panelWidth = Math.min(Math.max(startWidth + (startX - moveEvent.clientX), 280), window.innerWidth * 0.7);
-      const panel = this.root.querySelector<HTMLElement>('#group-panel');
-      if (panel) panel.style.width = `${this.panelWidth}px`;
-    };
-    const up = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up); };
-    window.addEventListener('pointermove', move);
-    window.addEventListener('pointerup', up);
+    const message = this.messages.find((item) => item.id === id);
+    if (message) this.openPreview(message);
   }
 
   private paint(mode: 'bottom' | 'preserve' | 'auto'): void {
@@ -834,7 +874,12 @@ export class GroupChat {
         if (this.renderedBatches.has(batch)) continue;
         this.renderedBatches.add(batch);
         const caption = this.batchCaptions.get(batch) ?? '';
-        if (caption) { const text = document.createElement('div'); text.className = 'message-text'; text.textContent = caption; bubble.append(text); }
+        if (caption) {
+          const text = document.createElement('div');
+          text.className = 'message-text';
+          text.append(linkifiedText(caption));
+          bubble.append(text);
+        }
         const grid = document.createElement('div'); grid.className = 'batch-grid';
         for (const item of this.messages.filter(candidate => this.batches.get(candidate.id) === batch)) {
           const cell = document.createElement('div'); cell.className = 'batch-item';
@@ -842,8 +887,9 @@ export class GroupChat {
           if (this.thumbs.has(item.id)) {
             const image = document.createElement('img'); image.className = 'file-thumb'; image.src = this.thumbs.get(item.id) ?? '';
             image.alt = item.file_name ?? '图片';
-            image.addEventListener('click', () => {
-              if (this.imageOpenMode === 'workspace') { void this.openPreview(item); return; }
+            image.addEventListener('click', (event) => {
+              event.stopPropagation();
+              if (this.imageOpenMode === 'workspace') { this.openPreview(item); return; }
               showImage(image.src, item.file_name ?? '图片');
             });
             cell.append(image);
@@ -859,11 +905,16 @@ export class GroupChat {
       } else if (message.kind === 'file') {
         const card = document.createElement('div'); card.className = 'file-card';
         card.addEventListener('contextmenu', (event) => this.fileMenu(event, message));
+        card.addEventListener('click', (event) => {
+          if ((event.target as HTMLElement).closest('.linkish')) return;
+          this.activateFile(message);
+        });
         if (this.isImageMessage(message) && this.thumbs.has(message.id)) {
           const image = document.createElement('img'); image.className = 'file-thumb'; image.src = this.thumbs.get(message.id) ?? '';
           image.alt = message.file_name ?? '图片';
-          image.addEventListener('click', () => {
-            if (this.imageOpenMode === 'workspace') { void this.openPreview(message); return; }
+          image.addEventListener('click', (event) => {
+            event.stopPropagation();
+            if (this.imageOpenMode === 'workspace') { this.openPreview(message); return; }
             showImage(image.src, message.file_name ?? '图片');
           });
           card.append(image);
@@ -886,7 +937,7 @@ export class GroupChat {
         }
         bubble.append(card);
       } else {
-        const body = document.createElement('div'); body.className = 'message-text'; body.textContent = message.body;
+        const body = document.createElement('div'); body.className = 'message-text'; body.append(linkifiedText(message.body));
         bubble.append(body);
       }
       if (incoming && message.mentions.includes(this.self)) {
@@ -956,6 +1007,7 @@ export class GroupChat {
     const input = this.root.querySelector<HTMLTextAreaElement>('#group-input');
     if (name) name.textContent = this.name;
     if (input) input.value = this.drafts.get(this.groupId) ?? '';
+    this.paintStaging();
     this.paintSubtitle();
     this.paintMembers();
     this.paintReplyBar();
@@ -973,9 +1025,10 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
   return buffer;
 }
 
-function previewKind(name: string): 'image' | 'html' | 'markdown' | 'text' | 'other' {
+function previewKind(name: string): 'image' | 'pdf' | 'html' | 'markdown' | 'text' | 'other' {
   const extension = name.slice(name.lastIndexOf('.') + 1).toLowerCase();
   if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp'].includes(extension)) return 'image';
+  if (extension === 'pdf') return 'pdf';
   if (['html', 'htm'].includes(extension)) return 'html';
   if (['md', 'markdown'].includes(extension)) return 'markdown';
   if (['txt', 'log', 'csv', 'json', 'xml', 'ini', 'toml', 'yaml', 'yml'].includes(extension)) return 'text';
@@ -991,4 +1044,8 @@ function formatJoined(seconds: number): string {
 function previewOf(body: string): string {
   const collapsed = body.split(/\s+/).filter(Boolean).join(' ');
   return collapsed.length > 60 ? `${collapsed.slice(0, 60)}…` : collapsed;
+}
+
+function escapeHtml(value: string): string {
+  return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }

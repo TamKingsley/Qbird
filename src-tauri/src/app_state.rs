@@ -1,5 +1,5 @@
 use std::{fs, io, net::SocketAddr, path::{Path, PathBuf}, sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}}, time::Duration};
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 use crate::{discovery::Discovery, identity::Identity, probe_service::{ProbeRequest, ProbeService}, storage::Store};
 
 type InitResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -17,6 +17,11 @@ pub struct AppState {
     locked: AtomicBool,
     /// Data directory for local-only assets such as the profile avatar.
     data_dir: Arc<PathBuf>,
+    /// Pending full-screen capture shown by the capture overlay window.
+    capture: Mutex<Option<crate::capture::ScreenCapture>>,
+    /// Whether the running listener also serves chat, not probes only. Kept beside
+    /// `probe_service` because `ProbeService` itself does not expose the mode.
+    chat_listener: AtomicBool,
 }
 
 #[tauri::command]
@@ -44,6 +49,37 @@ pub async fn v1_deliver_direct(state: tauri::State<'_, AppState>, peer: String, 
         let _guard = guard;
         crate::chat_transport::send_one(&identity, &store, &peer, address, &id)
             .map_err(|_| "发送未确认：对方可能离线、地址错误或身份不匹配；消息仍保存在本机，可重试".to_owned())
+    }).await.map_err(|_| "发送任务异常；消息仍保存在本机，可重试".to_owned())?
+}
+
+/// Attempts the saved address right away for every message still pending, so the
+/// user gets feedback on the spot instead of waiting for the retry worker.
+#[tauri::command]
+pub async fn v1_flush_direct(state: tauri::State<'_, AppState>, peer: String) -> Result<u32, String> {
+    let (address, pending) = {
+        let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+        let address = store.contact_address(&peer).map_err(|_| "无法读取联系人地址".to_owned())?
+            .ok_or_else(|| "尚未保存对方地址无法发送".to_owned())?;
+        let pending = store.pending_direct(&peer, 20).map_err(|_| "无法读取待发送消息".to_owned())?;
+        (address, pending)
+    };
+    if pending.is_empty() { return Ok(0); }
+    let address = crate::address::parse_manual_address(&address).map_err(str::to_owned)?;
+    if state.outbound_chat.swap(true, Ordering::AcqRel) { return Err("已有消息正在发送，请稍后重试".into()); }
+    let guard = ProbeGuard(Arc::clone(&state.outbound_chat));
+    let identity = Arc::clone(&state.identity);
+    let store = Arc::clone(&state.store);
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = guard;
+        let mut sent = 0u32;
+        for message in pending {
+            if crate::chat_transport::send_one(&identity, &store, &peer, address, &message.id).is_err() { break; }
+            sent += 1;
+        }
+        if sent == 0 {
+            return Err("发送未确认：对方可能离线、地址错误或未启动聊天服务；消息仍保存在本机，可稍后重试".to_owned());
+        }
+        Ok(sent)
     }).await.map_err(|_| "发送任务异常；消息仍保存在本机，可重试".to_owned())?
 }
 
@@ -164,6 +200,59 @@ pub fn v1_read_text_attachment(state: tauri::State<'_, AppState>, message_id: St
     if !matches!(kind, "text" | "markdown" | "html") { return Ok(None); }
     let Some(text) = crate::files::read_text_preview(&path).map_err(|_| "无法读取附件".to_owned())? else { return Ok(None); };
     Ok(Some(TextPreview { name, kind: kind.to_owned(), text }))
+}
+
+/// Group text preview for active members only; mirrors the direct chat command so
+/// restored workspace tabs can reload text without the original message object.
+#[tauri::command]
+pub fn v1_read_group_text_attachment(state: tauri::State<'_, AppState>, group_id: String, message_id: String)
+    -> Result<Option<TextPreview>, String> {
+    let self_id = state.identity.fingerprint();
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    let Some((name, path)) = store.group_attachment_path(&group_id, &self_id, &message_id)
+        .map_err(|_| "无法读取群文件".to_owned())? else { return Ok(None); };
+    let kind = crate::files::preview_kind(&name);
+    if !matches!(kind, "text" | "markdown" | "html") { return Ok(None); }
+    let Some(text) = crate::files::read_text_preview(&path).map_err(|_| "无法读取群文件".to_owned())? else { return Ok(None); };
+    Ok(Some(TextPreview { name, kind: kind.to_owned(), text }))
+}
+
+/// Upper bound for the serialized workspace (12 tabs, long URLs). Kept out of the
+/// settings table because that table caps values at 4 KiB.
+const MAX_WORKSPACE_STATE_BYTES: usize = 64 * 1024;
+
+/// Returns the persisted tab layout as opaque JSON; the frontend owns the schema.
+#[tauri::command]
+pub fn v1_workspace_state(state: tauri::State<'_, AppState>) -> Result<Option<String>, String> {
+    let path = state.data_dir.join("workspace.json");
+    match std::fs::read(&path) {
+        Ok(bytes) if !bytes.is_empty() && bytes.len() <= MAX_WORKSPACE_STATE_BYTES => {
+            Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+        }
+        Ok(_) => Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err("无法读取工作区状态".into()),
+    }
+}
+
+/// Writes the tab layout with a temp file + rename so a crash cannot leave a
+/// half-written layout behind. An empty payload removes the file.
+#[tauri::command]
+pub fn v1_set_workspace_state(state: tauri::State<'_, AppState>, payload: String) -> Result<(), String> {
+    if payload.len() > MAX_WORKSPACE_STATE_BYTES { return Err("工作区状态过大".into()); }
+    let dir = state.data_dir.as_ref();
+    std::fs::create_dir_all(dir).map_err(|_| "无法保存工作区状态".to_owned())?;
+    let path = dir.join("workspace.json");
+    if payload.trim().is_empty() {
+        match std::fs::remove_file(&path) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(_) => return Err("无法保存工作区状态".into()),
+        }
+    }
+    let temp = dir.join("workspace.json.tmp");
+    std::fs::write(&temp, payload.as_bytes()).map_err(|_| "无法保存工作区状态".to_owned())?;
+    std::fs::rename(&temp, &path).map_err(|_| "无法保存工作区状态".to_owned())
 }
 
 /// Completed group image preview for active members only.
@@ -333,21 +422,28 @@ pub struct ProbeStatus {
 
 #[tauri::command]
 pub async fn v1_start_probe_service(app: tauri::AppHandle, port: u16) -> Result<(), String> {
+    if port == 0 { return Err("端口须为 1–65535".into()); }
     tauri::async_runtime::spawn_blocking(move || app.state::<AppState>().start_listener(port, false))
         .await.map_err(|_| "探测服务任务异常".to_owned())?
 }
 
 #[tauri::command]
 pub async fn v1_start_chat_service(app: tauri::AppHandle, port: u16) -> Result<(), String> {
+    if port == 0 { return Err("端口须为 1–65535".into()); }
     tauri::async_runtime::spawn_blocking(move || app.state::<AppState>().start_listener(port, true))
         .await.map_err(|_| "聊天服务任务异常".to_owned())?
 }
 
 impl AppState {
     fn start_listener(&self, port: u16, chat: bool) -> Result<(), String> {
-        if port == 0 { return Err("端口须为 1–65535".into()); }
+        // Port 0 is internal only: bind any free port when the preferred one is taken.
         let mut slot = self.probe_service.lock().map_err(|_| "探测服务不可用".to_owned())?;
-        if slot.is_some() { return Err("探测服务已启动，请先停止再更改端口".into()); }
+        if slot.is_some() {
+            // Launch-time auto listening makes repeated "start" calls normal: treat the
+            // same mode as success, but never silently switch chat/probe modes.
+            return if self.chat_listener.load(Ordering::Acquire) == chat { Ok(()) }
+                else { Err("已有监听在运行，请先停止再切换模式".into()) };
+        }
         let service = if chat {
             ProbeService::start_with_chat(Arc::clone(&self.identity), port, Arc::clone(&self.store))
         } else {
@@ -365,7 +461,35 @@ impl AppState {
                 .map_err(|_| "无法启动消息重试服务".to_owned())?);
         }
         *slot = Some(service);
+        self.chat_listener.store(chat, Ordering::Release);
         Ok(())
+    }
+
+    /// One long-lived mDNS browser shared by the LAN list, diagnostics and presence.
+    fn ensure_discovery(&self) -> Result<(), String> {
+        let mut discovery = self.discovery.lock().map_err(|_| "局域网发现不可用".to_owned())?;
+        if discovery.is_none() {
+            *discovery = Some(Discovery::browse().map_err(|_| "无法启动局域网发现，请检查网络和防火墙".to_owned())?);
+        }
+        Ok(())
+    }
+
+    /// Restarts a listener whose worker stopped unexpectedly. A listener the user
+    /// stopped manually has no service slot, so it is never resurrected silently.
+    fn restart_dead_listener(&self) -> bool {
+        let (port, chat) = {
+            let Ok(mut slot) = self.probe_service.lock() else { return false };
+            match slot.as_ref() {
+                Some(service) if !service.is_running() => {
+                    let port = service.port();
+                    let chat = self.chat_listener.load(Ordering::Acquire);
+                    slot.take();
+                    (port, chat)
+                }
+                _ => return false,
+            }
+        };
+        self.start_listener(port, chat).is_ok()
     }
 
     fn stop_listener(&self) -> Result<(), String> {
@@ -375,6 +499,7 @@ impl AppState {
         let mut retry = self.retry_queue.lock().map_err(|_| "消息重试服务不可用".to_owned())?;
         drop(retry.take());
         drop(service.take());
+        self.chat_listener.store(false, Ordering::Release);
         Ok(())
     }
 }
@@ -395,6 +520,146 @@ pub async fn v1_probe_status(app: tauri::AppHandle) -> Result<ProbeStatus, Strin
             None => Ok(ProbeStatus { running: false, port: None, requests: vec![] }),
         }
     }).await.map_err(|_| "读取服务状态任务异常".to_owned())?
+}
+
+/// Read-only snapshot for the debug panel: listener, discovery, addresses and
+/// counts. It never probes peers or changes any state.
+#[tauri::command]
+pub async fn v1_network_diagnostics(app: tauri::AppHandle) -> Result<crate::diagnostics::NetworkReport, String> {
+    tauri::async_runtime::spawn_blocking(move || app.state::<AppState>().network_report())
+        .await.map_err(|_| "网络检测任务异常".to_owned())?
+}
+
+impl AppState {
+    fn network_report(&self) -> Result<crate::diagnostics::NetworkReport, String> {
+        use crate::diagnostics::{local_ipv4_addresses, port_available, NetworkReport};
+        let (service_running, service_port) = {
+            let slot = self.probe_service.lock().map_err(|_| "探测服务不可用".to_owned())?;
+            match slot.as_ref() {
+                Some(service) => (service.is_running(), Some(service.port())),
+                None => (false, None),
+            }
+        };
+        let chat_enabled = service_running && self.chat_listener.load(Ordering::Acquire);
+        let (discovery_started, lan_candidates) = {
+            let discovery = self.discovery.lock().map_err(|_| "局域网发现不可用".to_owned())?;
+            let started = discovery.is_some();
+            let count = discovery.as_ref().and_then(|discovery| discovery.candidates().ok()).map(|items| items.len()).unwrap_or(0);
+            (started, count)
+        };
+        let (default_port, contacts) = {
+            let store = self.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+            let port = read_network(&store)?.default_port;
+            let contacts = store.list_contacts().map(|items| items.len()).unwrap_or(0);
+            (port, contacts)
+        };
+        let default_port_available = port_available(default_port);
+        let local_ipv4 = local_ipv4_addresses();
+        let mut notes = Vec::new();
+        if !service_running {
+            notes.push("聊天服务未启动：局域网用户暂时无法向你发起连接。".to_owned());
+        } else if !chat_enabled {
+            notes.push("当前监听只接受身份探测，未启用聊天接收。".to_owned());
+        }
+        if !default_port_available && !(service_running && service_port == Some(default_port)) {
+            notes.push(format!("默认端口 {default_port} 已被其他程序占用，启动监听会失败。"));
+        }
+        if local_ipv4.is_empty() {
+            notes.push("未能读取本机 IPv4 地址，请检查网络连接或适配器状态。".to_owned());
+        }
+        if !discovery_started {
+            notes.push("局域网发现尚未启动，可打开「局域网用户」页或使用重建发现。".to_owned());
+        } else if lan_candidates == 0 {
+            notes.push("已启动发现，但暂未收到同网段广播；可能是无人在线或组播被防火墙拦截。".to_owned());
+        }
+        Ok(NetworkReport {
+            platform: format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
+            hostname: crate::diagnostics::hostname(),
+            local_ipv4,
+            service_running,
+            chat_enabled,
+            service_port,
+            default_port,
+            default_port_available,
+            discovery_started,
+            lan_candidates,
+            contacts,
+            notes,
+        })
+    }
+
+    /// Restarts the local chat listener on the port it was using, falling back to
+    /// the saved default if the old port cannot be bound again.
+    fn restart_chat_listener(&self) -> crate::diagnostics::RepairStep {
+        use crate::diagnostics::RepairStep;
+        let (running_port, saved_port) = {
+            let port = self.probe_service.lock().ok().and_then(|slot| slot.as_ref().map(|service| service.port()));
+            let saved = self.store.lock().ok().and_then(|store| read_network(&store).ok()).map(|settings| settings.default_port)
+                .unwrap_or(DEFAULT_LISTEN_PORT);
+            (port, saved)
+        };
+        let mut target = running_port.unwrap_or(saved_port);
+        if let Err(error) = self.stop_listener() {
+            return RepairStep { step: "重启聊天服务".into(), ok: false, detail: format!("无法停止现有监听：{error}") };
+        }
+        match self.start_listener(target, true) {
+            Ok(()) => RepairStep { step: "重启聊天服务".into(), ok: true, detail: format!("已在端口 {target} 重新监听") },
+            Err(first) if target != saved_port => {
+                target = saved_port;
+                match self.start_listener(target, true) {
+                    Ok(()) => RepairStep { step: "重启聊天服务".into(), ok: true, detail: format!("原端口不可用（{first}），已改用默认端口 {target}") },
+                    Err(second) => RepairStep { step: "重启聊天服务".into(), ok: false, detail: format!("重启失败，服务已停止；原端口：{first}；默认端口：{second}") },
+                }
+            }
+            Err(error) => RepairStep { step: "重启聊天服务".into(), ok: false, detail: format!("重启失败，服务已停止：{error}") },
+        }
+    }
+
+    /// Drops the current browse daemon and starts a fresh mDNS browse. Advertised
+    /// service records owned by the chat listener are left untouched.
+    fn rebuild_discovery(&self) -> crate::diagnostics::RepairStep {
+        use crate::diagnostics::RepairStep;
+        let mut slot = match self.discovery.lock() {
+            Ok(slot) => slot,
+            Err(_) => return RepairStep { step: "重建局域网发现".into(), ok: false, detail: "局域网发现不可用".into() },
+        };
+        *slot = None;
+        match Discovery::browse() {
+            Ok(discovery) => {
+                let count = discovery.candidates().map(|items| items.len()).unwrap_or(0);
+                *slot = Some(discovery);
+                RepairStep { step: "重建局域网发现".into(), ok: true, detail: format!("已重新浏览 mDNS，当前候选 {count} 个") }
+            }
+            Err(_) => RepairStep { step: "重建局域网发现".into(), ok: false, detail: "无法启动局域网发现，请检查网络和防火墙".into() },
+        }
+    }
+}
+
+/// Bounded repair: only restarts the local listener and/or rebuilds mDNS discovery.
+/// Identity, contacts, messages and the saved default port are never changed.
+#[tauri::command]
+pub async fn v1_network_repair(app: tauri::AppHandle, action: String) -> Result<crate::diagnostics::RepairReport, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let mut report = crate::diagnostics::RepairReport::new();
+        let restart = action == "restart" || action == "all";
+        let rediscover = action == "rediscover" || action == "all";
+        if !restart && !rediscover { return Err("未知的修复操作".into()); }
+        if restart { report.steps.push(state.restart_chat_listener()); }
+        if rediscover { report.steps.push(state.rebuild_discovery()); }
+        Ok(report)
+    }).await.map_err(|_| "网络修复任务异常".to_owned())?
+}
+
+/// Read-only storage snapshot: data directory, database, attachment quota and the
+/// free space of every receive directory.
+#[tauri::command]
+pub async fn v1_space_diagnostics(app: tauri::AppHandle) -> Result<crate::diagnostics::SpaceReport, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+        Ok(crate::diagnostics::space_report(&state.data_dir, &store))
+    }).await.map_err(|_| "空间检测任务异常".to_owned())?
 }
 
 struct ProbeGuard(Arc<AtomicBool>);
@@ -448,13 +713,64 @@ pub fn v1_confirm_contact(state: tauri::State<'_, AppState>, fingerprint: String
     state.confirm_observed(&fingerprint, &checked_fingerprint, &display_name)
 }
 
+/// Rebuilds the mDNS announcement after the local profile changed, so peers see the
+/// new nickname instead of what was broadcast at launch.
+#[tauri::command]
+pub async fn v1_refresh_listener(app: tauri::AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let (port, chat) = {
+            let slot = state.probe_service.lock().map_err(|_| "探测服务不可用".to_owned())?;
+            match slot.as_ref() {
+                Some(service) => (service.port(), state.chat_listener.load(Ordering::Acquire)),
+                None => return Err("监听未启动".to_owned()),
+            }
+        };
+        state.stop_listener()?;
+        for attempt in 0..3u64 {
+            if attempt > 0 { std::thread::sleep(std::time::Duration::from_millis(250 * attempt)); }
+            if state.start_listener(port, chat).is_ok() { return Ok(()); }
+        }
+        Err("刷新监听失败，请在局域网用户页重新开始监听".to_owned())
+    }).await.map_err(|_| "刷新监听任务异常".to_owned())?
+}
+
 #[tauri::command]
 pub fn v1_discovery_snapshot(state: tauri::State<'_, AppState>) -> Result<Vec<crate::discovery::Candidate>, String> {
-    let mut discovery = state.discovery.lock().map_err(|_| "局域网发现不可用".to_owned())?;
-    if discovery.is_none() {
-        *discovery = Some(Discovery::browse().map_err(|_| "无法启动局域网发现，请检查网络和防火墙".to_owned())?);
-    }
+    state.ensure_discovery()?;
+    let discovery = state.discovery.lock().map_err(|_| "局域网发现不可用".to_owned())?;
     discovery.as_ref().expect("initialized above").candidates().map_err(str::to_owned)
+}
+
+/// Launch-time listener: Qbird listens as soon as it starts, so peers can reach it
+/// without opening the discover page first.
+pub fn start_listener_on_launch(app: tauri::AppHandle) {
+    std::thread::spawn(move || {
+        let state = app.state::<AppState>();
+        let port = {
+            let Ok(store) = state.store.lock() else { return };
+            read_network(&store).map(|settings| settings.default_port).unwrap_or(DEFAULT_LISTEN_PORT)
+        };
+        // The previous instance may still be releasing the port.
+        for attempt in 0..4u64 {
+            if attempt > 0 { std::thread::sleep(std::time::Duration::from_millis(300 * attempt)); }
+            if state.start_listener(port, true).is_ok() {
+                let _ = state.ensure_discovery();
+                return;
+            }
+        }
+        // Last resort: bind any free port; mDNS advertises the actual one.
+        if state.start_listener(0, true).is_ok() { let _ = state.ensure_discovery(); }
+    });
+}
+
+/// Supervises the listener: a worker that died without a manual stop is restarted.
+pub fn watch_listener(app: tauri::AppHandle) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_secs(15));
+        let state = app.state::<AppState>();
+        if state.restart_dead_listener() { let _ = state.ensure_discovery(); }
+    });
 }
 
 impl AppState {
@@ -470,7 +786,7 @@ impl AppState {
         let store = Store::open(&database_path)?;
         // A configured lock always starts locked, even after a crash.
         let locked = crate::lock::is_configured(&store).unwrap_or(false);
-        Ok(Self { identity, store: Arc::new(Mutex::new(store)), discovery: Mutex::new(None), probe_service: Mutex::new(None), retry_queue: Mutex::new(None), outbound_probe: Arc::new(AtomicBool::new(false)), outbound_chat: Arc::new(AtomicBool::new(false)), last_outbound_fingerprint: Arc::new(Mutex::new(None)), locked: AtomicBool::new(locked), data_dir: Arc::new(dir.to_path_buf()) })
+        Ok(Self { identity, store: Arc::new(Mutex::new(store)), discovery: Mutex::new(None), probe_service: Mutex::new(None), retry_queue: Mutex::new(None), outbound_probe: Arc::new(AtomicBool::new(false)), outbound_chat: Arc::new(AtomicBool::new(false)), last_outbound_fingerprint: Arc::new(Mutex::new(None)), locked: AtomicBool::new(locked), data_dir: Arc::new(dir.to_path_buf()), capture: Mutex::new(None), chat_listener: AtomicBool::new(false) })
     }
 }
 
@@ -629,6 +945,11 @@ pub async fn v1_add_contact(
                 return Err("无法确认联系人".into());
             }
         }
+    }
+    // Keep the probed address: without it a cross-subnet contact can never be
+    // reached again and queued messages would stay pending forever.
+    if let Ok(store) = state.store.lock() {
+        let _ = store.set_contact_address(&fingerprint, &address.to_string());
     }
     // Tell the peer to add us back. Failure is expected when it is offline or has
     // automatic acceptance disabled; the local contact stays saved either way.
@@ -818,6 +1139,88 @@ pub fn v1_save_temp_image(state: tauri::State<'_, AppState>, bytes: Vec<u8>, ext
     let path = dir.join(name);
     std::fs::write(&path, &bytes).map_err(|_| "无法保存截图".to_owned())?;
     path.to_str().map(str::to_owned).ok_or_else(|| "截图路径无效".to_owned())
+}
+
+/// Hides the main window, captures the screen and opens the fullscreen overlay where
+/// the user picks a region. The capture is stored so the overlay can fetch it after
+/// its page has loaded.
+#[tauri::command]
+pub async fn v1_begin_capture(app: tauri::AppHandle) -> Result<(), String> {
+    if app.get_webview_window("capture").is_some() { return Ok(()); }
+    if let Some(window) = app.get_webview_window("main") { let _ = window.hide(); }
+    let shot = tauri::async_runtime::spawn_blocking(|| {
+        // Give the compositor a moment so the hidden window is not part of the shot.
+        std::thread::sleep(std::time::Duration::from_millis(180));
+        crate::capture::capture()
+    }).await.map_err(|_| "截图任务异常".to_owned())??;
+    {
+        let state = app.state::<AppState>();
+        let mut slot = state.capture.lock().map_err(|_| "截图状态不可用".to_owned())?;
+        *slot = Some(shot);
+    }
+    let window = tauri::WebviewWindowBuilder::new(&app, "capture", tauri::WebviewUrl::App("capture.html".into()))
+        .title("Qbird 截图")
+        .decorations(false)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .resizable(false)
+        .fullscreen(true)
+        .build();
+    let window = match window {
+        Ok(window) => window,
+        Err(_) => {
+            // Never leave the app invisible when the overlay cannot open.
+            if let Some(main) = app.get_webview_window("main") { let _ = main.show(); let _ = main.set_focus(); }
+            let state = app.state::<AppState>();
+            if let Ok(mut slot) = state.capture.lock() { *slot = None; }
+            return Err("无法打开截图窗口".to_owned());
+        }
+    };
+    let handle = app.clone();
+    window.on_window_event(move |event| {
+        // Safety net: the app must never stay invisible if the overlay goes away.
+        if let tauri::WindowEvent::Destroyed = event {
+            if let Some(main) = handle.get_webview_window("main") { let _ = main.show(); let _ = main.set_focus(); }
+            if let Some(state) = handle.try_state::<AppState>() {
+                if let Ok(mut slot) = state.capture.lock() { *slot = None; }
+            }
+        }
+    });
+    let _ = window.set_focus();
+    Ok(())
+}
+
+#[derive(serde::Serialize)]
+pub struct CaptureImage {
+    pub data_url: String,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Screen image for the overlay window; only valid while a capture is in progress.
+#[tauri::command]
+pub fn v1_capture_current(state: tauri::State<'_, AppState>) -> Result<CaptureImage, String> {
+    let slot = state.capture.lock().map_err(|_| "截图状态不可用".to_owned())?;
+    let shot = slot.as_ref().ok_or_else(|| "没有待处理的截图".to_owned())?;
+    Ok(CaptureImage { data_url: shot.data_url.clone(), width: shot.width, height: shot.height })
+}
+
+/// Closes the overlay, restores the main window and hands the cropped temp file
+/// (if any) back to the chat window. `None` means the user cancelled.
+#[tauri::command]
+pub fn v1_end_capture(app: tauri::AppHandle, path: Option<String>) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("capture") { let _ = window.close(); }
+    {
+        let state = app.state::<AppState>();
+        if let Ok(mut slot) = state.capture.lock() { *slot = None; };
+    }
+    if let Some(main) = app.get_webview_window("main") {
+        let _ = main.unminimize();
+        let _ = main.show();
+        let _ = main.set_focus();
+    }
+    if let Some(path) = path { let _ = app.emit("qbird://capture-done", path); }
+    Ok(())
 }
 
 /// Experimental switches; each defaults to off and is stored as "0"/"1".
@@ -1049,6 +1452,27 @@ pub fn v1_plugin_preview(state: tauri::State<'_, AppState>, file_name: String) -
 }
 
 /// Base64 bytes for a completed attachment, bounded so the IPC payload stays sane.
+/// Bounded data URL for a local image the user just picked, so the composer can show
+/// a thumbnail before anything is queued. Read-only and extension-whitelisted.
+#[tauri::command]
+pub fn v1_local_preview(path: String) -> Result<String, String> {
+    let source = std::path::PathBuf::from(&path);
+    let extension = source.extension().and_then(|value| value.to_str()).unwrap_or("").to_ascii_lowercase();
+    let mime = match extension.as_str() {
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "jpg" | "jpeg" => "image/jpeg",
+        _ => return Err("仅支持图片预览".into()),
+    };
+    let size = crate::files::file_size(&source).map_err(|_| "无法读取图片".to_owned())?;
+    if size == 0 { return Err("暂不支持空文件".into()); }
+    if size > 8 * 1024 * 1024 { return Err("图片超过 8 MiB，暂不能预览".into()); }
+    let data = std::fs::read(&source).map_err(|_| "无法读取图片".to_owned())?;
+    Ok(format!("data:{mime};base64,{}", crate::files::base64_encode(&data)))
+}
+
 #[tauri::command]
 pub fn v1_attachment_base64(state: tauri::State<'_, AppState>, message_id: String) -> Result<String, String> {
     let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
@@ -1073,6 +1497,85 @@ pub fn v1_group_attachment_base64(state: tauri::State<'_, AppState>, group_id: S
     if size == 0 || size > crate::plugins::MAX_ENTRY_BYTES { return Err("文件过大，暂不能交给插件预览".into()); }
     let data = std::fs::read(&path).map_err(|_| "无法读取群文件".to_owned())?;
     Ok(crate::files::base64_encode(&data))
+}
+
+/// Raw bytes for the workspace PDF viewer. The path is resolved from the local
+/// message id, the file must be a completed attachment and must actually start with
+/// `%PDF-`; oversized or renamed files are refused instead of guessed at.
+#[tauri::command]
+pub fn v1_attachment_bytes(state: tauri::State<'_, AppState>, message_id: String)
+    -> Result<tauri::ipc::Response, String> {
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    let Some((name, path)) = store.attachment_path(&message_id).map_err(|_| "无法读取附件".to_owned())? else {
+        return Err("文件尚未接收完成或已被移动".into());
+    };
+    if !crate::files::is_pdf(&name) { return Err("该类型暂不支持字节预览".into()); }
+    let size = crate::files::file_size(&path).map_err(|_| "无法读取附件".to_owned())?;
+    if size > crate::files::MAX_WORKSPACE_BYTES {
+        return Err(format!("文件超过 {} MiB，暂不能预览", crate::files::MAX_WORKSPACE_BYTES / (1024 * 1024)));
+    }
+    let data = crate::files::read_pdf_preview(&path).map_err(|_| "无法读取附件".to_owned())?;
+    let Some(bytes) = data else { return Err("文件为空、不是有效的 PDF 或已被移动".into()); };
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
+/// Same as `v1_attachment_bytes` for group files; membership and message ownership
+/// are still checked by the storage layer.
+#[tauri::command]
+pub fn v1_group_attachment_bytes(state: tauri::State<'_, AppState>, group_id: String, message_id: String)
+    -> Result<tauri::ipc::Response, String> {
+    let self_id = state.identity.fingerprint();
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    let Some((name, path)) = store.group_attachment_path(&group_id, &self_id, &message_id)
+        .map_err(|_| "无法读取群文件".to_owned())? else {
+        return Err("文件尚未接收完成或已被移动".into());
+    };
+    if !crate::files::is_pdf(&name) { return Err("该类型暂不支持字节预览".into()); }
+    let size = crate::files::file_size(&path).map_err(|_| "无法读取群文件".to_owned())?;
+    if size > crate::files::MAX_WORKSPACE_BYTES {
+        return Err(format!("文件超过 {} MiB，暂不能预览", crate::files::MAX_WORKSPACE_BYTES / (1024 * 1024)));
+    }
+    let data = crate::files::read_pdf_preview(&path).map_err(|_| "无法读取群文件".to_owned())?;
+    let Some(bytes) = data else { return Err("文件为空、不是有效的 PDF 或已被移动".into()); };
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
+/// Opens an http(s) URL in the system browser. Only web schemes are accepted so the
+/// workspace cannot be used to launch local executables or file:// paths.
+#[tauri::command]
+pub fn v1_open_external_url(url: String) -> Result<(), String> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() || trimmed.len() > 2048 { return Err("链接无效".into()); }
+    if trimmed.chars().any(|c| c.is_control() || c.is_whitespace()) { return Err("链接无效".into()); }
+    let lower = trimmed.to_ascii_lowercase();
+    if !lower.starts_with("http://") && !lower.starts_with("https://") {
+        return Err("只允许打开 http 或 https 链接".into());
+    }
+    open_url(trimmed)
+}
+
+fn open_url(url: &str) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::UI::Shell::ShellExecuteW;
+        use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+        let verb: Vec<u16> = "open\0".encode_utf16().collect();
+        let target: Vec<u16> = std::ffi::OsStr::new(url).encode_wide().chain(std::iter::once(0)).collect();
+        let result = unsafe {
+            ShellExecuteW(std::ptr::null_mut(), verb.as_ptr(), target.as_ptr(), std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL)
+        };
+        if (result as isize) <= 32 { return Err("无法用系统浏览器打开链接".to_owned()); }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open").arg(url).spawn().map_err(|_| "无法用系统浏览器打开链接".to_owned())?;
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open").arg(url).spawn().map_err(|_| "无法用系统浏览器打开链接".to_owned())?;
+    }
+    Ok(())
 }
 
 #[derive(serde::Serialize)]
@@ -1136,6 +1639,80 @@ pub fn v1_set_image_open_mode(state: tauri::State<'_, AppState>, mode: String) -
     let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
     store.set_setting("image_open_mode", Some(&mode)).map_err(|_| "无法保存工作区设置".to_owned())?;
     Ok(mode)
+}
+
+/// What clicking a chat file bubble does: preview inside the workspace or hand the
+/// file to the system default program. Images keep using `image_open_mode`.
+#[tauri::command]
+pub fn v1_file_open_mode(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    Ok(store.get_setting("file_open_mode").map_err(|_| "无法读取工作区设置".to_owned())?
+        .filter(|value| value == "system")
+        .unwrap_or_else(|| "workspace".to_owned()))
+}
+
+#[tauri::command]
+pub fn v1_set_file_open_mode(state: tauri::State<'_, AppState>, mode: String) -> Result<String, String> {
+    if mode != "workspace" && mode != "system" { return Err("文件打开方式无效".into()); }
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    store.set_setting("file_open_mode", Some(&mode)).map_err(|_| "无法保存工作区设置".to_owned())?;
+    Ok(mode)
+}
+
+/// Settings key for what the window close button does. Values: `ask`, `tray`, `quit`.
+pub const CLOSE_ACTION_KEY: &str = "window_close_action";
+/// Emitted when the close prompt has to be shown by the frontend.
+pub const CLOSE_REQUESTED_EVENT: &str = "qbird://close-requested";
+
+#[derive(serde::Serialize)]
+pub struct WindowSettings {
+    pub close_action: String,
+}
+
+fn read_window_settings(store: &crate::storage::Store) -> WindowSettings {
+    let close_action = store.get_setting(CLOSE_ACTION_KEY).ok().flatten()
+        .filter(|value| value == "tray" || value == "quit")
+        .unwrap_or_else(|| "ask".to_owned());
+    WindowSettings { close_action }
+}
+
+/// Current close behavior; `ask` means the in-app prompt is shown every time.
+#[tauri::command]
+pub fn v1_window_settings(state: tauri::State<'_, AppState>) -> Result<WindowSettings, String> {
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    Ok(read_window_settings(&store))
+}
+
+#[tauri::command]
+pub fn v1_set_window_settings(state: tauri::State<'_, AppState>, close_action: String)
+    -> Result<WindowSettings, String> {
+    if !matches!(close_action.as_str(), "ask" | "tray" | "quit") { return Err("关闭行为无效".into()); }
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    store.set_setting(CLOSE_ACTION_KEY, Some(&close_action)).map_err(|_| "无法保存关闭行为".to_owned())?;
+    Ok(read_window_settings(&store))
+}
+
+/// Applies the choice made in the close prompt. The window stays open until the
+/// user decides, so hiding and quitting happen here and only here.
+#[tauri::command]
+pub fn v1_resolve_window_close(app: tauri::AppHandle, state: tauri::State<'_, AppState>,
+    action: String, remember: bool) -> Result<(), String> {
+    match action.as_str() {
+        "cancel" => Ok(()),
+        "tray" | "quit" => {
+            if remember {
+                let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+                store.set_setting(CLOSE_ACTION_KEY, Some(&action)).map_err(|_| "无法保存关闭行为".to_owned())?;
+            }
+            if action == "quit" {
+                app.exit(0);
+                return Ok(());
+            }
+            let window = app.get_webview_window("main").ok_or_else(|| "主窗口不可用".to_owned())?;
+            window.hide().map_err(|_| "无法隐藏主窗口".to_owned())
+        }
+        _ => Err("关闭行为无效".into()),
+    }
 }
 
 /// Returns the local avatar as raw PNG bytes, or `null` when none is saved.
@@ -1250,6 +1827,72 @@ pub fn v1_set_contact_profile(state: tauri::State<'_, AppState>, peer: String, r
 pub fn v1_search_contacts(state: tauri::State<'_, AppState>, query: String, limit: u32) -> Result<Vec<crate::storage::Contact>, String> {
     state.store.lock().map_err(|_| "本地存储不可用".to_owned())?
         .search_contacts(&query, limit).map_err(|_| "搜索条件无效".to_owned())
+}
+
+#[tauri::command]
+pub fn v1_accept_contact(state: tauri::State<'_, AppState>, fingerprint: String) -> Result<(), String> {
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    if store.confirm_candidate(&fingerprint).map_err(|_| "无法确认联系人".to_owned())? { Ok(()) }
+    else { Err("该联系人已确认或不存在".into()) }
+}
+
+#[tauri::command]
+pub fn v1_decline_contact(state: tauri::State<'_, AppState>, fingerprint: String) -> Result<(), String> {
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    if store.decline_candidate(&fingerprint).map_err(|_| "无法移除联系人".to_owned())? { Ok(()) }
+    else { Err("只能移除待确认的联系人".into()) }
+}
+
+#[derive(serde::Serialize)]
+pub struct ContactPresence {
+    pub fingerprint: String,
+    pub online: bool,
+}
+
+fn address_is_reachable(address: &str) -> bool {
+    let Ok(target) = address.parse::<std::net::SocketAddr>() else { return false };
+    std::net::TcpStream::connect_timeout(&target, std::time::Duration::from_millis(350)).is_ok()
+}
+
+/// Best-effort presence: either the peer is visible over mDNS on this LAN, or its saved
+/// address accepts a TCP connection. Reachability is not proof of identity, and an online
+/// peer may still be idle; the UI must not claim more than that.
+#[tauri::command]
+pub async fn v1_contact_presence(state: tauri::State<'_, AppState>) -> Result<Vec<ContactPresence>, String> {
+    let mut targets: Vec<(String, Option<String>)> = Vec::new();
+    {
+        let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+        for contact in store.list_contacts().map_err(|_| "无法读取联系人".to_owned())? {
+            if contact.trust_state != "verified" { continue; }
+            let address = store.contact_address(&contact.fingerprint).ok().flatten();
+            targets.push((contact.fingerprint, address));
+        }
+    }
+    let lan_addresses: Vec<String> = {
+        let discovery = state.discovery.lock().map_err(|_| "局域网发现不可用".to_owned())?;
+        match discovery.as_ref() {
+            Some(discovery) => discovery.candidates().unwrap_or_default().into_iter()
+                .flat_map(|candidate| candidate.addresses).collect(),
+            None => Vec::new(),
+        }
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = targets.into_iter().map(|(fingerprint, address)| {
+                let lan = &lan_addresses;
+                scope.spawn(move || {
+                    let host = |value: &str| value.rsplit_once(':').map(|(host, _)| host.to_owned()).unwrap_or_else(|| value.to_owned());
+                    let visible_on_lan = address.as_deref().is_some_and(|saved| {
+                        let saved_host = host(saved);
+                        lan.iter().any(|entry| host(entry) == saved_host)
+                    });
+                    let reachable = address.as_deref().is_some_and(address_is_reachable);
+                    ContactPresence { fingerprint, online: visible_on_lan || reachable }
+                })
+            }).collect();
+            handles.into_iter().filter_map(|handle| handle.join().ok()).collect()
+        })
+    }).await.map_err(|_| "在线状态查询异常".to_owned())
 }
 
 #[tauri::command]
@@ -1497,6 +2140,29 @@ pub fn v1_hide_group(state: tauri::State<'_, AppState>, group_id: String) -> Res
     let self_id = state.identity.fingerprint();
     state.store.lock().map_err(|_| "本地存储不可用".to_owned())?
         .hide_group(&group_id, &self_id).map_err(|_| "无法隐藏会话".to_owned())
+}
+
+/// One entry point for the conversation list's right-click menu: `kind` is
+/// "self", "direct" or "group" and `id` is the peer fingerprint or group id.
+#[tauri::command]
+pub fn v1_set_conversation_muted(state: tauri::State<'_, AppState>, kind: String, id: String, muted: bool) -> Result<bool, String> {
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    match kind.as_str() {
+        "self" => store.set_self_muted(muted).map_err(|_| "无法更新免打扰".to_owned()),
+        "direct" => store.set_direct_muted(&id, muted).map_err(|_| "无法更新免打扰".to_owned()),
+        "group" => store.set_group_muted(&id, &state.identity.fingerprint(), muted).map_err(|_| "无法更新免打扰".to_owned()),
+        _ => Err("未知的会话类型".to_owned()),
+    }
+}
+
+#[tauri::command]
+pub fn v1_mark_conversation_unread(state: tauri::State<'_, AppState>, kind: String, id: String) -> Result<bool, String> {
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    match kind.as_str() {
+        "direct" => store.mark_direct_unread(&id).map_err(|_| "无法标记未读".to_owned()),
+        "group" => store.mark_group_unread(&id, &state.identity.fingerprint()).map_err(|_| "无法标记未读".to_owned()),
+        _ => Err("自聊不能标记未读".to_owned()),
+    }
 }
 
 #[tauri::command]
@@ -1936,7 +2602,7 @@ mod tests {
 
     #[test]
     fn explicitly_started_chat_listener_receives_trusted_message() {
-        use std::net::{TcpListener, TcpStream};
+        use std::net::TcpStream;
         let alice = AppState::initialize(&test_dir("chat-alice")).unwrap();
         let bob = AppState::initialize(&test_dir("chat-bob")).unwrap();
         let alice_id = alice.identity.fingerprint();
@@ -1946,12 +2612,10 @@ mod tests {
             store.add_candidate(peer, "contact").unwrap();
             store.confirm_candidate(peer).unwrap();
         }
-        assert!(bob.start_listener(0, true).is_err());
-        let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = reservation.local_addr().unwrap().port();
-        drop(reservation);
+        bob.start_listener(0, true).unwrap();
+        let port = bob.probe_service.lock().unwrap().as_ref().unwrap().port();
         bob.start_listener(port, true).unwrap();
-        assert!(bob.start_listener(port, true).is_err());
+        assert!(bob.start_listener(port, false).is_err());
         let message = alice.store.lock().unwrap().queue_direct(&alice_id, &bob_id, "app listener", 1).unwrap();
         let address = format!("127.0.0.1:{port}").parse().unwrap();
         crate::chat_transport::send_one(&alice.identity, &alice.store, &bob_id, address, &message.id).unwrap();

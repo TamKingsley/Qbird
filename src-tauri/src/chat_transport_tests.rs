@@ -288,6 +288,7 @@ fn group_invite_creates_the_group_for_the_invited_member() {
     let bob = side("bob-group-invite");
     trust(&alice, &bob);
     trust(&bob, &alice);
+    bob.store.lock().unwrap().set_auto_join_groups(true).unwrap();
     let alice_id = alice.identity.fingerprint();
     let bob_id = bob.identity.fingerprint();
     let group = alice.store.lock().unwrap().create_group(&alice_id, "Team", &[bob_id.clone()], 1).unwrap();

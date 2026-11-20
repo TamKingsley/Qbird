@@ -6,6 +6,9 @@ use sha2::{Digest, Sha256};
 pub use crate::protocol::MAX_FILE_BYTES;
 pub const MAX_PREVIEW_BYTES: u64 = 8 * 1024 * 1024;
 pub const MAX_TEXT_PREVIEW_BYTES: u64 = 256 * 1024;
+/// Upper bound for workspace previews such as PDF. Larger than image previews but
+/// still bounded so the IPC payload and WebView memory stay predictable.
+pub const MAX_WORKSPACE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Preview class decided from the local name only; never from peer-supplied MIME.
 pub fn preview_kind(name: &str) -> &'static str {
@@ -63,6 +66,28 @@ pub fn is_image(name: &str) -> bool {
         Path::new(name).extension().and_then(|ext| ext.to_str()).map(|ext| ext.to_ascii_lowercase()).as_deref(),
         Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp")
     )
+}
+
+/// PDF is the only workspace preview that needs raw bytes rather than text.
+pub fn is_pdf(name: &str) -> bool {
+    matches!(
+        Path::new(name).extension().and_then(|ext| ext.to_str()).map(|ext| ext.to_ascii_lowercase()).as_deref(),
+        Some("pdf")
+    )
+}
+
+/// Read a completed PDF after checking the `%PDF-` header, so a renamed file is
+/// never handed to the built-in viewer as a PDF. `None` means “not previewable”.
+pub fn read_pdf_preview(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    let size = file_size(path)?;
+    if size == 0 || size > MAX_WORKSPACE_BYTES {
+        return Ok(None);
+    }
+    let data = fs::read(path)?;
+    if !data.starts_with(b"%PDF-") {
+        return Ok(None);
+    }
+    Ok(Some(data))
 }
 
 /// Incoming: `<message id>-<safe name>` keeps the extension for external opening.
@@ -195,6 +220,7 @@ mod tests {
         assert_eq!(sanitize_name("a\u{0000}b"), None);
         assert_eq!(sanitize_name(&"x".repeat(201)), None);
         assert!(is_image("photo.JPG") && is_image("a.png") && !is_image("a.pdf"));
+        assert!(is_pdf("report.PDF") && !is_pdf("report.pdf.txt"));
     }
 
     #[test]
@@ -203,6 +229,7 @@ mod tests {
         assert_eq!(preview_kind("a.html"), "html");
         assert_eq!(preview_kind("a.md"), "markdown");
         assert_eq!(preview_kind("报告.TXT"), "text");
+        assert_eq!(preview_kind("a.pdf"), "other");
         assert_eq!(preview_kind("a.exe"), "other");
         assert_eq!(preview_kind("noext"), "other");
     }

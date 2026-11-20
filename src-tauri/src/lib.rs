@@ -10,6 +10,7 @@ pub mod certificate;
 pub mod capture;
 pub mod chat_transport;
 pub mod chatfile;
+pub mod diagnostics;
 pub mod discovery;
 pub mod files;
 pub mod identity;
@@ -23,8 +24,77 @@ pub mod scan;
 pub mod storage;
 pub mod tls;
 
-use tauri::Manager;
 use std::path::{Path, PathBuf};
+use tauri::{Emitter, Manager, WindowEvent};
+
+/// Keeps the tray icon alive: the icon is removed as soon as the last handle drops.
+struct TrayHandle(#[allow(dead_code)] tauri::tray::TrayIcon<tauri::Wry>);
+
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
+/// Reads the saved close behavior. A missing or unreadable value falls back to
+/// asking, so a corrupt setting can never trap the user inside the app.
+fn saved_close_action(app: &tauri::AppHandle) -> String {
+    let state = app.state::<app_state::AppState>();
+    let Ok(store) = state.store.lock() else { return "ask".to_owned() };
+    store.get_setting(app_state::CLOSE_ACTION_KEY).ok().flatten().unwrap_or_else(|| "ask".to_owned())
+}
+
+/// Tray icon with a menu to reopen the window or quit while it is hidden.
+fn setup_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
+    use tauri::menu::{Menu, MenuItem};
+    use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+
+    let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "退出 Qbird", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show, &quit])?;
+    let mut builder = TrayIconBuilder::with_id("qbird-tray")
+        .tooltip("Qbird 青鸟")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "show" => show_main_window(app),
+            "quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = event {
+                show_main_window(tray.app_handle());
+            }
+        });
+    if let Some(icon) = app.default_window_icon() {
+        builder = builder.icon(icon.clone());
+    }
+    let _ = app.manage(TrayHandle(builder.build(app)?));
+    Ok(())
+}
+
+/// The window is never closed by the default handler: either the saved behavior is
+/// applied directly, or the frontend is asked to show the tray/quit prompt.
+fn install_close_behavior(app: &tauri::AppHandle) {
+    let Some(window) = app.get_webview_window("main") else { return };
+    let handle = app.clone();
+    window.on_window_event(move |event| {
+        let WindowEvent::CloseRequested { api, .. } = event else { return };
+        api.prevent_close();
+        match saved_close_action(&handle).as_str() {
+            "quit" => handle.exit(0),
+            "tray" => {
+                if let Some(window) = handle.get_webview_window("main") { let _ = window.hide(); }
+            }
+            _ => {
+                show_main_window(&handle);
+                let _ = handle.emit(app_state::CLOSE_REQUESTED_EVENT, ());
+            }
+        }
+    });
+}
 
 /// Marker written into the install directory by the NSIS installer. Its presence
 /// makes the executable keep its data in `<install dir>\data` instead of the
@@ -107,6 +177,10 @@ pub fn run() {
             let dir = resolved;
             let state = app_state::AppState::initialize(&dir).map_err(|error| std::io::Error::other(error.to_string()))?;
             app.manage(state);
+            app_state::start_listener_on_launch(app.handle().clone());
+            app_state::watch_listener(app.handle().clone());
+            setup_tray(app.handle())?;
+            install_close_behavior(app.handle());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -128,6 +202,9 @@ pub fn run() {
             app_state::v1_group_file_offer_requests,
             app_state::v1_resolve_file_offer,
             app_state::v1_capture_screen,
+            app_state::v1_begin_capture,
+            app_state::v1_capture_current,
+            app_state::v1_end_capture,
             app_state::v1_save_temp_image,
             app_state::v1_experiment_settings,
             app_state::v1_set_experiment_settings,
@@ -140,13 +217,22 @@ pub fn run() {
             app_state::v1_set_plugin_enabled,
             app_state::v1_remove_plugin,
             app_state::v1_plugin_preview,
+            app_state::v1_local_preview,
             app_state::v1_attachment_base64,
             app_state::v1_group_attachment_base64,
+            app_state::v1_attachment_bytes,
+            app_state::v1_group_attachment_bytes,
+            app_state::v1_open_external_url,
             app_state::v1_hover_settings,
             app_state::v1_set_hover_settings,
             app_state::v1_contact_network,
             app_state::v1_image_open_mode,
             app_state::v1_set_image_open_mode,
+            app_state::v1_file_open_mode,
+            app_state::v1_set_file_open_mode,
+            app_state::v1_window_settings,
+            app_state::v1_set_window_settings,
+            app_state::v1_resolve_window_close,
             app_state::v1_composer_settings,
             app_state::v1_list_stickers,
             app_state::v1_add_sticker,
@@ -168,6 +254,9 @@ pub fn run() {
             app_state::v1_set_contact_profile,
             app_state::v1_search_contacts,
             app_state::v1_list_contacts,
+            app_state::v1_accept_contact,
+            app_state::v1_decline_contact,
+            app_state::v1_contact_presence,
             app_state::v1_confirm_contact,
             app_state::v1_add_contact,
             app_state::v1_contact_sync_settings,
@@ -184,6 +273,9 @@ pub fn run() {
             app_state::v1_file_progress,
             app_state::v1_read_attachment,
             app_state::v1_read_text_attachment,
+            app_state::v1_read_group_text_attachment,
+            app_state::v1_workspace_state,
+            app_state::v1_set_workspace_state,
             app_state::v1_open_attachment,
             app_state::v1_open_group_attachment,
             app_state::v1_reveal_attachment,
@@ -193,17 +285,22 @@ pub fn run() {
             app_state::v1_restore_backup,
             app_state::v1_set_storage_quota,
             app_state::v1_deliver_direct,
+            app_state::v1_flush_direct,
             app_state::v1_open_self,
             app_state::v1_hide_self,
             app_state::v1_list_conversations,
             app_state::v1_list_self_messages,
             app_state::v1_send_self,
             app_state::v1_discovery_snapshot,
+            app_state::v1_refresh_listener,
             app_state::v1_lan_people,
             app_state::v1_start_probe_service,
             app_state::v1_start_chat_service,
             app_state::v1_stop_probe_service,
             app_state::v1_probe_status,
+            app_state::v1_network_diagnostics,
+            app_state::v1_network_repair,
+            app_state::v1_space_diagnostics,
             app_state::v1_create_group,
             app_state::v1_list_groups,
             app_state::v1_list_left_groups,
@@ -216,6 +313,8 @@ pub fn run() {
             app_state::v1_list_group_members,
             app_state::v1_open_group,
             app_state::v1_hide_group,
+            app_state::v1_set_conversation_muted,
+            app_state::v1_mark_conversation_unread,
             app_state::v1_queue_group,
             app_state::v1_queue_direct_images,
             app_state::v1_queue_group_images,

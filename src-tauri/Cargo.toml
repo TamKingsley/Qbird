@@ -1,6 +1,6 @@
 [package]
 name = "qbird"
-version = "0.1.11"
+version = "0.1.12-beta"
 edition = "2021"
 description = "Local-first LAN chat"
 license = "Apache-2.0"
@@ -13,7 +13,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "=2.7.6", features = [] }
 
 [dependencies]
-tauri = { version = "=2.12.7", features = [] }
+tauri = { version = "=2.12.7", features = ["tray-icon"] }
 tauri-plugin-dialog = "=2.8.4"
 rusqlite = { version = "=0.43.0", features = ["bundled"] }
 rcgen = { version = "=0.14.10", default-features = false, features = ["crypto", "ring"] }
@@ -27,7 +27,7 @@ rustls = { version = "=0.23.46", default-features = false, features = ["ring", "
 x509-parser = "=0.18.1"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_System_SystemInformation", "Win32_UI_Input_KeyboardAndMouse", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell"] }
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_System_SystemInformation", "Win32_UI_Input_KeyboardAndMouse", "Win32_Storage_FileSystem", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell"] }
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]
