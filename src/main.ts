@@ -6,6 +6,7 @@ import { version as appVersion } from '../package.json';
 import { DirectChat } from './direct_chat';
 import { GroupChat } from './group_chat';
 import { captureRegion } from './screenshot';
+import { composerTools, toolIcon } from './ui_icons';
 
 type Page = 'messages' | 'contacts' | 'discover' | 'settings' | 'about' | 'profile';
 const root = document.querySelector<HTMLDivElement>('#app');
@@ -14,8 +15,19 @@ const app = root;
 let page: Page = 'messages';
 let menuOpen = false;
 let fingerprint = isTauri() ? '正在读取…' : '仅桌面应用可读取';
-type Candidate = { service_name: string; addresses: string[] };
+type Candidate = { service_name: string; addresses: string[]; nickname: string | null; username: string | null };
 let candidates: Candidate[] = [];
+type LanPerson = {
+  service_name: string; address: string; fingerprint: string; qbird_id: string;
+  nickname: string | null; username: string | null; known: boolean; verified: boolean;
+};
+let lanPeople: LanPerson[] = [];
+let lanQuery = '';
+let lanStatus = isTauri() ? '正在识别同网段用户…' : '仅桌面应用支持局域网发现';
+let lanLoading = false;
+let lanAddBusy = '';
+let lanNotice = '';
+let lanRefreshedAt = 0;
 let discoveryStatus = isTauri() ? '正在查找…' : '仅桌面应用支持局域网发现';
 let discoveryLoading = false;
 type ProbeRequest = { fingerprint: string; remote_ip: string };
@@ -40,7 +52,7 @@ let remoteFingerprint = '';
 let observedAddress = '';
 let probeBusy = false;
 let selectedFingerprint = '';
-type Contact = { fingerprint: string; display_name: string; trust_state: string; remark: string | null; category: string | null };
+type Contact = { fingerprint: string; display_name: string; trust_state: string; username: string | null; remark: string | null; category: string | null };
 let contactQuery = '';
 let profileNotice = '';
 let avatarUrl: string | null = null;
@@ -53,14 +65,28 @@ let experimentNotice = '';
 let composer: ComposerSettings = { send_shortcut: 'enter', rows: 3 };
 let composerNotice = '';
 type GroupSearchHit = { group_id: string; name: string; owner: string; member_count: number; reported_by: string; owner_known: boolean };
+type GroupInvitation = { id: string; group_id: string; name: string; owner: string; owner_name: string | null; member_count: number; created_at: number };
+let groupInvites: GroupInvitation[] = [];
+let leftGroups: Group[] = [];
+let invitesNotice = '';
+let autoJoinGroups = false;
+let autoAcceptContacts = true;
+let contactSyncNotice = '';
 type JoinRequest = { id: string; group_id: string; group_name: string; owner: string; applicant: string; applicant_name: string; created_at: number; status: string };
 let groupSearchHits: GroupSearchHit[] = [];
 let groupSearchStatus = '';
 let groupSearchBusy = false;
 let joinRequests: { incoming: JoinRequest[]; outgoing: JoinRequest[] } = { incoming: [], outgoing: [] };
 let joinNotice = '';
-type FileAcceptMode = { confirm: boolean };
-let fileAccept: FileAcceptMode = { confirm: false };
+type FileAcceptSettings = { mode: 'always' | 'remember' | 'auto'; remembered: string[] };
+let fileAccept: FileAcceptSettings = { mode: 'always', remembered: [] };
+type FileRecvSettings = { direct: string; group: string; direct_custom: boolean; group_custom: boolean };
+let fileRecv: FileRecvSettings = { direct: '', group: '', direct_custom: false, group_custom: false };
+const ACCEPT_MODE_LABEL: Record<FileAcceptSettings['mode'], string> = {
+  always: '每次都询问（默认）',
+  remember: '只询问未记住的来源',
+  auto: '全部自动接收',
+};
 let fileAcceptNotice = '';
 let team = { name: '', has_logo: false };
 let teamLogoUrl: string | null = null;
@@ -81,7 +107,18 @@ let stickersLoaded = false;
 const stickerUrls = new Map<string, string>();
 let stickerManage = false;
 let emojiNotice = '';
-type Profile = { nickname: string; email: string };
+type Profile = { nickname: string; email: string; username: string };
+type OnboardingState = { done: boolean; profile: Profile; qbird_id: string };
+let onboardingLoaded = !isTauri();
+let onboarding: OnboardingState | null = null;
+let onboardingStep = 1;
+let onboardingBusy = false;
+let onboardingNotice = '';
+let onboardingDraft = { nickname: '', username: '', email: '', recvDir: '' };
+let qbirdId = '';
+let contactNotice = '';
+/// Browser-only visual check of the first-run flow (`?demo=1`); desktop builds ignore it.
+const demoMode = !isTauri() && new URLSearchParams(location.search).get('demo') === '1';
 type Conversation = { id: string; last_body: string; last_logical: number; kind: string; unread: number };
 type Group = { id: string; name: string; owner: string; member_count: number; hidden: boolean; is_owner: boolean; last_body: string; last_logical: number };
 let groups: Group[] = [];
@@ -264,7 +301,7 @@ function selfChatView(): string {
   return `<section class="self-chat" aria-label="自聊">
     <header class="chat-header"><div><strong>自己</strong><small>仅保存在本机</small></div><div class="group-actions"><button class="outline" data-action="export-text" data-kind="self">导出文本</button><button class="outline" data-action="hide-self">不显示此会话</button></div></header>
     <div class="chat-history" id="self-history" aria-label="自聊记录"><button class="load-older" data-action="self-older" hidden>加载更早消息</button><div id="self-messages"></div></div>
-    <div class="chat-compose"><label for="self-input">消息</label><textarea id="self-input" rows="3" maxlength="32768" placeholder="写点什么…"></textarea><div class="compose-footer"><span>Enter 发送 · Shift+Enter 换行</span><button data-action="self-send">发送</button></div><p id="self-error" role="status"></p></div>
+    <div class="chat-compose"><label for="self-input">消息</label><textarea id="self-input" rows="3" maxlength="32768" placeholder="写点什么…"></textarea>${composerTools('self', 'Enter 发送 · Shift+Enter 换行', false)}<p id="self-error" role="status"></p></div>
   </section>`;
 }
 
@@ -272,9 +309,9 @@ type PlaceholderPage = 'messages' | 'contacts' | 'discover' | 'settings' | 'abou
 const pages: Record<PlaceholderPage, { title: string; eyebrow: string; heading: string; copy: string }> = {
   messages: { title: '消息', eyebrow: 'MESSAGES', heading: '还没有会话', copy: '从联系人打开自聊或已确认的单聊。' },
   contacts: { title: '联系人', eyebrow: 'CONTACTS', heading: '联系人', copy: '可搜索联系人、编辑本机备注与分组。' },
-  discover: { title: '发现', eyebrow: 'DISCOVERY', heading: '局域网发现', copy: '仅浏览同网段 IPv4 mDNS 服务；发现结果未经身份验证，不代表可信联系人。' },
+  discover: { title: '局域网用户', eyebrow: 'DISCOVERY', heading: '局域网用户', copy: '同一网段的 Qbird 用户会自动出现，点「添加」即可加入联系人。' },
   settings: { title: '设置', eyebrow: 'PREFERENCES', heading: '设置', copy: '存储配额、备份恢复与应用锁已开放；插件与更多设置将在后续阶段提供。' },
-  about: { title: '设置', eyebrow: 'ABOUT', heading: 'Qbird 青鸟', copy: '本地优先的局域网聊天工具。' },
+  about: { title: '关于', eyebrow: 'ABOUT', heading: 'Qbird 青鸟', copy: '本地优先的局域网聊天工具。' },
   profile: { title: '我的资料', eyebrow: 'PROFILE', heading: '个人资料', copy: '昵称与邮箱仅保存在本机。' }
 };
 
@@ -289,7 +326,8 @@ function formatBytes(bytes: number): string {
 function profileView(): string {
   return `<section class="card settings-card">
     <span class="eyebrow">PROFILE / 我的资料</span><h2>个人资料</h2>
-    <p>昵称和邮箱只保存在本机，不改变身份指纹；联系人看到的是对方各自保存的名称。</p>
+    <p>昵称、用户名和邮箱只保存在本机，不改变身份。用户名用于局域网搜索，昵称可以随时修改。</p>
+    <p class="hint">Qbird ID <code>${shortId(fingerprint)}</code> · 由身份密钥生成，安装后不变</p>
     <div class="avatar-row">
       <div class="avatar-preview">${avatarMarkup()}</div>
       <div class="avatar-actions">
@@ -300,10 +338,17 @@ function profileView(): string {
     </div>
     <label for="profile-nickname">昵称</label>
     <input id="profile-nickname" type="text" maxlength="64" autocomplete="off">
+    <label for="profile-username">用户名</label>
+    <input id="profile-username" type="text" maxlength="20" autocomplete="off" spellcheck="false" placeholder="2–20 位小写字母、数字、- 或 _">
     <label for="profile-email">邮箱（可选）</label>
     <input id="profile-email" type="text" maxlength="128" autocomplete="off">
     <div class="probe-row"><button class="outline" data-action="save-profile">保存资料</button></div>
     <p id="profile-notice" role="status">${profileNotice}</p>
+    <div class="probe-box"><h3>联系人添加</h3>
+      <p>同一局域网的同事添加你时，本机默认也把对方加入联系人，双方一次添加即可互相聊天。</p>
+      <p><label><input id="auto-accept-contacts" type="checkbox" ${autoAcceptContacts ? 'checked' : ''}> 自动接受对方添加（关闭后只在本机提示，不自动加入）</label></p>
+      <p id="contact-sync-notice" class="hint" role="status">${contactSyncNotice}</p>
+    </div>
     <div class="probe-box"><h3>联系人悬浮信息</h3>
       <p>悬停联系人时显示：${hover.show_ip ? 'IP 地址' : '不显示 IP'}${hover.show_mac ? '、MAC 地址' : '、不显示 MAC'}。</p>
       <p><label><input id="hover-show-ip" type="checkbox" ${hover.show_ip ? 'checked' : ''}> 显示 IP 地址（来自本机保存的联系人地址）</label></p>
@@ -321,21 +366,31 @@ async function refreshProfile(): Promise<void> {
   if (!isTauri()) return;
   try {
     const profile = await invoke<Profile>('v1_profile');
+    try {
+      const sync = await invoke<{ auto_accept: boolean }>('v1_contact_sync_settings');
+      autoAcceptContacts = sync.auto_accept;
+      const toggle = app.querySelector<HTMLInputElement>('#auto-accept-contacts');
+      if (toggle) toggle.checked = autoAcceptContacts;
+    } catch { /* keep the default */ }
     const nickname = app.querySelector<HTMLInputElement>('#profile-nickname');
+    const username = app.querySelector<HTMLInputElement>('#profile-username');
     const email = app.querySelector<HTMLInputElement>('#profile-email');
     if (nickname) nickname.value = profile.nickname;
+    if (username) username.value = profile.username;
     if (email) email.value = profile.email;
   } catch { profileNotice = '无法读取个人资料'; }
 }
 
 async function saveProfile(): Promise<void> {
   const nickname = app.querySelector<HTMLInputElement>('#profile-nickname')?.value ?? '';
+  const username = app.querySelector<HTMLInputElement>('#profile-username')?.value ?? '';
   const email = app.querySelector<HTMLInputElement>('#profile-email')?.value ?? '';
   const notice = app.querySelector<HTMLElement>('#profile-notice');
   if (!isTauri()) return;
   try {
     await invoke<Profile>('v1_set_profile', { nickname, email });
-    profileNotice = '资料已保存在本机。';
+    await invoke<Profile>('v1_set_username', { username });
+    profileNotice = '资料已保存在本机。昵称与用户名会在重新开始监听后广播给同一网段的同事。';
   } catch (error) { profileNotice = typeof error === 'string' ? error : '无法保存资料'; }
   if (notice) notice.textContent = profileNotice;
 }
@@ -411,23 +466,15 @@ function emojiPanelHtml(): string {
     <p class="emoji-notice" role="status">${emojiNotice}</p>`;
 }
 
-/// Re-created after every render, so the trigger and panel always exist together.
+/// The toolbar button is part of each template; this only mounts the shared panel.
 function applyEmojiUI(): void {
   for (const compose of app.querySelectorAll<HTMLElement>('.chat-compose')) {
-    if (compose.querySelector('[data-action="toggle-emoji"]')) continue;
-    const footer = compose.querySelector<HTMLElement>('.compose-footer');
-    if (!footer) continue;
-    const toggle = document.createElement('button');
-    toggle.type = 'button';
-    toggle.className = 'outline emoji-toggle';
-    toggle.dataset.action = 'toggle-emoji';
-    toggle.textContent = '表情';
-    footer.insertBefore(toggle, footer.firstChild);
+    if (compose.querySelector('.emoji-panel')) continue;
     const panel = document.createElement('div');
     panel.className = 'emoji-panel';
     panel.hidden = true;
     panel.innerHTML = emojiPanelHtml();
-    footer.after(panel);
+    compose.append(panel);
   }
 }
 
@@ -559,6 +606,41 @@ async function saveScanBlacklist(): Promise<void> {
   if (page === 'discover') render();
 }
 
+async function refreshOnboarding(): Promise<void> {
+  if (!isTauri()) {
+    onboardingLoaded = true;
+    if (demoMode) {
+      qbirdId = 'QB-2F91-8C3D';
+      onboarding = { done: false, profile: { nickname: 'Tam', email: '', username: 'tam' }, qbird_id: qbirdId };
+      onboardingDraft = { nickname: 'Tam', username: 'tam', email: '', recvDir: '' };
+      lanPeople = [
+        { service_name: 'a', address: '192.168.1.23:42853', fingerprint: 'a'.repeat(64), qbird_id: 'QB-AAAA-1111', nickname: '林小满', username: 'xiaoman', known: true, verified: true },
+        { service_name: 'b', address: '192.168.1.41:42853', fingerprint: 'b'.repeat(64), qbird_id: 'QB-BBBB-2222', nickname: '周隐', username: 'zhouyin', known: false, verified: false },
+        { service_name: 'c', address: '192.168.1.77:42853', fingerprint: 'c'.repeat(64), qbird_id: 'QB-CCCC-3333', nickname: '陈默', username: 'chenmo', known: false, verified: false },
+      ];
+      lanStatus = '发现 3 位用户';
+      lanRefreshedAt = Date.now();
+      page = 'discover';
+    }
+    return;
+  }
+  try {
+    onboarding = await invoke<OnboardingState>('v1_onboarding_state');
+    qbirdId = onboarding.qbird_id || shortId(fingerprint);
+    if (!onboarding.done) {
+      onboardingDraft.nickname = onboarding.profile.nickname || '';
+      onboardingDraft.username = onboarding.profile.username || suggestUsername(onboarding.profile.nickname, qbirdId);
+      onboardingDraft.email = onboarding.profile.email || '';
+      page = 'discover';
+    }
+  } catch {
+    // A broken profile must not trap the user in the setup screen.
+    onboarding = { done: true, profile: { nickname: '', email: '', username: '' }, qbird_id: shortId(fingerprint) };
+  }
+  onboardingLoaded = true;
+  render();
+}
+
 async function refreshNetwork(): Promise<void> {
   if (!isTauri()) return;
   try {
@@ -651,11 +733,22 @@ function privacySettingsHtml(): string {
       <small>应用锁只隐藏界面，不加密本地 SQLite 数据库；备份密码与应用锁密码相互独立。忘记应用锁密码时目前只能在本机设置中移除后重设；Windows 身份验证重置尚未实现。</small>
     </div>
     <div class="probe-box"><h3>文件接收</h3>
-      <p>逐次确认：${fileAccept.confirm ? '已开启，收到文件时先保存在待确认列表，等你决定后再接收' : '已关闭，已确认联系人发来的文件自动接收'}。</p>
-      <p><label><input id="file-accept-confirm" type="checkbox" ${fileAccept.confirm ? 'checked' : ''}> 接收文件前逐次确认</label></p>
-      <div class="probe-row"><button class="outline" data-action="save-file-accept">保存接收设置</button></div>
+      <p>当前策略：<strong>${ACCEPT_MODE_LABEL[fileAccept.mode]}</strong>；${fileAccept.remembered.length ? `已记住 ${fileAccept.remembered.length} 个来源` : '尚未记住任何来源'}。</p>
+      <label for="file-accept-mode">接收文件时的处理方式</label>
+      <select id="file-accept-mode">
+        <option value="always" ${fileAccept.mode === 'always' ? 'selected' : ''}>每次都询问（默认）</option>
+        <option value="remember" ${fileAccept.mode === 'remember' ? 'selected' : ''}>只询问未记住的来源</option>
+        <option value="auto" ${fileAccept.mode === 'auto' ? 'selected' : ''}>全部自动接收</option>
+      </select>
+      <div class="probe-row"><button class="outline" data-action="save-file-accept">保存接收策略</button><button class="outline" data-action="forget-file-sources" ${fileAccept.remembered.length ? '' : 'disabled'}>清除已记住的来源</button></div>
+      <label>单聊接收目录</label>
+      <p><code class="recv-dir">${escapeText(fileRecv.direct || '读取中…')}</code>${fileRecv.direct_custom ? '（自定义）' : '（默认）'}</p>
+      <div class="probe-row"><button class="outline" data-action="choose-recv-direct">更改单聊目录…</button><button class="outline" data-action="reset-recv-direct" ${fileRecv.direct_custom ? '' : 'disabled'}>恢复默认</button></div>
+      <label>群聊接收目录</label>
+      <p><code class="recv-dir">${escapeText(fileRecv.group || '读取中…')}</code>${fileRecv.group_custom ? '（自定义）' : '（默认）'}</p>
+      <div class="probe-row"><button class="outline" data-action="choose-recv-group">更改群聊目录…</button><button class="outline" data-action="reset-recv-group" ${fileRecv.group_custom ? '' : 'disabled'}>恢复默认</button></div>
       <p id="file-accept-notice" role="status">${fileAcceptNotice}</p>
-      <small>开启后对方会暂停并等待；接受后对方下次重试自动续传，拒绝则不再重试。设置只影响本机，对单聊与群文件同时生效。</small>
+      <small>路径变更只影响之后接收的文件，进行中的传输和已有附件保持原路径。自定义到应用数据目录之外的文件夹不占用应用存储配额，请自行管理磁盘空间；网络盘或移动盘断线会导致传输失败，恢复后继续续传。</small>
     </div>
     <div class="probe-box"><h3>聊天备份与恢复</h3>
       <p>备份使用密码加密并校验完整性；${backupInfo ? `已校验备份：${backupInfo.message_count} 条消息 · ${new Date(backupInfo.created_at * 1000).toLocaleString()}${backupInfo.include_chat ? ' · 含聊天记录' : ' · 不含聊天记录'}` : '尚未校验备份文件'}</p>
@@ -707,16 +800,14 @@ function workspaceSettingsHtml(): string {
       </select>
       <div class="probe-row"><button class="outline" data-action="save-image-open-mode">保存图片打开方式</button></div>
       <p id="image-open-notice" role="status">${imageOpenNotice}</p>
-      <small>工作区面板可拖拽调宽；群聊目前只能预览图片，其他文件请用“打开所在目录”。</small>
+      <p>文件预览面板可拖拽调宽，支持图片、TXT/日志/CSV/JSON、Markdown 与禁用脚本的 HTML。</p>
+      <small>预览只读取已完成的本地附件，不会上传内容；群聊目前只能预览图片，其他文件请用“打开所在目录”。</small>
     </div>
     <div class="probe-box"><h3>表情</h3>
       <p>常用表情和本地表情收藏在聊天输入区的“表情”按钮中管理；收藏的表情按图片文件发送给已确认联系人。</p>
       <small>本地收藏最多 64 个，单个不超过 512 KiB，支持 PNG、JPEG、GIF 与 WebP。</small>
     </div>
-    <div class="probe-box"><h3>右侧工作区</h3>
-      <p>文件预览面板可拖拽调宽，支持图片、TXT/日志/CSV/JSON、Markdown 与禁用脚本的 HTML。</p>
-      <small>预览只读取已完成的本地附件，不会上传内容。</small>
-    </div>`;
+`;
 }
 
 function experimentalSettingsHtml(): string {
@@ -749,16 +840,47 @@ async function takeScreenshot(): Promise<void> {
 
 async function refreshFileAccept(): Promise<void> {
   if (!isTauri()) return;
-  try { fileAccept = await invoke<FileAcceptMode>('v1_file_accept_mode'); }
+  try { fileAccept = await invoke<FileAcceptSettings>('v1_file_accept_settings'); }
   catch { fileAcceptNotice = '无法读取接收设置'; }
+  try { fileRecv = await invoke<FileRecvSettings>('v1_file_recv_settings'); }
+  catch { fileAcceptNotice = '无法读取接收目录'; }
 }
 
 async function saveFileAccept(): Promise<void> {
   if (!isTauri()) return;
-  const confirm = app.querySelector<HTMLInputElement>('#file-accept-confirm')?.checked ?? false;
+  const mode = app.querySelector<HTMLSelectElement>('#file-accept-mode')?.value ?? 'always';
   try {
-    fileAccept = await invoke<FileAcceptMode>('v1_set_file_accept_mode', { confirm });
-    fileAcceptNotice = confirm ? '已开启逐次确认：收到文件时先等待你确认。' : '已关闭逐次确认：已确认联系人发来的文件自动接收。';
+    fileAccept = await invoke<FileAcceptSettings>('v1_set_file_accept_policy', { mode });
+    fileAcceptNotice = `已保存：${ACCEPT_MODE_LABEL[fileAccept.mode]}。`;
+  } catch (error) { fileAcceptNotice = displayError(error); }
+  if (page === 'settings') render();
+}
+
+async function forgetFileSources(): Promise<void> {
+  if (!isTauri()) return;
+  try {
+    fileAccept = await invoke<FileAcceptSettings>('v1_forget_file_sources');
+    fileAcceptNotice = '已清除记住的来源，之后会重新询问。';
+  } catch (error) { fileAcceptNotice = displayError(error); }
+  if (page === 'settings') render();
+}
+
+async function chooseRecvDir(kind: 'direct' | 'group'): Promise<void> {
+  if (!isTauri()) return;
+  try {
+    const picked = await openFileDialog({ directory: true, multiple: false, title: kind === 'direct' ? '选择单聊文件接收目录' : '选择群聊文件接收目录' });
+    if (typeof picked !== 'string') return;
+    fileRecv = await invoke<FileRecvSettings>('v1_set_file_recv_dir', { kind, path: picked });
+    fileAcceptNotice = `已更新${kind === 'direct' ? '单聊' : '群聊'}接收目录。`;
+  } catch (error) { fileAcceptNotice = displayError(error); }
+  if (page === 'settings') render();
+}
+
+async function resetRecvDir(kind: 'direct' | 'group'): Promise<void> {
+  if (!isTauri()) return;
+  try {
+    fileRecv = await invoke<FileRecvSettings>('v1_set_file_recv_dir', { kind, path: null });
+    fileAcceptNotice = `已恢复${kind === 'direct' ? '单聊' : '群聊'}默认接收目录。`;
   } catch (error) { fileAcceptNotice = displayError(error); }
   if (page === 'settings') render();
 }
@@ -918,36 +1040,330 @@ async function restoreBackup(overwrite: boolean): Promise<void> {
   finally { backupBusy = false; if (page === 'settings') render(); }
 }
 
-function discoveryView(): string {
-  return `<section class="discovery-panel card">
-    <span class="eyebrow">DISCOVERY / 发现</span><h2>局域网身份探测</h2>
-    <p>探测仅证明对方持有密钥，不会自动建立信任。双方须分别通过独立可靠渠道核对完整指纹。</p>
-    <div class="probe-box"><label for="probe-port">本机监听端口</label><div class="probe-row"><input id="probe-port" type="number" min="1" max="65535" aria-label="本机监听端口"><button class="outline" data-action="probe-start">启动聊天和探测</button><button class="outline" data-action="probe-stop">停止</button></div>
-    <p id="probe-status" aria-live="polite"></p><small>启动时使用设置页保存的默认端口，此处可临时修改；启动后提供探测、聊天及待发消息重试。停止后待发消息保留在本机。</small></div>
-    <div class="probe-box"><label for="probe-address">手动地址</label><div class="probe-row"><input id="probe-address" type="text" placeholder="192.168.1.8:42853" aria-label="手动地址"><button class="outline" data-action="probe-manual">探测指纹</button></div><p id="probe-message" aria-live="polite"></p>
-    <p>本机指纹：<br><code id="local-fingerprint" class="fingerprint"></code></p><p>对方指纹（未确认）：<br><span id="remote-target"></span><br><code id="remote-fingerprint" class="fingerprint"></code></p><button class="outline" data-action="select-outbound">选择此指纹核对</button></div>
-    <p id="discovery-status" aria-live="polite"></p><ul id="discovery-results" class="discovery-results"></ul>
-    <h3>收到的探测请求（未确认）</h3><ul id="probe-requests" class="discovery-results"></ul>
-    <div class="probe-box"><h3>扫描其他网段</h3>
-      <p>mDNS 只覆盖本网段；可对 /24–/32 的 IPv4 网段限速探测身份。扫描结果只是候选，不代表可信。</p>
-      <label for="scan-cidr">网段（CIDR）</label>
-      <input id="scan-cidr" type="text" maxlength="24" spellcheck="false" placeholder="192.168.1.0/24" value="${scanCidr.replace(/"/g, '&quot;')}">
-      <div class="probe-row"><button class="outline" data-action="scan-start" ${scanBusy ? 'disabled' : ''}>${scanBusy ? '扫描中…' : '开始扫描'}</button></div>
-      <p id="scan-status" role="status">${scanNotice}</p>
-      <ul class="discovery-results">${scanHits.map((hit) => `<li><span>${hit.address} · <code>${hit.fingerprint.slice(0, 16)}…</code></span><button class="outline" data-action="probe-scanned" data-address="${hit.address}">核对指纹</button></li>`).join('')}</ul>
-      <label for="scan-block">黑名单（IP 或 CIDR，逗号分隔）</label>
-      <input id="scan-block" type="text" maxlength="512" spellcheck="false" placeholder="192.168.1.20, 10.0.0.0/24" value="${scanBlacklistDraft.replace(/"/g, '&quot;')}">
-      <div class="probe-row"><button class="outline" data-action="save-scan-blacklist">保存黑名单</button></div>
-      <p id="scan-blacklist-notice" role="status">${scanBlacklistNotice}</p>
-      <small>扫描并发 4、单地址超时 400 毫秒，仅用于发现候选；黑名单中的地址不会被扫描。</small>
+function shortId(value: string): string {
+  const upper = (value || '').toUpperCase();
+  return upper.length >= 8 ? `QB-${upper.slice(0, 4)}-${upper.slice(4, 8)}` : 'QB-0000-0000';
+}
+
+function suggestUsername(nickname: string, id: string): string {
+  const slug = nickname.toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 16);
+  if (slug.length >= 2) return slug;
+  const tail = id.replace(/[^A-Za-z0-9]/g, '').slice(-4).toLowerCase() || 'qbird';
+  return `user${tail}`.slice(0, 20);
+}
+
+const USERNAME_PATTERN = /^[a-z0-9_-]{2,20}$/;
+
+/* ---------- first run ---------- */
+
+function onboardingSteps(): string {
+  const steps = [
+    [1, '你的资料', '同事如何认出你'],
+    [2, '文件位置', '接收的文件存到哪'],
+    [3, '找到同事', '同一网络里的人'],
+  ] as const;
+  return steps.map(([step, title, sub]) => `
+    <li class="${onboardingStep === step ? 'current' : ''} ${onboardingStep > step ? 'done' : ''}">
+      <span>0${step}</span><strong>${title}</strong><small>${sub}</small>
+    </li>`).join('');
+}
+
+function onboardingBrand(): string {
+  return `<aside class="ob-brand">
+    <div class="ob-brand-top"><span class="ob-logo">Q</span><div><strong>Qbird 青鸟</strong><small>局域网聊天与文件</small></div></div>
+    <div class="ob-brand-copy">
+      <p class="ob-quote">同一张网，<br>说一句话就到。</p>
+      <p class="ob-desc">不需要服务器，不经过云端。设备与设备直接通信，聊天记录只留在你自己的电脑上。</p>
     </div>
-    <div class="probe-box"><h3>确认联系人</h3><p>所选指纹：<br><code id="selected-fingerprint" class="fingerprint"></code></p>
-    <p>请通过当面或其他可靠渠道取得对方的完整指纹并输入；不要仅根据此页面显示的结果确认。对方也需要独立确认你的指纹。</p>
-    <label for="checked-fingerprint">对方通过可靠渠道提供的完整指纹</label><input id="checked-fingerprint" type="text" autocomplete="off" spellcheck="false">
-    <label for="contact-name">联系人名称</label><input id="contact-name" type="text" maxlength="128" autocomplete="off">
-    <p><label><input id="checked-independent" type="checkbox"> 我已通过独立可靠渠道核对完整指纹</label></p>
-    <button class="outline" data-action="confirm-contact">确认联系人</button><p id="confirm-message" aria-live="polite"></p></div>
+    <ol class="ob-steps">${onboardingSteps()}</ol>
+    <p class="ob-brand-foot">设置之后都可以在「设置」里修改</p>
+  </aside>`;
+}
+
+function onboardingView(): string {
+  const draft = onboardingDraft;
+  const step = onboardingStep;
+  const dir = draft.recvDir || fileRecv.direct;
+  return `<div class="onboard">
+    ${onboardingBrand()}
+    <div class="ob-main">
+      ${step === 1 ? `
+      <div class="ob-page">
+        <p class="eyebrow">STEP 1 / 3</p>
+        <h1>先认识一下你</h1>
+        <p class="lede">这些信息只保存在本机，用来让同一局域网里的同事认出你。</p>
+        <div class="ob-avatar-row">
+          <div class="ob-avatar">${avatarMarkup()}</div>
+          <div><strong class="ob-avatar-name">${escapeText(draft.nickname || '你的头像')}</strong><p class="hint">头像可在「设置 → 个人资料」中上传，本轮先跳过。</p></div>
+          <span class="ob-id">${qbirdId || 'QB-…'}</span>
+        </div>
+        <div class="field"><label for="ob-nickname">昵称 <span class="req">必填</span></label>
+          <input id="ob-nickname" type="text" maxlength="24" autocomplete="off" value="${escapeText(draft.nickname)}" placeholder="例如：Tam">
+          <p class="hint">同事在联系人列表里看到的名字，随时可改。</p></div>
+        <div class="field"><label for="ob-username">用户名 <span class="req">必填</span></label>
+          <div class="input-prefix"><span>@</span><input id="ob-username" type="text" maxlength="20" autocomplete="off" spellcheck="false" value="${escapeText(draft.username)}"></div>
+          <p class="hint">局域网内用来搜索你：2–20 位小写字母、数字、<code>-</code> 或 <code>_</code>。 <span id="ob-username-state" class="${USERNAME_PATTERN.test(draft.username) ? 'ok' : 'warn'}">${USERNAME_PATTERN.test(draft.username) ? '可用' : '待填写'}</span></p></div>
+        <div class="field"><label for="ob-email">邮箱 <span class="opt">可选</span></label>
+          <input id="ob-email" type="email" maxlength="128" autocomplete="off" value="${escapeText(draft.email)}" placeholder="仅保存在本机"></div>
+        <div class="ob-actions"><span class="hint">昵称和用户名之后都可以修改</span>
+          <button class="ob-primary" data-action="ob-next" data-step="2">下一步</button></div>
+      </div>` : step === 2 ? `
+      <div class="ob-page">
+        <p class="eyebrow">STEP 2 / 3</p>
+        <h1>接收的文件放哪里</h1>
+        <p class="lede">同事发来的图片和文件会保存到这里。身份和聊天记录仍然保存在应用的 <code>data</code> 目录。</p>
+        <div class="field"><label for="ob-path">保存位置</label>
+          <div class="ob-path-row"><input id="ob-path" type="text" readonly value="${escapeText(dir || '读取中…')}"><button class="ob-ghost" data-action="ob-pick-dir">更改…</button><button class="ob-text" data-action="ob-reset-dir">恢复默认</button></div>
+          <p class="hint">${draft.recvDir ? '已选择自定义目录 · ' : ''}目录须存在或可创建，并且当前用户可写。</p></div>
+        <div class="ob-callout"><strong>建议不要选这些位置</strong><p>C:\\Program Files、Windows、磁盘根目录。卸载或覆盖安装不会删除已经接收的文件，但受保护目录里的文件可能写入失败。</p></div>
+        <div class="ob-actions"><button class="ob-text" data-action="ob-back">返回</button><button class="ob-primary" data-action="ob-next" data-step="3">下一步</button></div>
+      </div>` : `
+      <div class="ob-page">
+        <p class="eyebrow">STEP 3 / 3</p>
+        <h1>同一网络里的同事</h1>
+        <p class="lede">Qbird 会自动发现同一网段使用它的用户。添加后会出现在你的联系人里，可以直接开始聊天。</p>
+        <div class="ob-scan"><span class="pulse"></span><span id="ob-lan-status">${escapeText(lanStatus)}</span><span class="demo-tag">未验证的局域网信息</span></div>
+        <ul class="people" id="ob-people">${lanPeople.length ? '' : `<li class="people-empty">${lanLoading ? '正在扫描同网段…' : '暂未发现其他用户。可以稍后在「局域网用户」页手动添加地址。'}</li>`}</ul>
+        <p class="hint">没看到想找的人？可以稍后在「局域网用户 → 其他网段与手动地址」中填写对方 IP。</p>
+        <p class="ob-notice" role="status">${escapeText(onboardingNotice)}</p>
+        <div class="ob-actions"><button class="ob-text" data-action="ob-finish">稍后再说</button>
+          <button class="ob-primary" data-action="ob-finish" ${onboardingBusy ? 'disabled' : ''}>${onboardingBusy ? '正在完成…' : '完成，进入 Qbird'}</button></div>
+      </div>`}
+    </div>
+  </div>`;
+}
+
+function paintOnboarding(): void {
+  if (page !== 'discover') page = 'discover';
+  app.innerHTML = onboardingView();
+  if (onboardingStep === 3) paintLanPeopleList(app.querySelector<HTMLUListElement>('#ob-people'), false);
+  const status = app.querySelector<HTMLElement>('#ob-lan-status');
+  if (status) status.textContent = lanStatus;
+}
+
+function syncOnboardingDraft(): void {
+  const nickname = app.querySelector<HTMLInputElement>('#ob-nickname');
+  const username = app.querySelector<HTMLInputElement>('#ob-username');
+  const email = app.querySelector<HTMLInputElement>('#ob-email');
+  if (nickname) onboardingDraft.nickname = nickname.value;
+  if (username) onboardingDraft.username = username.value.trim().toLowerCase();
+  if (email) onboardingDraft.email = email.value;
+}
+
+function paintUsernameState(): void {
+  const input = app.querySelector<HTMLInputElement>('#ob-username');
+  const state = app.querySelector<HTMLElement>('#ob-username-state');
+  if (!input || !state) return;
+  const value = input.value.trim().toLowerCase();
+  const valid = USERNAME_PATTERN.test(value);
+  state.textContent = valid ? '可用' : value ? '格式不正确' : '待填写';
+  state.className = valid ? 'ok' : 'warn';
+}
+
+async function submitOnboarding(): Promise<void> {
+  syncOnboardingDraft();
+  const draft = onboardingDraft;
+  const nickname = draft.nickname.trim();
+  const username = draft.username.trim();
+  if (!nickname) { onboardingNotice = '请先填写昵称'; paintOnboarding(); return; }
+  if (!USERNAME_PATTERN.test(username)) { onboardingNotice = '用户名须为 2–20 位小写字母、数字、- 或 _'; paintOnboarding(); return; }
+  onboardingBusy = true;
+  onboardingNotice = '';
+  paintOnboarding();
+  try {
+    const profile = await invoke<Profile>('v1_complete_onboarding', {
+      nickname, username, email: draft.email.trim(), recvDir: draft.recvDir || null,
+    });
+    onboarding = { done: true, profile, qbird_id: qbirdId || shortId(fingerprint) };
+    let listenNotice = '';
+    try {
+      await invoke('v1_start_chat_service', { port: networkSettings.default_port });
+      listenNotice = '已开始监听局域网，同事可以发现你。';
+    } catch {
+      listenNotice = '监听未启动：端口可能被占用，可在局域网用户页重试。';
+    }
+    onboardingBusy = false;
+    page = 'contacts';
+    contactNotice = listenNotice;
+    render();
+    void refreshContacts();
+    void refreshProbeStatus();
+  } catch (error) {
+    onboardingBusy = false;
+    onboardingNotice = displayError(error);
+    paintOnboarding();
+  }
+}
+
+/* ---------- LAN people ---------- */
+
+function lanPersonRow(person: LanPerson, allowOpen = true): string {
+  const name = person.nickname || person.username || `Qbird 用户 ${person.qbird_id.slice(-4)}`;
+  const initial = escapeText(name.slice(0, 1).toUpperCase());
+  const handle = person.username ? `<span class="p-user">@${escapeText(person.username)}</span>` : `<span class="p-user">${person.qbird_id}</span>`;
+  const meta = `<span>${escapeText(person.address)}</span><span class="sep">·</span><span>${person.verified ? '已核对指纹' : '身份未核对'}</span>`;
+  return `<li data-fingerprint="${person.fingerprint}" class="${person.known ? 'is-added' : ''}">
+    <span class="av av-40">${initial}</span>
+    <div class="p-body"><div class="p-name"><strong>${escapeText(name)}</strong>${handle}</div><div class="p-meta">${meta}</div></div>
+    ${person.known
+      ? (allowOpen
+        ? `<button class="btn-add is-added" data-action="open-direct" data-peer="${person.fingerprint}" data-name="${escapeText(person.nickname || name)}">发消息</button>`
+        : '<span class="btn-add is-added" role="status">已添加</span>')
+      : `<button class="btn-add" data-action="lan-add" data-address="${person.address}" data-fingerprint="${person.fingerprint}" data-name="${escapeText(name)}" data-username="${person.username ? escapeText(person.username) : ''}" ${lanAddBusy === person.fingerprint ? 'disabled' : ''}>${lanAddBusy === person.fingerprint ? '添加中…' : '添加'}</button>`}
+  </li>`;
+}
+
+function paintLanPeopleList(list: HTMLUListElement | null, allowOpen = true): void {
+  if (!list) return;
+  const query = lanQuery.trim().toLowerCase();
+  const rows = lanPeople.filter((person) => !query
+    || (person.nickname || '').toLowerCase().includes(query)
+    || (person.username || '').toLowerCase().includes(query)
+    || person.qbird_id.toLowerCase().includes(query));
+  list.innerHTML = rows.length
+    ? rows.map((person) => lanPersonRow(person, allowOpen)).join('')
+    : `<li class="people-empty">${lanLoading ? '正在识别同网段用户…' : lanPeople.length ? '没有匹配的用户' : '暂未发现其他用户。请确认对方已启动 Qbird，且与本机在同一网段。'}</li>`;
+}
+
+function discoveryView(): string {
+  const since = lanRefreshedAt ? `${Math.max(1, Math.round((Date.now() - lanRefreshedAt) / 1000))} 秒前刷新` : '尚未刷新';
+  const subnet = lanPeople[0]?.address.replace(/\.\d+:\d+$/, '.0/24') || '同网段';
+  return `<section class="lan-page">
+    <header class="lan-head">
+      <div><span class="eyebrow">DISCOVERY / 局域网</span><h2>局域网用户</h2>
+        <p>他们正在使用 Qbird，并且和你在同一个网络。</p></div>
+      <span class="pill ${probeStatus.running ? 'pill-live' : ''}">${probeStatus.running ? `<span class="pulse"></span>监听中 · ${probeStatus.port}` : '未监听'}</span>
+    </header>
+    <div class="lan-bar">
+      <span class="lan-net">网段 <code>${escapeText(subnet)}</code></span>
+      <input id="lan-search" type="search" maxlength="64" placeholder="搜索昵称或用户名" aria-label="搜索局域网用户" value="${escapeText(lanQuery)}">
+      <button class="outline" data-action="lan-refresh" ${lanLoading ? 'disabled' : ''}>${lanLoading ? '刷新中…' : '立即刷新'}</button>
+      ${probeStatus.running
+        ? '<button class="outline" data-action="lan-stop">停止监听</button>'
+        : '<button class="outline" data-action="lan-start">开始监听</button>'}
+    </div>
+    <p id="lan-status" class="lan-status" role="status">${escapeText(lanStatus)} · ${since}</p>
+    <ul id="lan-list" class="people lan-list"></ul>
+
+    <details class="lan-advanced">
+      <summary>其他网段与手动地址</summary>
+      <div class="lan-advanced-body">
+        <div class="field"><label for="lan-manual">手动添加地址</label>
+          <div class="probe-row"><input id="lan-manual" type="text" placeholder="192.168.2.8:42853"><input id="lan-manual-name" type="text" maxlength="24" placeholder="对方昵称（可选）"><button class="outline" data-action="lan-manual-add">探测并添加</button></div>
+          <p class="hint">适用于跨 VLAN、VPN 或已知 IP 的同事。添加前会探测地址，确认对方身份与列表一致。</p></div>
+        <div class="field"><label for="scan-cidr">扫描指定网段</label>
+          <div class="probe-row"><input id="scan-cidr" type="text" maxlength="24" spellcheck="false" placeholder="192.168.2.0/24" value="${escapeText(scanCidr)}"><button class="outline" data-action="scan-start" ${scanBusy ? 'disabled' : ''}>${scanBusy ? '扫描中…' : '开始扫描'}</button></div>
+          <p class="hint">限速扫描（4 并发、单地址 400 毫秒），只用于发现候选。结果仍需点「添加」并探测确认。</p>
+          <p id="scan-status" class="hint" role="status">${escapeText(scanNotice)}</p>
+          <ul class="people">${scanHits.map((hit) => `<li><span class="av av-40">?</span><div class="p-body"><div class="p-name"><strong>${escapeText(hit.address)}</strong></div><div class="p-meta"><span>扫描候选 · ${escapeText(hit.fingerprint.slice(0, 8))}…</span></div></div><button class="btn-add" data-action="lan-add" data-address="${escapeText(hit.address)}" data-fingerprint="${hit.fingerprint}" data-name="Qbird 用户 ${escapeText(hit.fingerprint.slice(0, 4))}">添加</button></li>`).join('')}</ul>
+          <label for="scan-block">黑名单（IP 或 CIDR，逗号分隔）</label>
+          <div class="probe-row"><input id="scan-block" type="text" maxlength="512" spellcheck="false" value="${escapeText(scanBlacklistDraft)}"><button class="outline" data-action="save-scan-blacklist">保存</button></div>
+          <p class="hint" role="status">${escapeText(scanBlacklistNotice)}</p></div>
+      </div>
+    </details>
+
+    <div class="lan-identity">
+      <span class="lan-shield">${icon('lock')}</span>
+      <div><strong>关于身份</strong><p>添加时以 Qbird ID 识别用户，昵称和用户名可以随时修改，ID 不变。需要更强确认时，可以核对完整身份指纹。</p></div>
+      <button class="outline" data-action="lan-identity">查看我的身份</button>
+    </div>
+    <p class="hint">${escapeText(lanNotice)}</p>
   </section>`;
+}
+
+function paintLan(): void {
+  paintLanPeopleList(app.querySelector<HTMLUListElement>('#lan-list'));
+  const status = app.querySelector<HTMLElement>('#lan-status');
+  if (status) {
+    const since = lanRefreshedAt ? `${Math.max(1, Math.round((Date.now() - lanRefreshedAt) / 1000))} 秒前刷新` : '尚未刷新';
+    status.textContent = `${lanStatus} · ${since}`;
+  }
+}
+
+async function refreshLanPeople(force = false): Promise<void> {
+  if (!isTauri() || lanLoading) return;
+  if (!force && lanRefreshedAt && Date.now() - lanRefreshedAt < 25_000) return;
+  lanLoading = true;
+  lanStatus = '正在识别同网段用户…';
+  if (page === 'discover') paintLan();
+  if (!onboarding?.done && onboardingStep === 3) paintOnboarding();
+  try {
+    lanPeople = await invoke<LanPerson[]>('v1_lan_people');
+    lanRefreshedAt = Date.now();
+    lanStatus = lanPeople.length ? `发现 ${lanPeople.length} 位用户` : '暂未发现其他用户';
+  } catch {
+    lanPeople = [];
+    lanStatus = '局域网发现不可用，请检查网络和防火墙';
+  } finally {
+    lanLoading = false;
+    if (page === 'discover') paintLan();
+    if (!onboarding?.done && onboardingStep === 3) paintOnboarding();
+  }
+}
+
+async function addLanPerson(button: HTMLButtonElement): Promise<void> {
+  if (!isTauri() || lanAddBusy) return;
+  const { address, fingerprint, name, username } = button.dataset;
+  if (!address || !fingerprint) return;
+  lanAddBusy = fingerprint;
+  lanNotice = '';
+  paintLan();
+  paintOnboarding();
+  try {
+    await invoke('v1_add_contact', { address, fingerprint, displayName: name || 'Qbird 用户', username: username || null });
+    const person = lanPeople.find((item) => item.fingerprint === fingerprint);
+    if (person) { person.known = true; person.verified = true; }
+    lanNotice = `已添加「${name || 'Qbird 用户'}」到联系人。对方也需要添加你才能互发消息。`;
+  } catch (error) {
+    lanNotice = displayError(error);
+  } finally {
+    lanAddBusy = '';
+    paintLan();
+    paintOnboarding();
+    if (onboardingStep === 3) paintLanPeopleList(app.querySelector<HTMLUListElement>('#ob-people'), false);
+    void refreshContacts();
+  }
+}
+
+async function pickOnboardingDir(): Promise<void> {
+  if (!isTauri()) return;
+  const picked = await openFileDialog({ directory: true, multiple: false, title: '选择接收文件保存位置' }).catch(() => null);
+  if (!picked || typeof picked !== 'string') return;
+  onboardingDraft.recvDir = picked;
+  paintOnboarding();
+}
+
+async function toggleLanListener(start: boolean): Promise<void> {
+  if (!isTauri()) return;
+  lanNotice = start ? '正在启动监听…' : '正在停止监听…';
+  paintLan();
+  try {
+    if (start) await invoke('v1_start_chat_service', { port: networkSettings.default_port });
+    else await invoke('v1_stop_probe_service');
+    await refreshProbeStatus();
+    lanNotice = start ? '已开始监听，同事可以发现你。' : '已停止监听，待发消息仍保存在本机。';
+  } catch (error) {
+    lanNotice = displayError(error);
+  }
+  paintLan();
+}
+
+async function addManualLan(): Promise<void> {
+  const address = app.querySelector<HTMLInputElement>('#lan-manual')?.value.trim() || '';
+  const name = app.querySelector<HTMLInputElement>('#lan-manual-name')?.value.trim() || '';
+  if (!address) { lanNotice = '请输入对方的 IP 和端口，例如 192.168.2.8:42853'; paintLan(); return; }
+  lanNotice = '正在探测该地址…';
+  paintLan();
+  try {
+    const fingerprint = await invoke<string>('v1_probe_peer', { address });
+    await invoke('v1_add_contact', { address, fingerprint, displayName: name || address, username: null });
+    lanNotice = `已添加 ${name || address} 到联系人。`;
+    await refreshLanPeople(true);
+  } catch (error) {
+    lanNotice = displayError(error);
+  }
+  paintLan();
+  void refreshContacts();
 }
 
 function selectFingerprint(value: string): void {
@@ -1257,16 +1673,25 @@ async function refreshContacts(): Promise<void> {
   if (!status || !list) return;
   if (!isTauri()) { status.textContent = '仅桌面应用支持联系人'; return; }
   try {
-    const [contacts, groupList] = await Promise.all([
+    const [contacts, groupList, invites, groupSettings, left] = await Promise.all([
       contactQuery ? invoke<Contact[]>('v1_search_contacts', { query: contactQuery, limit: 100 }) : invoke<Contact[]>('v1_list_contacts'),
       invoke<Group[]>('v1_list_groups'),
+      invoke<GroupInvitation[]>('v1_group_invitations'),
+      invoke<{ auto_join: boolean }>('v1_group_settings'),
+      invoke<Group[]>('v1_list_left_groups'),
     ]);
     groups = groupList;
+    leftGroups = left;
+    groupInvites = invites;
+    autoJoinGroups = groupSettings.auto_join;
     if (!list.isConnected) return;
     list.replaceChildren();
     status.textContent = contactQuery
       ? (contacts.length ? `匹配 ${contacts.length} 位联系人` : '没有匹配的联系人')
-      : (contacts.length ? `其他联系人：${contacts.length}` : '暂无其他联系人，可前往发现页面核对指纹。');
+      : (contacts.length ? `其他联系人：${contacts.length}` : '暂无其他联系人，可前往「局域网用户」添加。');
+    if (contactNotice) { status.textContent = contactNotice; contactNotice = ''; }
+    paintGroupInvitations();
+    paintLeftGroups();
     paintGroups(contacts);
     paintGroupSearch();
     await refreshJoinRequests();
@@ -1280,7 +1705,8 @@ async function refreshContacts(): Promise<void> {
       item.title = '拖到“我的群聊”中的群即可邀请入群';
       const title = document.createElement('span');
       title.className = 'contact-title';
-      title.textContent = `${contact.remark ? `${contact.remark}（${contact.display_name}）` : contact.display_name} · ${contact.trust_state === 'verified' ? '已确认' : '待确认'}${contact.category ? ` · ${contact.category}` : ''} · ${contact.fingerprint}`;
+      title.textContent = `${contact.remark ? `${contact.remark}（${contact.display_name}）` : contact.display_name} · ${contact.username ? `@${contact.username}` : shortId(contact.fingerprint)} · ${contact.trust_state === 'verified' ? '已添加' : '待确认'}${contact.category ? ` · ${contact.category}` : ''}`;
+      title.title = `Qbird ID ${shortId(contact.fingerprint)}\n指纹 ${contact.fingerprint}`;
       item.append(title);
       const actions = document.createElement('div'); actions.className = 'contact-actions';
       if (contact.trust_state === 'verified') {
@@ -1301,6 +1727,86 @@ async function refreshContacts(): Promise<void> {
       list.append(item);
     }
   } catch { if (status.isConnected) status.textContent = '无法读取联系人'; }
+}
+
+async function refreshGroupInvites(): Promise<void> {
+  if (!isTauri()) return;
+  try {
+    const invites = await invoke<GroupInvitation[]>('v1_group_invitations');
+    if (JSON.stringify(invites) !== JSON.stringify(groupInvites)) {
+      groupInvites = invites;
+      paintGroupInvitations();
+    }
+  } catch { /* keep the last list on a transient read failure */ }
+}
+
+function paintLeftGroups(): void {
+  const list = app.querySelector<HTMLUListElement>('#left-groups-list');
+  if (!list) return;
+  list.replaceChildren();
+  if (!leftGroups.length) {
+    const empty = document.createElement('li');
+    empty.textContent = '没有已退出的群聊。';
+    list.append(empty);
+    return;
+  }
+  for (const group of leftGroups) {
+    const item = document.createElement('li');
+    const info = document.createElement('span');
+    info.textContent = `${group.name} · ${group.member_count} 人 · 已退出`;
+    const button = document.createElement('button');
+    button.className = 'outline';
+    button.textContent = '查看历史';
+    button.dataset.action = 'open-left-group';
+    button.dataset.group = group.id;
+    button.dataset.name = group.name;
+    item.append(info, button);
+    list.append(item);
+  }
+}
+
+function paintGroupInvitations(): void {
+  const host = app.querySelector<HTMLElement>('#group-invitations');
+  if (!host) return;
+  host.replaceChildren();
+  const toggle = app.querySelector<HTMLInputElement>('#auto-join-groups');
+  if (toggle) toggle.checked = autoJoinGroups;
+  if (!groupInvites.length) {
+    const empty = document.createElement('p');
+    empty.className = 'hint';
+    empty.textContent = '没有待处理的邀请。';
+    host.append(empty);
+    return;
+  }
+  for (const invite of groupInvites) {
+    const row = document.createElement('div');
+    row.className = 'group-invite';
+    const text = document.createElement('div');
+    const title = document.createElement('strong');
+    title.textContent = invite.name;
+    const meta = document.createElement('small');
+    meta.textContent = `${invite.owner_name || '群主'} 邀请你加入 · ${invite.member_count} 人`;
+    text.append(title, meta);
+    const accept = document.createElement('button');
+    accept.className = 'outline';
+    accept.textContent = '同意';
+    accept.dataset.action = 'accept-invite';
+    accept.dataset.id = invite.id;
+    const decline = document.createElement('button');
+    decline.className = 'linkish';
+    decline.textContent = '拒绝';
+    decline.dataset.action = 'decline-invite';
+    decline.dataset.id = invite.id;
+    const actions = document.createElement('div');
+    actions.className = 'group-invite-actions';
+    actions.append(accept, decline);
+    row.append(text, actions);
+    host.append(row);
+  }
+  const notice = document.createElement('p');
+  notice.className = 'hint';
+  notice.textContent = invitesNotice;
+  host.append(notice);
 }
 
 function paintGroups(contacts: Contact[]): void {
@@ -1381,6 +1887,8 @@ async function createGroup(): Promise<void> {
 
 function render(): void {
   if (lockState.locked) { app.innerHTML = lockView(); return; }
+  if (!onboardingLoaded) { app.innerHTML = '<div class="boot">正在准备 Qbird…</div>'; return; }
+  if (isTauri() && onboarding && !onboarding.done) { paintOnboarding(); return; }
   const current = pages[page];
   app.innerHTML = `
     <div class="shell">
@@ -1389,7 +1897,7 @@ function render(): void {
         <nav class="rail-nav" aria-label="主要功能">
           <button data-page="messages" class="${page === 'messages' ? 'active' : ''}" aria-label="消息" title="消息">${icon('messages')}</button>
           <button data-page="contacts" class="${page === 'contacts' ? 'active' : ''}" aria-label="联系人" title="联系人">${icon('contacts')}</button>
-          <button data-page="discover" class="${page === 'discover' ? 'active' : ''}" aria-label="发现" title="发现">${icon('discover')}</button>
+          <button data-page="discover" class="${page === 'discover' ? 'active' : ''}" aria-label="局域网用户" title="局域网用户">${icon('discover')}</button>
         </nav>
         <span class="rail-brand">Qbird</span>
         <button class="rail-bottom" data-action="lock-now" aria-label="临时离开锁定" title="临时离开锁定">${icon('lock')}</button>
@@ -1403,10 +1911,11 @@ function render(): void {
         <div class="side-foot"><span class="dot"></span>开发中 · 本地桌面版</div>
       </aside>
       <main class="workspace">
-        ${page === 'messages' && groupChat.groupId ? groupChat.view() : page === 'messages' && direct.peer ? direct.view() : page === 'messages' && selfOpen ? selfChatView() : page === 'discover' ? discoveryView() : page === 'settings' ? settingsView() : page === 'profile' ? profileView() : page === 'contacts' ? `<section class="discovery-panel card"><h2>联系人</h2><button class="self-contact" data-action="open-self" ${isTauri() ? '' : 'disabled'}><strong>自己</strong><span>打开本地自聊</span></button><p>已确认的联系人保存在本机；双方须各自核对指纹后才能聊天。</p><label for="contact-search">搜索联系人</label><input id="contact-search" type="search" maxlength="64" placeholder="名称、备注、分组或指纹" value="${contactQuery.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;')}"><p id="contacts-status" aria-live="polite"></p><ul id="contacts-list" class="discovery-results"></ul><div class="probe-box"><h3>我的群聊</h3><ul id="groups-list" class="discovery-results"></ul><div id="join-requests"></div><label for="group-search-name">按群名搜索并申请加入</label><div class="probe-row"><input id="group-search-name" type="text" maxlength="64" placeholder="群名关键词"><button class="outline" data-action="search-groups" ${groupSearchBusy ? 'disabled' : ''}>搜索</button></div><p id="group-search-status" role="status">${groupSearchStatus}</p><ul id="group-search-results" class="discovery-results"></ul><small>只会向已确认且有地址的联系人查询；申请直接发给群主，因此群主须是本机已确认联系人。对方离线时不保证送达。</small></div><div class="probe-box"><h3>新建群聊</h3><label for="group-name">新建群聊名称</label><input id="group-name" type="text" maxlength="128" placeholder="例如：项目组"><div id="group-members-pick" class="group-pick"></div><button class="outline" data-action="create-group">创建群聊</button><p id="group-create-status" aria-live="polite"></p><small>只能邀请已确认的联系人；新成员只能看到加入之后的消息。</small></div></section>` : page === 'about' ? `<section class="card about"><span class="eyebrow">ABOUT / 关于</span><h2>Qbird 青鸟</h2><p>面向局域网的本地优先聊天与文件交流工具。</p><dl><div><dt>当前阶段</dt><dd>Windows 开发版 ${appVersion}</dd></div><div><dt>许可证</dt><dd>Apache License 2.0</dd></div><div><dt>平台规划</dt><dd>Windows 首发 · 后续 Linux / macOS</dd></div></dl><p class="notice">开发版未经安全审计，本地数据库未加密。</p></section>` : `<section class="empty"><div class="empty-mark">${icon('spark')}</div><h2>${current.heading}</h2><p>${current.copy}</p></section>`}
+        ${page === 'messages' && groupChat.groupId ? groupChat.view() : page === 'messages' && direct.peer ? direct.view() : page === 'messages' && selfOpen ? selfChatView() : page === 'discover' ? discoveryView() : page === 'settings' ? settingsView() : page === 'profile' ? profileView() : page === 'contacts' ? `<section class="discovery-panel card"><span class="eyebrow">CONTACTS / 联系人</span><h2>联系人</h2><button class="self-contact" data-action="open-self" ${isTauri() ? '' : 'disabled'}><strong>自己</strong><span>打开本地自聊</span></button><p>联系人保存在本机。添加是单向的：对方也添加你之后，双方才能互发消息。</p><label for="contact-search">搜索联系人</label><input id="contact-search" type="search" maxlength="64" placeholder="搜索用户名、昵称或备注" value="${contactQuery.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;')}"><p id="contacts-status" aria-live="polite"></p><ul id="contacts-list" class="discovery-results"></ul><div class="probe-box" id="group-invite-box"><h3>群聊邀请</h3><div id="group-invitations"></div></div>
+<div class="probe-box"><h3>我的群聊</h3><p class="hint">默认先询问是否加入；勾选后，被拉进群会自动加入。</p><p><label><input id="auto-join-groups" type="checkbox" ${autoJoinGroups ? 'checked' : ''}> 被拉进群时自动加入</label></p><ul id="groups-list" class="discovery-results"></ul><div id="join-requests"></div><label for="group-search-name">按群名搜索并申请加入</label><div class="probe-row"><input id="group-search-name" type="text" maxlength="64" placeholder="群名关键词"><button class="outline" data-action="search-groups" ${groupSearchBusy ? 'disabled' : ''}>搜索</button></div><p id="group-search-status" role="status">${groupSearchStatus}</p><ul id="group-search-results" class="discovery-results"></ul><small>只会向已确认且有地址的联系人查询；申请直接发给群主，因此群主须是本机已确认联系人。对方离线时不保证送达。</small></div><div class="probe-box"><h3>新建群聊</h3><label for="group-name">新建群聊名称</label><input id="group-name" type="text" maxlength="128" placeholder="例如：项目组"><div id="group-members-pick" class="group-pick"></div><button class="outline" data-action="create-group">创建群聊</button><p id="group-create-status" aria-live="polite"></p><small>只能邀请已确认的联系人；新成员只能看到加入之后的消息。</small></div><div class="probe-box"><h3>已退出的群聊</h3><p class="hint">退出后消息记录仍保留在本机，可随时查看或导出。</p><ul id="left-groups-list" class="discovery-results"></ul></div></section>` : page === 'about' ? `<section class="card about"><span class="eyebrow">ABOUT / 关于</span><h2>Qbird 青鸟</h2><p>面向局域网的本地优先聊天与文件交流工具。</p><dl><div><dt>当前阶段</dt><dd>Windows 开发版 ${appVersion}</dd></div><div><dt>许可证</dt><dd>Apache License 2.0</dd></div><div><dt>平台规划</dt><dd>Windows 首发 · 后续 Linux / macOS</dd></div></dl><p class="notice">开发版未经安全审计，本地数据库未加密。</p></section>` : `<section class="empty"><div class="empty-mark">${icon('spark')}</div><h2>${current.heading}</h2><p>${current.copy}</p></section>`}
       </main>
     </div>`;
-  if (page === 'discover') paintDiscovery();
+  if (page === 'discover') { paintLan(); void refreshLanPeople(); }
   if (page === 'settings') void refreshStorage();
   if (page === 'profile') void refreshProfile();
   if (page === 'messages') {
@@ -1505,7 +2014,7 @@ async function refreshProbeStatus(): Promise<void> {
     probeStatus = await invoke<ProbeStatus>('v1_probe_status');
     probeNotice = probeStatus.running ? `聊天与探测监听中：TCP ${probeStatus.port}` : probeStatus.port !== null ? '监听异常停止，请先停止再重试' : '聊天与探测服务未启动';
   } catch { probeNotice = '无法读取探测服务状态'; }
-  if (page === 'discover') paintDiscovery();
+  if (page === 'discover') paintLan();
 }
 
 function lockView(): string {
@@ -1755,13 +2264,13 @@ async function setProbeService(start: boolean): Promise<void> {
   if (start && (!Number.isInteger(port) || port < 1 || port > 65535)) {
     probeMessage = '请输入 1–65535 的端口'; paintDiscovery(); return;
   }
-  probeBusy = true; probeMessage = ''; paintDiscovery();
+  probeBusy = true; probeMessage = ''; paintLan();
   try {
     if (start) await invoke('v1_start_chat_service', { port });
     else await invoke('v1_stop_probe_service');
     await refreshProbeStatus();
   } catch (error) { probeMessage = displayError(error); }
-  finally { probeBusy = false; if (page === 'discover') paintDiscovery(); }
+  finally { probeBusy = false; if (page === 'discover') paintLan(); }
 }
 
 async function probePeer(address: string): Promise<void> {
@@ -1795,6 +2304,10 @@ app.addEventListener('input', (event) => {
   if (target.id === 'group-search-category') { groupChat.searchDraft('category', target.value); return; }
   if (target.id === 'backup-password') { backupPassword = target.value; return; }
   if (target.id === 'contact-search') { contactQuery = target.value; void refreshContacts(); return; }
+  if (target.id === 'lan-search') { lanQuery = target.value; paintLanPeopleList(app.querySelector<HTMLUListElement>('#lan-list')); return; }
+  if (target.id === 'ob-nickname') { onboardingDraft.nickname = target.value; return; }
+  if (target.id === 'ob-username') { onboardingDraft.username = target.value.trim().toLowerCase(); paintUsernameState(); return; }
+  if (target.id === 'ob-email') { onboardingDraft.email = target.value; return; }
   if (target.id === 'global-search') { searchQuery = target.value; scheduleSearch(); return; }
 });
 app.addEventListener('keydown', (event) => {
@@ -1804,8 +2317,57 @@ app.addEventListener('keydown', (event) => {
   if (target.id === 'group-input') { event.preventDefault(); void groupChat.send(); return; }
   if (target.id === 'self-input') { event.preventDefault(); void sendSelf(); }
 });
+async function respondToInvite(id: string, accept: boolean): Promise<void> {
+  if (!isTauri()) return;
+  invitesNotice = accept ? '正在加入…' : '正在拒绝…';
+  paintGroupInvitations();
+  try {
+    if (accept) {
+      const groupId = await invoke<string | null>('v1_accept_group_invitation', { id });
+      invitesNotice = groupId ? '已加入群聊。' : '邀请已失效或群身份不一致。';
+      if (groupId) { await refreshContacts(); await groupChat.open(groupId, groupInvites.find((item) => item.id === id)?.name || '群聊'); }
+    } else {
+      await invoke<boolean>('v1_decline_group_invitation', { id });
+      invitesNotice = '已拒绝邀请，群主会收到退出通知。';
+    }
+    if (accept) await refreshContacts();
+  } catch (error) {
+    invitesNotice = displayError(error);
+  }
+  paintGroupInvitations();
+}
+
 app.addEventListener('change', (event) => {
   const target = event.target;
+  if (target instanceof HTMLInputElement && target.id === 'auto-accept-contacts') {
+    void (async () => {
+      try {
+        const result = await invoke<{ auto_accept: boolean }>('v1_set_contact_sync', { autoAccept: target.checked });
+        autoAcceptContacts = result.auto_accept;
+        contactSyncNotice = autoAcceptContacts ? '已开启：同事添加你时自动互相加入。' : '已关闭：对方添加你时不会自动加入联系人。';
+      } catch {
+        target.checked = !target.checked;
+        contactSyncNotice = '无法保存联系人设置';
+      }
+      const notice = app.querySelector<HTMLElement>('#contact-sync-notice');
+      if (notice) notice.textContent = contactSyncNotice;
+    })();
+    return;
+  }
+  if (target instanceof HTMLInputElement && target.id === 'auto-join-groups') {
+    void (async () => {
+      try {
+        const result = await invoke<{ auto_join: boolean }>('v1_set_group_auto_join', { autoJoin: target.checked });
+        autoJoinGroups = result.auto_join;
+        invitesNotice = autoJoinGroups ? '之后被拉进群会自动加入。' : '之后被拉进群会先询问。';
+      } catch {
+        target.checked = !target.checked;
+        invitesNotice = '无法保存群设置';
+      }
+      paintGroupInvitations();
+    })();
+    return;
+  }
   if (target instanceof HTMLInputElement && target.dataset.pluginToggle) {
     void togglePlugin(target.dataset.pluginToggle, target.checked);
     return;
@@ -1851,9 +2413,56 @@ app.addEventListener('click', (event) => {
   if (action?.dataset.action === 'scan-start') { void startScan(); return; }
   if (action?.dataset.action === 'save-scan-blacklist') { void saveScanBlacklist(); return; }
   if (action?.dataset.action === 'probe-scanned' && action.dataset.address) { void probePeer(action.dataset.address); return; }
+  if (action?.dataset.action === 'ob-next') {
+    syncOnboardingDraft();
+    if (onboardingStep === 1) {
+      if (!onboardingDraft.nickname.trim()) { onboardingNotice = '请先填写昵称'; paintOnboarding(); return; }
+      if (!onboardingDraft.username) onboardingDraft.username = suggestUsername(onboardingDraft.nickname, qbirdId);
+      if (!USERNAME_PATTERN.test(onboardingDraft.username)) { onboardingNotice = '用户名须为 2–20 位小写字母、数字、- 或 _'; paintOnboarding(); return; }
+    }
+    onboardingStep = Math.min(3, Number(action.dataset.step) || 2);
+    onboardingNotice = '';
+    paintOnboarding();
+    if (onboardingStep === 3) void refreshLanPeople(true);
+    return;
+  }
+  if (action?.dataset.action === 'ob-back') { onboardingStep = Math.max(1, onboardingStep - 1); paintOnboarding(); return; }
+  if (action?.dataset.action === 'ob-pick-dir') { void pickOnboardingDir(); return; }
+  if (action?.dataset.action === 'ob-reset-dir') { onboardingDraft.recvDir = ''; paintOnboarding(); return; }
+  if (action?.dataset.action === 'ob-finish') { void submitOnboarding(); return; }
+  if (action?.dataset.action === 'lan-refresh') { void refreshLanPeople(true); return; }
+  if (action?.dataset.action === 'lan-start') { void toggleLanListener(true); return; }
+  if (action?.dataset.action === 'lan-stop') { void toggleLanListener(false); return; }
+  if (action?.dataset.action === 'lan-add') { void addLanPerson(action as HTMLButtonElement); return; }
+  if (action?.dataset.action === 'lan-manual-add') { void addManualLan(); return; }
+  if (action?.dataset.action === 'lan-identity') { page = 'profile'; render(); return; }
+  if (action?.dataset.action === 'open-left-group' && action.dataset.group) {
+    const groupId = action.dataset.group, name = action.dataset.name || '群聊';
+    direct.clear(); selfOpen = false; page = 'messages';
+    void groupChat.open(groupId, name, true).catch((error) => {
+      page = 'contacts';
+      render();
+      const status = app.querySelector<HTMLElement>('#contacts-status');
+      if (status) status.textContent = displayError(error);
+    });
+    return;
+  }
+  if (action?.dataset.action === 'accept-invite' && action.dataset.id) {
+    void respondToInvite(action.dataset.id, true);
+    return;
+  }
+  if (action?.dataset.action === 'decline-invite' && action.dataset.id) {
+    void respondToInvite(action.dataset.id, false);
+    return;
+  }
   if (action?.dataset.action === 'toggle-emoji') {
     const panel = action.closest('.chat-compose')?.querySelector<HTMLElement>('.emoji-panel');
-    if (panel) { const open = panel.hidden; if (open) void loadStickers(panel); panel.hidden = !open; }
+    if (panel) {
+      const open = panel.hidden;
+      if (open) void loadStickers(panel);
+      panel.hidden = !open;
+      action.setAttribute('aria-expanded', String(open));
+    }
     return;
   }
   if (action?.dataset.action === 'pick-emoji' && action.dataset.emoji) {
@@ -1885,8 +2494,19 @@ app.addEventListener('click', (event) => {
   }
   if (action?.dataset.action === 'save-experiment') { void saveExperiments(); return; }
   if (action?.dataset.action === 'save-file-accept') { void saveFileAccept(); return; }
+  if (action?.dataset.action === 'forget-file-sources') { void forgetFileSources(); return; }
+  if (action?.dataset.action === 'choose-recv-direct') { void chooseRecvDir('direct'); return; }
+  if (action?.dataset.action === 'choose-recv-group') { void chooseRecvDir('group'); return; }
+  if (action?.dataset.action === 'reset-recv-direct') { void resetRecvDir('direct'); return; }
+  if (action?.dataset.action === 'reset-recv-group') { void resetRecvDir('group'); return; }
   if (action?.dataset.action === 'accept-file-offer' && action.dataset.id) { void direct.resolveOffer(action.dataset.id, true); return; }
   if (action?.dataset.action === 'reject-file-offer' && action.dataset.id) { void direct.resolveOffer(action.dataset.id, false); return; }
+  if (action?.dataset.action === 'accept-file-offer-remember' && action.dataset.id) { void direct.resolveOffer(action.dataset.id, true, { remember: true }); return; }
+  if (action?.dataset.action === 'saveas-file-offer' && action.dataset.id) { void direct.saveOfferAs(action.dataset.id); return; }
+  if (action?.dataset.action === 'accept-group-file-offer' && action.dataset.id) { void groupChat.resolveOffer(action.dataset.id, true); return; }
+  if (action?.dataset.action === 'accept-group-file-offer-remember' && action.dataset.id) { void groupChat.resolveOffer(action.dataset.id, true, { remember: true }); return; }
+  if (action?.dataset.action === 'saveas-group-file-offer' && action.dataset.id) { void groupChat.saveOfferAs(action.dataset.id); return; }
+  if (action?.dataset.action === 'reject-group-file-offer' && action.dataset.id) { void groupChat.resolveOffer(action.dataset.id, false); return; }
   if (action?.dataset.action === 'group-older') { void groupChat.load(true); return; }
   if (action?.dataset.action === 'hide-group') { void groupChat.hide(); return; }
   if (action?.dataset.action === 'leave-group') { void groupChat.leave(); return; }
@@ -1968,6 +2588,7 @@ app.addEventListener('click', (event) => {
   }
 });
 render();
+void refreshOnboarding();
 void initLock();
 void refreshAvatar().then(() => { if (!lockState.locked) render(); });
 void refreshComposer().then(() => { if (!lockState.locked) render(); });
@@ -2003,8 +2624,10 @@ document.addEventListener('mouseout', (event) => {
 window.setInterval(() => { void checkIdleLock(); }, 15_000);
 app.addEventListener('conversations-changed', () => { void refreshConversations(); });
 window.setInterval(() => {
-  void refreshDiscovery(); void refreshProbeStatus();
+  if (page === 'discover') void refreshLanPeople();
+  void refreshProbeStatus();
   if (page === 'messages') { void refreshConversations(); if (direct.peer) void direct.load(); if (groupChat.groupId) void groupChat.load(); }
+  if (page === 'contacts') void refreshGroupInvites();
 }, 4000);
 if (isTauri()) {
   // Dragging files onto the window provides real local paths, so no extra permission is needed.

@@ -13,6 +13,10 @@ pub struct Candidate {
     /// An unauthenticated DNS-SD service name, not a verified user name.
     pub service_name: String,
     pub addresses: Vec<String>,
+    /// Advertised nickname and username. Untrusted display hints only; the fingerprint
+    /// obtained by probing the address remains the identity.
+    pub nickname: Option<String>,
+    pub username: Option<String>,
 }
 
 type CandidateMap = BTreeMap<String, Candidate>;
@@ -33,7 +37,7 @@ impl CandidateView {
     pub(crate) fn test_set(&self, name: &str, address: Option<SocketAddr>) {
         let mut entries = self.entries.lock().unwrap();
         match address {
-            Some(address) => update_candidate(&mut entries, name, address.port(), std::iter::once(address.ip())),
+            Some(address) => update_candidate(&mut entries, name, address.port(), std::iter::once(address.ip()), None, None),
             None => { entries.remove(&name.to_ascii_lowercase()); },
         }
     }
@@ -74,8 +78,9 @@ impl Discovery {
                 match receiver.recv_timeout(Duration::from_millis(200)) {
                     Ok(ServiceEvent::ServiceResolved(service)) => {
                         let addresses = service.get_addresses_v4().into_iter().map(IpAddr::V4);
+                        let (nickname, username) = advertised_profile(service.get_properties());
                         if let Ok(mut entries) = worker_entries.lock() {
-                            update_candidate(&mut entries, &service.fullname, service.port, addresses);
+                            update_candidate(&mut entries, &service.fullname, service.port, addresses, nickname.as_deref(), username.as_deref());
                         }
                     }
                     Ok(ServiceEvent::ServiceRemoved(_, fullname)) => {
@@ -89,8 +94,9 @@ impl Discovery {
         Ok(Self { daemon, entries, stopping, worker: Some(worker), registered_name: None })
     }
 
-    /// Only call once an authenticated Qbird listener is actually ready. No identity is advertised.
-    pub fn advertise_bound(&mut self, listener: &TcpListener, random_instance: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    /// Only call once an authenticated Qbird listener is actually ready. The DNS-SD record
+    /// carries display-only hints; it never carries the fingerprint or any trust claim.
+    pub fn advertise_bound(&mut self, listener: &TcpListener, random_instance: &str, properties: &[(&str, &str)]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if self.registered_name.is_some() || random_instance.is_empty() || random_instance.len() > 32
             || !random_instance.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid service instance").into());
@@ -100,7 +106,9 @@ impl Discovery {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "listener must be bound to IPv4 wildcard").into());
         }
         let hostname = format!("qbird-{random_instance}.local.");
-        let properties: &[(&str, &str)] = &[];
+        for (key, value) in properties {
+            if key.is_empty() || key.len() > 32 || value.len() > 192 { return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid announcement").into()); }
+        }
         let info = ServiceInfo::new(SERVICE_TYPE, random_instance, &hostname, "", address.port(), properties)?.enable_addr_auto();
         let fullname = info.get_fullname().to_string();
         self.daemon.register(info)?;
@@ -117,7 +125,28 @@ impl Discovery {
     }
 }
 
-fn update_candidate(entries: &mut CandidateMap, name: &str, port: u16, ips: impl Iterator<Item = IpAddr>) {
+/// Reads the optional display hints a peer put in its TXT record. Values are bounded and
+/// copied only when they satisfy the same shape the local UI uses.
+fn advertised_profile(properties: &mdns_sd::TxtProperties) -> (Option<String>, Option<String>) {
+    let mut nickname = None;
+    let mut username = None;
+    for property in properties.iter() {
+        let value = property.val_str().trim();
+        match property.key() {
+            "nick" if !value.is_empty() && value.chars().count() <= 64 && !value.chars().any(char::is_control) => {
+                nickname = Some(value.to_owned());
+            }
+            "user" if !value.is_empty() && value.len() <= 20
+                && value.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_') => {
+                username = Some(value.to_owned());
+            }
+            _ => {}
+        }
+    }
+    (nickname, username)
+}
+
+fn update_candidate(entries: &mut CandidateMap, name: &str, port: u16, ips: impl Iterator<Item = IpAddr>, nickname: Option<&str>, username: Option<&str>) {
     if name.is_empty() || name.len() > 255 { return; }
     let key = name.to_ascii_lowercase();
     if port == 0 { entries.remove(&key); return; }
@@ -127,7 +156,12 @@ fn update_candidate(entries: &mut CandidateMap, name: &str, port: u16, ips: impl
     addresses.sort();
     addresses.dedup();
     if addresses.is_empty() { entries.remove(&key); return; }
-    entries.insert(key, Candidate { service_name: name.to_owned(), addresses });
+    entries.insert(key, Candidate {
+        service_name: name.to_owned(),
+        addresses,
+        nickname: nickname.map(str::to_owned),
+        username: username.map(str::to_owned),
+    });
 }
 
 impl Drop for Discovery {
@@ -152,14 +186,16 @@ mod tests {
         let mut map = CandidateMap::new();
         let name = "example._qbird._tcp.local.";
         let ips = [Ipv4Addr::new(192, 168, 1, 9), Ipv4Addr::new(192, 168, 1, 9), Ipv4Addr::UNSPECIFIED].into_iter().map(IpAddr::V4);
-        update_candidate(&mut map, name, 42853, ips);
+        update_candidate(&mut map, name, 42853, ips, Some("林小满"), Some("xiaoman"));
         assert_eq!(map[name].addresses, vec!["192.168.1.9:42853"]);
-        update_candidate(&mut map, name, 0, std::iter::empty());
+        assert_eq!(map[name].nickname.as_deref(), Some("林小满"));
+        assert_eq!(map[name].username.as_deref(), Some("xiaoman"));
+        update_candidate(&mut map, name, 0, std::iter::empty(), None, None);
         assert!(map.is_empty());
-        update_candidate(&mut map, name, 9, std::iter::once(IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
+        update_candidate(&mut map, name, 9, std::iter::once(IpAddr::V4(Ipv4Addr::UNSPECIFIED)), None, None);
         assert!(map.is_empty());
         for i in 0..MAX_SERVICES + 3 {
-            update_candidate(&mut map, &format!("peer-{i}"), 42, std::iter::once(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+            update_candidate(&mut map, &format!("peer-{i}"), 42, std::iter::once(IpAddr::V4(Ipv4Addr::LOCALHOST)), None, None);
         }
         assert_eq!(map.len(), MAX_SERVICES);
     }
@@ -168,8 +204,8 @@ mod tests {
     fn cannot_advertise_an_unbound_or_specific_interface() {
         let mut discovery = Discovery::browse().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        assert!(discovery.advertise_bound(&listener, "test").is_err());
-        assert!(discovery.advertise_bound(&listener, "bad name").is_err());
+        assert!(discovery.advertise_bound(&listener, "test", &[]).is_err());
+        assert!(discovery.advertise_bound(&listener, "bad name", &[]).is_err());
     }
 
     #[test]
@@ -180,7 +216,7 @@ mod tests {
         let mut publisher = Discovery::browse().unwrap();
         let listener = TcpListener::bind("0.0.0.0:0").unwrap();
         let instance = format!("test-{:x}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos());
-        publisher.advertise_bound(&listener, &instance).unwrap();
+        publisher.advertise_bound(&listener, &instance, &[("nick", "青鸟"), ("user", "qbird")]).unwrap();
         let found = |d: &Discovery| d.candidates().unwrap().iter().any(|candidate| candidate.service_name.starts_with(&instance) && candidate.addresses.iter().any(|address| address.ends_with(&format!(":{}", listener.local_addr().unwrap().port()))));
         let deadline = Instant::now() + Duration::from_secs(15);
         while !found(&reader) && Instant::now() < deadline { thread::sleep(Duration::from_millis(100)); }

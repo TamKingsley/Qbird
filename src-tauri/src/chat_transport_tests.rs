@@ -93,7 +93,11 @@ fn side(label: &str) -> Side {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("chat-tests")
         .join(format!("{label}-{}-{}-{}", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(), NEXT.fetch_add(1, Ordering::Relaxed)));
     fs::create_dir_all(&dir).unwrap();
-    Side { identity: Arc::new(Identity::load_or_create(&dir.join("identity.bin")).unwrap()), store: Arc::new(Mutex::new(Store::open(&dir.join("db.sqlite3")).unwrap())) }
+    let store = Store::open(&dir.join("db.sqlite3")).unwrap();
+    // Transfer tests stand in for a user who already accepts files automatically;
+    // the shipping default is to ask before every file.
+    store.set_file_accept_mode(crate::storage::FileAcceptMode::Auto).unwrap();
+    Side { identity: Arc::new(Identity::load_or_create(&dir.join("identity.bin")).unwrap()), store: Arc::new(Mutex::new(store)) }
 }
 
 fn trust(side: &Side, peer: &Side) {

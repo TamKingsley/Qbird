@@ -1,5 +1,6 @@
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
+import { composerTools } from './ui_icons';
 import { showImage } from './image_viewer';
 import { base64ToBytes, createPluginFrame } from './plugin_view';
 import { showContextMenu } from './context_menu';
@@ -13,7 +14,7 @@ type DirectMessage = {
 };
 type TextPreview = { name: string; kind: string; text: string };
 type Panel = { id: string; name: string; kind: string };
-type FileOffer = { message_id: string; peer: string; name: string; total: number; created_at: number; status: string };
+type FileOffer = { message_id: string; peer: string; name: string; total: number; created_at: number; status: string; group_id?: string | null };
 type Cursor = Pick<DirectMessage, 'logical' | 'sender' | 'id'>;
 const cursorOf = (message: DirectMessage): Cursor => ({ logical: message.logical, sender: message.sender, id: message.id });
 const compare = (a: Cursor, b: Cursor): number => a.logical - b.logical || (a.sender < b.sender ? -1 : a.sender > b.sender ? 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
@@ -53,9 +54,9 @@ export class DirectChat {
 
   view(): string {
     return `<section class="self-chat" aria-label="单聊">
-      <header class="chat-header"><div><strong id="direct-name"></strong><small>端到端加密 · 指纹已确认</small></div><div class="group-actions"><button class="outline" data-action="export-text" data-kind="direct">导出文本</button><button class="outline" data-action="hide-direct">不显示此会话</button></div></header>
+      <header class="chat-header"><div><strong id="direct-name"></strong><small>端到端加密 · 已添加联系人</small></div><div class="group-actions"><button class="outline" data-action="export-text" data-kind="direct">导出文本</button><button class="outline" data-action="hide-direct">不显示此会话</button></div></header>
       <div class="chat-history" id="direct-history" aria-label="单聊记录"><div class="direct-address"><label for="direct-address">联系人地址（仅连接提示）</label><div class="probe-row"><input id="direct-address" type="text" placeholder="192.168.1.8:42853"><button class="outline" data-action="save-direct-address">保存地址</button></div><small>地址不代表身份，连接时仍核对指纹。请在发现页面启动聊天服务；离线消息与文件须双方同时在线才能补发或续传。</small><p id="direct-address-status" role="status"></p></div><button class="load-older" data-action="direct-older" hidden>加载更早消息</button><div id="direct-messages"></div><div id="direct-offers" class="direct-offers" hidden></div></div>
-      <div class="chat-compose"><label for="direct-input">消息</label><textarea id="direct-input" rows="3" maxlength="32768" placeholder="写点什么，或把文件/图片拖进窗口…"></textarea><div class="compose-footer"><span>Enter 发送 · Shift+Enter 换行</span><div class="compose-actions"><button class="outline" data-action="direct-image">发送图片</button><button class="outline" data-action="direct-file">发送文件</button><button class="outline" data-action="direct-screenshot">截图</button><button data-action="direct-send">发送</button></div></div><p id="direct-file-status" role="status"></p><p id="direct-error" role="status"></p></div>
+      <div class="chat-compose"><label for="direct-input">消息</label><textarea id="direct-input" rows="3" maxlength="32768" placeholder="写点什么，或把文件/图片拖进窗口…"></textarea>${composerTools('direct', 'Enter 发送 · Shift+Enter 换行')}<p id="direct-file-status" role="status"></p><p id="direct-error" role="status"></p></div>
       <aside class="file-panel" id="direct-panel" hidden aria-label="文件预览">
         <div class="panel-resizer" data-role="panel-resizer" aria-hidden="true"></div>
         <header class="panel-header"><strong id="panel-title"></strong><div class="panel-actions"><button class="outline" data-action="panel-reveal">打开所在目录</button><button class="outline" data-action="panel-close">关闭</button></div></header>
@@ -484,24 +485,44 @@ export class DirectChat {
       const accept = document.createElement('button');
       accept.className = 'outline'; accept.textContent = '接收';
       accept.dataset.action = 'accept-file-offer'; accept.dataset.id = offer.message_id;
+      const remember = document.createElement('button');
+      remember.className = 'outline'; remember.textContent = '接收并不再询问';
+      remember.dataset.action = 'accept-file-offer-remember'; remember.dataset.id = offer.message_id;
+      const saveAs = document.createElement('button');
+      saveAs.className = 'outline'; saveAs.textContent = '另存为…';
+      saveAs.dataset.action = 'saveas-file-offer'; saveAs.dataset.id = offer.message_id;
       const reject = document.createElement('button');
       reject.className = 'linkish'; reject.textContent = '拒绝';
       reject.dataset.action = 'reject-file-offer'; reject.dataset.id = offer.message_id;
-      actions.append(accept, reject);
+      actions.append(accept, remember, saveAs, reject);
       card.append(text, actions);
       box.append(card);
     }
   }
 
   /// Accepting only marks the local decision; the sender retries and then proceeds.
-  async resolveOffer(id: string, accept: boolean): Promise<void> {
+  /// `remember` also stops future prompts from this contact; `dir` is a one-shot
+  /// destination for this single file.
+  async resolveOffer(id: string, accept: boolean, options: { dir?: string; remember?: boolean } = {}): Promise<void> {
     if (!isTauri() || !id) return;
     try {
-      await invoke('v1_resolve_file_offer', { id, accept });
+      if (options.remember && this.peer) await invoke('v1_remember_file_source', { source: this.peer });
+      await invoke('v1_resolve_file_offer', { id, accept, dir: options.dir ?? null });
       this.offers = this.offers.filter(offer => offer.message_id !== id);
       this.paintOffers();
-      this.status('#direct-file-status', accept ? '已接受，等待对方重新发送' : '已拒绝该文件');
-    } catch { this.status('#direct-error', '无法更新文件确认状态'); }
+      const saved = options.dir ? '，将保存到你选择的文件夹' : '';
+      this.status('#direct-file-status', accept ? `已接受${saved}，等待对方重新发送` : '已拒绝该文件');
+    } catch (error) { this.status('#direct-error', typeof error === 'string' ? error : '无法更新文件确认状态'); }
+  }
+
+  /// Ask for a folder and accept this one file into it.
+  async saveOfferAs(id: string): Promise<void> {
+    if (!isTauri() || !id) return;
+    try {
+      const picked = await open({ directory: true, multiple: false, title: '选择该文件的保存位置' });
+      if (typeof picked !== 'string') return;
+      await this.resolveOffer(id, true, { dir: picked });
+    } catch (error) { this.status('#direct-error', typeof error === 'string' ? error : '无法选择保存位置'); }
   }
 
   private paint(mode: 'bottom' | 'preserve' | 'auto'): void {

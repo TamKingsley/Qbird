@@ -195,6 +195,32 @@ mod tests {
     }
 }
 
+/// Display-only identity hints published over DNS-SD. Never includes the fingerprint.
+#[derive(Clone, Debug, Default)]
+pub struct LanAnnounce {
+    pub nickname: String,
+    pub username: String,
+}
+
+impl LanAnnounce {
+    fn properties(&self) -> Vec<(&str, &str)> {
+        let mut properties: Vec<(&str, &str)> = Vec::with_capacity(3);
+        properties.push(("v", "2"));
+        let nickname = self.nickname.trim();
+        if !nickname.is_empty() { properties.push(("nick", nickname)); }
+        let username = self.username.trim();
+        if !username.is_empty() { properties.push(("user", username)); }
+        properties
+    }
+}
+
+fn announce_from_store(store: &Arc<Mutex<Store>>) -> LanAnnounce {
+    store.lock().ok()
+        .and_then(|store| store.get_profile().ok())
+        .map(|profile| LanAnnounce { nickname: profile.nickname, username: profile.username })
+        .unwrap_or_default()
+}
+
 pub struct ProbeService {
     port: u16,
     stopping: Arc<AtomicBool>,
@@ -209,14 +235,19 @@ pub struct ProbeService {
 
 impl ProbeService {
     pub fn start(identity: Arc<Identity>, port: u16) -> ServiceResult<Self> {
-        Self::start_inner(identity, port, None)
+        Self::start_inner(identity, port, None, LanAnnounce::default())
+    }
+
+    pub fn start_announcing(identity: Arc<Identity>, port: u16, announce: LanAnnounce, store: Arc<Mutex<Store>>) -> ServiceResult<Self> {
+        Self::start_inner(identity, port, Some(store), announce)
     }
 
     pub fn start_with_chat(identity: Arc<Identity>, port: u16, store: Arc<Mutex<Store>>) -> ServiceResult<Self> {
-        Self::start_inner(identity, port, Some(store))
+        let announce = announce_from_store(&store);
+        Self::start_inner(identity, port, Some(store), announce)
     }
 
-    fn start_inner(identity: Arc<Identity>, port: u16, store: Option<Arc<Mutex<Store>>>) -> ServiceResult<Self> {
+    fn start_inner(identity: Arc<Identity>, port: u16, store: Option<Arc<Mutex<Store>>>, announce: LanAnnounce) -> ServiceResult<Self> {
         let listener = TcpListener::bind(("0.0.0.0", port))?;
         listener.set_nonblocking(true)?;
         let actual_port = listener.local_addr()?.port();
@@ -224,7 +255,7 @@ impl ProbeService {
         let digest = Sha256::digest(random_key.subject_public_key_info());
         let instance: String = digest[..12].iter().map(|b| format!("{b:02x}")).collect();
         let mut discovery = Discovery::browse()?;
-        discovery.advertise_bound(&listener, &instance)?;
+        discovery.advertise_bound(&listener, &instance, &announce.properties())?;
         let stopping = Arc::new(AtomicBool::new(false));
         let running = Arc::new(AtomicBool::new(true));
         let requests: Arc<Mutex<BTreeMap<String, ProbeRequest>>> = Arc::new(Mutex::new(BTreeMap::new()));
@@ -272,11 +303,38 @@ impl ProbeService {
                             }
                             if detected && !stopping.load(Ordering::Acquire) {
                                 if first[0] == 0x16 {
-                                    if let Ok((fingerprint, automatic)) = probe::accept_classified(&identity, &mut socket) {
-                                        if !automatic && !stopping.load(Ordering::Acquire) {
-                                            if let Ok(mut requests) = requests.lock() {
-                                                if requests.len() < MAX_PENDING || requests.contains_key(&fingerprint) {
-                                                    requests.insert(fingerprint.clone(), ProbeRequest { fingerprint, remote_ip: remote.ip().to_string() });
+                                    if let Ok((fingerprint, kind)) = probe::accept_classified(&identity, &mut socket) {
+                                        match kind {
+                                            probe::ProbeKind::Contact => {
+                                                // A peer added us. Automatic acceptance is a local
+                                                // preference; the fingerprint still comes from TLS.
+                                                if let Some(store) = &store {
+                                                    let accepted = match probe::read_contact_announce(&mut socket) {
+                                                        Ok(announce) => {
+                                                            let result = store.lock().ok().and_then(|store| {
+                                                                let enabled = store.auto_accept_contacts().unwrap_or(true);
+                                                                if !enabled { return Some(false); }
+                                                                if store.add_candidate_with_username(&fingerprint, &announce.nickname, announce.username.as_deref()).is_err() {
+                                                                    return Some(false);
+                                                                }
+                                                                Some(store.confirm_candidate(&fingerprint).unwrap_or(false))
+                                                            }).unwrap_or(false);
+                                                            let _ = probe::write_contact_ack(&mut socket, result);
+                                                            result
+                                                        }
+                                                        Err(_) => false,
+                                                    };
+                                                    let _ = accepted;
+                                                }
+                                            }
+                                            probe::ProbeKind::Automatic => {}
+                                            probe::ProbeKind::Manual => {
+                                                if !stopping.load(Ordering::Acquire) {
+                                                    if let Ok(mut requests) = requests.lock() {
+                                                        if requests.len() < MAX_PENDING || requests.contains_key(&fingerprint) {
+                                                            requests.insert(fingerprint.clone(), ProbeRequest { fingerprint, remote_ip: remote.ip().to_string() });
+                                                        }
+                                                    }
                                                 }
                                             }
                                         }

@@ -1,4 +1,4 @@
-use std::{fs, io, path::{Path, PathBuf}, sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}}};
+use std::{fs, io, net::SocketAddr, path::{Path, PathBuf}, sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}}, time::Duration};
 use tauri::Manager;
 use crate::{discovery::Discovery, identity::Identity, probe_service::{ProbeRequest, ProbeService}, storage::Store};
 
@@ -47,10 +47,34 @@ pub async fn v1_deliver_direct(state: tauri::State<'_, AppState>, peer: String, 
     }).await.map_err(|_| "发送任务异常；消息仍保存在本机，可重试".to_owned())?
 }
 
+/// Tells a contact we added it, so a single add can become mutual. Best effort: the peer
+/// may be offline, may have automatic acceptance off, or may already know us.
+fn notify_contact_async(identity: Arc<Identity>, store: Arc<Mutex<Store>>, peer: &str, address: Option<String>) {
+    let address = address.or_else(|| store.lock().ok().and_then(|store| store.contact_address(peer).ok().flatten()));
+    let Some(parsed) = address.and_then(|value| crate::address::parse_manual_address(&value).ok()) else { return };
+    let announce = store.lock().ok().and_then(|store| store.get_profile().ok())
+        .map(|profile| crate::probe::ContactAnnounce {
+            nickname: profile.nickname,
+            username: Some(profile.username).filter(|value| !value.is_empty()),
+        });
+    if let Some(announce) = announce {
+        std::thread::spawn(move || { let _ = crate::probe::announce_contact(&identity, parsed, &announce); });
+    }
+}
+
 #[tauri::command]
 pub fn v1_open_direct(state: tauri::State<'_, AppState>, peer: String) -> Result<(), String> {
     let opened = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?.open_direct(&peer).map_err(|_| "无法打开会话".to_owned())?;
-    if opened { Ok(()) } else { Err("联系人尚未确认".into()) }
+    if !opened { return Err("联系人尚未确认".into()); }
+    // Retry the mutual-add notice when the chat is opened; it is idempotent.
+    notify_contact_async(Arc::clone(&state.identity), Arc::clone(&state.store), &peer, None);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn v1_announce_contact(state: tauri::State<'_, AppState>, peer: String) -> Result<(), String> {
+    notify_contact_async(Arc::clone(&state.identity), Arc::clone(&state.store), &peer, None);
+    Ok(())
 }
 
 #[tauri::command]
@@ -205,18 +229,24 @@ fn reveal_path(path: &std::path::Path) -> Result<(), String> {
 }
 
 /// Opens a completed attachment with the system default program. The path always
-/// comes from the local database, never from UI input.
+/// comes from the local database, never from UI input, but it still derives from a
+/// peer-supplied file name, so it must never pass through the command interpreter:
+/// `cmd /C start` would treat `&`, `%` or `^` inside the name as shell syntax.
 fn open_path(path: &std::path::Path) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        std::process::Command::new("cmd")
-            .args(["/C", "start", ""])
-            .arg(path)
-            .creation_flags(CREATE_NO_WINDOW)
-            .spawn()
-            .map_err(|_| "无法用默认程序打开文件".to_owned())?;
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::UI::Shell::ShellExecuteW;
+        use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+        let verb: Vec<u16> = "open\0".encode_utf16().collect();
+        let file: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        // ShellExecuteW returns a value greater than 32 on success and never runs a shell.
+        let result = unsafe {
+            ShellExecuteW(std::ptr::null_mut(), verb.as_ptr(), file.as_ptr(), std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL)
+        };
+        if (result as isize) <= 32 {
+            return Err("无法用默认程序打开文件".to_owned());
+        }
     }
     #[cfg(target_os = "macos")]
     {
@@ -321,7 +351,12 @@ impl AppState {
         let service = if chat {
             ProbeService::start_with_chat(Arc::clone(&self.identity), port, Arc::clone(&self.store))
         } else {
-            ProbeService::start(Arc::clone(&self.identity), port)
+            let announce = {
+                let store = self.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+                let profile = store.get_profile().map_err(|_| "无法读取个人资料".to_owned())?;
+                crate::probe_service::LanAnnounce { nickname: profile.nickname, username: profile.username }
+            };
+            ProbeService::start_announcing(Arc::clone(&self.identity), port, announce, Arc::clone(&self.store))
         };
         let service = service.map_err(|_| "无法启动服务：端口可能被占用，或网络发现不可用".to_owned())?;
         let mut retry = self.retry_queue.lock().map_err(|_| "消息重试服务不可用".to_owned())?;
@@ -387,7 +422,7 @@ impl AppState {
             return Err("指纹不一致或不能添加本机身份".into());
         }
         let name = display_name.trim();
-        if name.is_empty() || name.len() > 128 { return Err("联系人名称须为 1–128 字节".into()); }
+        if name.is_empty() || name.chars().count() > 64 { return Err("联系人名称须为 1–64 个字符".into()); }
         let outbound = self.last_outbound_fingerprint.lock().map_err(|_| "身份探测不可用".to_owned())?;
         let service = self.probe_service.lock().map_err(|_| "探测服务不可用".to_owned())?;
         let inbound = match service.as_ref() {
@@ -450,6 +485,173 @@ pub fn v1_profile(state: tauri::State<'_, AppState>) -> Result<crate::storage::P
         .get_profile().map_err(|_| "无法读取个人资料".to_owned())
 }
 
+/// Stable short identifier derived from the identity fingerprint. Display only.
+fn qbird_id(fingerprint: &str) -> String {
+    let upper = fingerprint.to_ascii_uppercase();
+    if upper.len() < 8 { return "QB-0000-0000".to_owned(); }
+    format!("QB-{}-{}", &upper[0..4], &upper[4..8])
+}
+
+#[tauri::command]
+pub fn v1_identity_id(state: tauri::State<'_, AppState>) -> String {
+    qbird_id(&state.identity.fingerprint())
+}
+
+#[tauri::command]
+pub fn v1_set_username(state: tauri::State<'_, AppState>, username: String) -> Result<crate::storage::Profile, String> {
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    if !store.set_username(&username).map_err(|_| "无法保存用户名".to_owned())? {
+        return Err("用户名须为 2–20 位小写字母、数字、- 或 _".into());
+    }
+    store.get_profile().map_err(|_| "无法读取个人资料".to_owned())
+}
+
+#[derive(serde::Serialize)]
+pub struct OnboardingState {
+    pub done: bool,
+    pub profile: crate::storage::Profile,
+    pub qbird_id: String,
+}
+
+#[tauri::command]
+pub fn v1_onboarding_state(state: tauri::State<'_, AppState>) -> Result<OnboardingState, String> {
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    let profile = store.get_profile().map_err(|_| "无法读取个人资料".to_owned())?;
+    let done = store.onboarding_done().map_err(|_| "无法读取引导状态".to_owned())?;
+    Ok(OnboardingState { done, profile, qbird_id: qbird_id(&state.identity.fingerprint()) })
+}
+
+/// Saves the first-run answers in one step. `recv_dir` empty means keep the default.
+#[tauri::command]
+pub fn v1_complete_onboarding(
+    state: tauri::State<'_, AppState>, nickname: String, username: String, email: String, recv_dir: Option<String>,
+) -> Result<crate::storage::Profile, String> {
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    if !store.set_profile(&nickname, &email).map_err(|_| "无法保存个人资料".to_owned())? {
+        return Err("昵称不超过 64 字符；邮箱需包含一个 @ 或留空".into());
+    }
+    if !store.set_username(&username).map_err(|_| "无法保存用户名".to_owned())? {
+        return Err("用户名须为 2–20 位小写字母、数字、- 或 _".into());
+    }
+    if let Some(dir) = recv_dir.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+        let exe_dir = std::env::current_exe().ok().and_then(|exe| exe.parent().map(Path::to_path_buf));
+        let data_dir = store.data_dir().to_path_buf();
+        let cleaned = crate::files::validate_recv_dir(dir, exe_dir.as_deref(), Some(&data_dir))?;
+        store.set_recv_dir(crate::storage::RecvKind::Direct, Some(&cleaned)).map_err(|_| "无法保存接收目录".to_owned())?;
+    }
+    store.set_onboarding_done().map_err(|_| "无法保存引导状态".to_owned())?;
+    store.get_profile().map_err(|_| "无法读取个人资料".to_owned())
+}
+
+/// One LAN row: advertised display hints plus the identity proven by probing its address.
+#[derive(serde::Serialize)]
+pub struct LanPerson {
+    pub service_name: String,
+    pub address: String,
+    pub fingerprint: String,
+    pub qbird_id: String,
+    pub nickname: Option<String>,
+    pub username: Option<String>,
+    pub known: bool,
+    pub verified: bool,
+}
+
+#[tauri::command]
+pub async fn v1_lan_people(state: tauri::State<'_, AppState>) -> Result<Vec<LanPerson>, String> {
+    let candidates = {
+        let mut discovery = state.discovery.lock().map_err(|_| "局域网发现不可用".to_owned())?;
+        if discovery.is_none() {
+            *discovery = Some(Discovery::browse().map_err(|_| "无法启动局域网发现，请检查网络和防火墙".to_owned())?);
+        }
+        discovery.as_ref().expect("initialized above").candidates().map_err(str::to_owned)?
+    };
+    let identity = Arc::clone(&state.identity);
+    // Probing is cheap but bounded: at most 24 candidates, 600 ms each, sequential so a
+    // crowded network cannot stall the UI thread or flood peers.
+    let probed = tauri::async_runtime::spawn_blocking(move || {
+        let mut rows = Vec::new();
+        for candidate in candidates.into_iter().take(24) {
+            let Some(address) = candidate.addresses.first().cloned() else { continue };
+            let Ok(addr) = address.parse::<SocketAddr>() else { continue };
+            if let Ok(fingerprint) = crate::probe::connect_with_timeout(&identity, addr, Duration::from_millis(600)) {
+                if fingerprint != identity.fingerprint() { rows.push((candidate, address, fingerprint)); }
+            }
+        }
+        rows
+    }).await.map_err(|_| "局域网探测任务异常".to_owned())?;
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    let contacts = store.list_contacts().map_err(|_| "无法读取联系人".to_owned())?;
+    Ok(probed.into_iter().map(|(candidate, address, fingerprint)| {
+        let existing = contacts.iter().find(|contact| contact.fingerprint == fingerprint);
+        LanPerson {
+            service_name: candidate.service_name,
+            address,
+            qbird_id: qbird_id(&fingerprint),
+            nickname: existing.map(|contact| contact.display_name.clone()).or(candidate.nickname),
+            username: existing.and_then(|contact| contact.username.clone()).or(candidate.username),
+            known: existing.is_some(),
+            verified: existing.is_some_and(|contact| contact.trust_state == "verified"),
+            fingerprint,
+        }
+    }).collect())
+}
+
+/// Adds a discovered peer without asking the user to compare fingerprints by hand.
+/// The address is probed again so the stored fingerprint always matches the live peer.
+#[tauri::command]
+pub async fn v1_add_contact(
+    state: tauri::State<'_, AppState>, address: String, fingerprint: String, display_name: String, username: Option<String>,
+) -> Result<(), String> {
+    let address = crate::address::parse_manual_address(&address).map_err(str::to_owned)?;
+    if !crate::storage::valid_fingerprint_public(&fingerprint) { return Err("身份标识格式不正确".into()); }
+    if fingerprint == state.identity.fingerprint() { return Err("不能添加本机身份".into()); }
+    let name = display_name.trim();
+    if name.is_empty() || name.chars().count() > 64 { return Err("联系人名称须为 1–64 个字符".into()); }
+    let username = username.map(|value| value.trim().to_owned()).filter(|value| !value.is_empty());
+    if let Some(value) = username.as_deref() {
+        if !crate::storage::valid_username_public(value) { return Err("对方用户名格式不正确".into()); }
+    }
+    if state.outbound_probe.swap(true, Ordering::AcqRel) { return Err("已有身份探测正在进行，请稍后重试".into()); }
+    let guard = ProbeGuard(Arc::clone(&state.outbound_probe));
+    let identity = Arc::clone(&state.identity);
+    let expected = fingerprint.clone();
+    let probed = tauri::async_runtime::spawn_blocking(move || {
+        let _guard = guard;
+        crate::probe::connect(&identity, address)
+    }).await.map_err(|_| "身份探测不可用".to_owned())?
+      .map_err(|_| "无法连接对方：对方可能离线、端口错误或网络受阻".to_owned())?;
+    if probed != expected { return Err("该地址当前的用户与列表不一致，请刷新后重试".into()); }
+    {
+        let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+        store.add_candidate_with_username(&fingerprint, name, username.as_deref()).map_err(|_| "无法保存联系人".to_owned())?;
+        if !store.is_verified(&fingerprint).map_err(|_| "无法读取联系人".to_owned())? {
+            if !store.confirm_candidate(&fingerprint).map_err(|_| "无法确认联系人".to_owned())? {
+                return Err("无法确认联系人".into());
+            }
+        }
+    }
+    // Tell the peer to add us back. Failure is expected when it is offline or has
+    // automatic acceptance disabled; the local contact stays saved either way.
+    notify_contact_async(Arc::clone(&state.identity), Arc::clone(&state.store), &fingerprint, Some(address.to_string()));
+    Ok(())
+}
+
+#[derive(serde::Serialize)]
+pub struct ContactSyncSettings { pub auto_accept: bool }
+
+#[tauri::command]
+pub fn v1_contact_sync_settings(state: tauri::State<'_, AppState>) -> Result<ContactSyncSettings, String> {
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    Ok(ContactSyncSettings { auto_accept: store.auto_accept_contacts().map_err(|_| "无法读取联系人设置".to_owned())? })
+}
+
+#[tauri::command]
+pub fn v1_set_contact_sync(state: tauri::State<'_, AppState>, auto_accept: bool) -> Result<ContactSyncSettings, String> {
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    store.set_auto_accept_contacts(auto_accept).map_err(|_| "无法保存联系人设置".to_owned())?;
+    Ok(ContactSyncSettings { auto_accept })
+}
+
 #[tauri::command]
 pub fn v1_set_profile(state: tauri::State<'_, AppState>, nickname: String, email: String) -> Result<crate::storage::Profile, String> {
     let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
@@ -459,22 +661,87 @@ pub fn v1_set_profile(state: tauri::State<'_, AppState>, nickname: String, email
     store.get_profile().map_err(|_| "无法读取个人资料".to_owned())
 }
 
+/// Receive policy plus the sources the user chose not to be asked about again.
 #[derive(serde::Serialize)]
-pub struct FileAcceptMode {
-    pub confirm: bool,
+pub struct FileAcceptSettings {
+    pub mode: String,
+    pub remembered: Vec<String>,
+}
+
+fn accept_settings(store: &Store) -> Result<FileAcceptSettings, String> {
+    let mode = store.file_accept_mode().map_err(|_| "无法读取接收设置".to_owned())?;
+    let remembered = store.remembered_file_sources().map_err(|_| "无法读取接收设置".to_owned())?;
+    Ok(FileAcceptSettings { mode: mode.as_str().to_owned(), remembered })
 }
 
 #[tauri::command]
-pub fn v1_file_accept_mode(state: tauri::State<'_, AppState>) -> Result<FileAcceptMode, String> {
+pub fn v1_file_accept_settings(state: tauri::State<'_, AppState>) -> Result<FileAcceptSettings, String> {
     let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
-    Ok(FileAcceptMode { confirm: store.file_accept_confirm().map_err(|_| "无法读取接收设置".to_owned())? })
+    accept_settings(&store)
+}
+
+/// `mode` is one of `always`, `remember` or `auto`.
+#[tauri::command]
+pub fn v1_set_file_accept_policy(state: tauri::State<'_, AppState>, mode: String) -> Result<FileAcceptSettings, String> {
+    let parsed = crate::storage::FileAcceptMode::parse(&mode).ok_or_else(|| "未知的接收策略".to_owned())?;
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    store.set_file_accept_mode(parsed).map_err(|_| "无法保存接收设置".to_owned())?;
+    accept_settings(&store)
 }
 
 #[tauri::command]
-pub fn v1_set_file_accept_mode(state: tauri::State<'_, AppState>, confirm: bool) -> Result<FileAcceptMode, String> {
+pub fn v1_forget_file_sources(state: tauri::State<'_, AppState>) -> Result<FileAcceptSettings, String> {
     let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
-    store.set_file_accept_confirm(confirm).map_err(|_| "无法保存接收设置".to_owned())?;
-    Ok(FileAcceptMode { confirm })
+    store.forget_file_sources().map_err(|_| "无法清除记住的来源".to_owned())?;
+    accept_settings(&store)
+}
+
+/// Effective receive directories plus whether each one is a user choice.
+#[derive(serde::Serialize)]
+pub struct FileRecvSettings {
+    pub direct: String,
+    pub group: String,
+    pub direct_custom: bool,
+    pub group_custom: bool,
+}
+
+fn recv_settings(store: &Store) -> FileRecvSettings {
+    use crate::storage::RecvKind;
+    FileRecvSettings {
+        direct: store.recv_dir(RecvKind::Direct).to_string_lossy().to_string(),
+        group: store.recv_dir(RecvKind::Group).to_string_lossy().to_string(),
+        direct_custom: store.recv_dir_custom(RecvKind::Direct),
+        group_custom: store.recv_dir_custom(RecvKind::Group),
+    }
+}
+
+#[tauri::command]
+pub fn v1_file_recv_settings(state: tauri::State<'_, AppState>) -> Result<FileRecvSettings, String> {
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    Ok(recv_settings(&store))
+}
+
+/// `path` empty or missing restores the built-in default for that kind.
+#[tauri::command]
+pub fn v1_set_file_recv_dir(state: tauri::State<'_, AppState>, kind: String, path: Option<String>) -> Result<FileRecvSettings, String> {
+    let recv_kind = match kind.as_str() {
+        "direct" => crate::storage::RecvKind::Direct,
+        "group" => crate::storage::RecvKind::Group,
+        _ => return Err("未知的会话类型".to_owned()),
+    };
+    let cleaned = match path.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) => {
+            let exe_dir = std::env::current_exe().ok().and_then(|exe| exe.parent().map(Path::to_path_buf));
+            // A receive folder inside the installed data directory is allowed; the rest
+            // of the install directory is not, because uninstall removes it.
+            let data_dir = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?.data_dir().to_path_buf();
+            Some(crate::files::validate_recv_dir(value, exe_dir.as_deref(), Some(&data_dir))?)
+        }
+        None => None,
+    };
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    store.set_recv_dir(recv_kind, cleaned.as_deref()).map_err(|_| "无法保存接收目录".to_owned())?;
+    Ok(recv_settings(&store))
 }
 
 #[tauri::command]
@@ -484,11 +751,35 @@ pub fn v1_file_offer_requests(state: tauri::State<'_, AppState>, peer: String)
         .list_file_offer_requests(&peer).map_err(|_| "无法读取待确认文件".to_owned())
 }
 
-/// Accepting a deferred offer lets the sender's next retry proceed automatically.
 #[tauri::command]
-pub fn v1_resolve_file_offer(state: tauri::State<'_, AppState>, id: String, accept: bool) -> Result<bool, String> {
+pub fn v1_group_file_offer_requests(state: tauri::State<'_, AppState>, group_id: String)
+    -> Result<Vec<crate::storage::FileOfferRequest>, String> {
     state.store.lock().map_err(|_| "本地存储不可用".to_owned())?
-        .resolve_file_offer(&id, accept).map_err(|_| "无法更新文件确认状态".to_owned())
+        .list_group_file_offer_requests(&group_id).map_err(|_| "无法读取待确认文件".to_owned())
+}
+
+/// Accepting a deferred offer lets the sender's next retry proceed automatically.
+/// `dir` is an optional one-shot "save as" destination for this file.
+#[tauri::command]
+pub fn v1_resolve_file_offer(state: tauri::State<'_, AppState>, id: String, accept: bool, dir: Option<String>) -> Result<bool, String> {
+    let chosen = match dir.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) => {
+            let exe_dir = std::env::current_exe().ok().and_then(|exe| exe.parent().map(Path::to_path_buf));
+            let data_dir = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?.data_dir().to_path_buf();
+            Some(crate::files::validate_recv_dir(value, exe_dir.as_deref(), Some(&data_dir))?)
+        }
+        None => None,
+    };
+    state.store.lock().map_err(|_| "本地存储不可用".to_owned())?
+        .resolve_file_offer(&id, accept, chosen.as_deref()).map_err(|_| "无法更新文件确认状态".to_owned())
+}
+
+/// Remember a contact or group so later offers from it skip the prompt.
+#[tauri::command]
+pub fn v1_remember_file_source(state: tauri::State<'_, AppState>, source: String) -> Result<FileAcceptSettings, String> {
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    store.remember_file_source(&source).map_err(|_| "无法记住该来源".to_owned())?;
+    accept_settings(&store)
 }
 
 #[derive(serde::Serialize)]
@@ -1125,6 +1416,59 @@ pub fn v1_create_group(state: tauri::State<'_, AppState>, name: String, members:
     state.store.lock().map_err(|_| "本地存储不可用".to_owned())?
         .create_group(&owner, &name, &members, now)
         .map_err(|_| "群名无效、成员尚未确认或数量超出限制".to_owned())
+}
+
+fn unix_seconds() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64).unwrap_or(0)
+}
+
+#[tauri::command]
+pub fn v1_list_left_groups(state: tauri::State<'_, AppState>) -> Result<Vec<crate::storage::GroupSummary>, String> {
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    store.list_left_groups(&state.identity.fingerprint()).map_err(|_| "无法读取已退出的群聊".to_owned())
+}
+
+/// Opens read-only history for a group the user left. Returns false when there is no record.
+#[tauri::command]
+pub fn v1_open_group_history(state: tauri::State<'_, AppState>, group_id: String) -> Result<bool, String> {
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    Ok(store.group_membership(&group_id, &state.identity.fingerprint())
+        .map_err(|_| "无法读取群聊记录".to_owned())?.is_some())
+}
+
+#[tauri::command]
+pub fn v1_group_invitations(state: tauri::State<'_, AppState>) -> Result<Vec<crate::storage::GroupInvitation>, String> {
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    store.pending_group_invitations(&state.identity.fingerprint()).map_err(|_| "无法读取群邀请".to_owned())
+}
+
+#[tauri::command]
+pub fn v1_accept_group_invitation(state: tauri::State<'_, AppState>, id: String) -> Result<Option<String>, String> {
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    store.accept_group_invitation(&id, &state.identity.fingerprint(), unix_seconds()).map_err(|_| "无法加入群聊".to_owned())
+}
+
+#[tauri::command]
+pub fn v1_decline_group_invitation(state: tauri::State<'_, AppState>, id: String) -> Result<bool, String> {
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    store.decline_group_invitation(&id, &state.identity.fingerprint(), unix_seconds()).map_err(|_| "无法拒绝群邀请".to_owned())
+}
+
+#[derive(serde::Serialize)]
+pub struct GroupSettings { pub auto_join: bool }
+
+#[tauri::command]
+pub fn v1_group_settings(state: tauri::State<'_, AppState>) -> Result<GroupSettings, String> {
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    Ok(GroupSettings { auto_join: store.auto_join_groups().map_err(|_| "无法读取群设置".to_owned())? })
+}
+
+#[tauri::command]
+pub fn v1_set_group_auto_join(state: tauri::State<'_, AppState>, auto_join: bool) -> Result<GroupSettings, String> {
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    store.set_auto_join_groups(auto_join).map_err(|_| "无法保存群设置".to_owned())?;
+    Ok(GroupSettings { auto_join })
 }
 
 #[tauri::command]

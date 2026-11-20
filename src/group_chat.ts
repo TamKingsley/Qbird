@@ -1,5 +1,6 @@
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
+import { composerTools } from './ui_icons';
 import { showImage } from './image_viewer';
 import { base64ToBytes, createPluginFrame } from './plugin_view';
 import { showContextMenu } from './context_menu';
@@ -20,12 +21,14 @@ const compare = (a: Cursor, b: Cursor): number => a.logical - b.logical || (a.se
 type SearchCategory = 'all' | 'text' | 'file' | 'image';
 type Quoted = { id: string; name: string; preview: string };
 type Panel = { id: string; name: string; kind: string };
+type FileOffer = { message_id: string; peer: string; name: string; total: number; created_at: number; status: string; group_id?: string | null };
 
 /// Group chat: outbound messages are queued per member by the backend, so the UI only
 /// shows the pending count and never claims delivery on its own. Replies keep a short
 /// local quote, and @ mentions are resolved against the active member list.
 export class GroupChat {
   groupId = '';
+  readOnly = false;
   private name = '';
   private owner = '';
   private isOwner = false;
@@ -60,6 +63,7 @@ export class GroupChat {
   private renderedBatches = new Set<string>();
   private panelBytes: Uint8Array | null = null;
   private panel: Panel | null = null;
+  private offers: FileOffer[] = [];
   private panelWidth = 380;
   /// 'lightbox' keeps the in-app viewer; 'workspace' opens the right panel instead.
   imageOpenMode: 'lightbox' | 'workspace' = 'lightbox';
@@ -71,7 +75,7 @@ export class GroupChat {
 
   view(): string {
     return `<section class="self-chat" aria-label="群聊">
-      <header class="chat-header"><div class="chat-identity"><span class="chat-avatar" id="group-avatar">群</span><div><strong id="group-name"></strong><small id="group-subtitle">群聊</small></div></div><div class="group-actions"><button class="outline" id="group-avatar-button" data-action="choose-group-avatar" hidden>群头像</button><button class="outline" id="group-avatar-remove" data-action="clear-group-avatar" hidden>移除头像</button><button class="outline" data-action="export-text" data-kind="group">导出文本</button><button class="outline" data-action="toggle-group-search">搜索</button><button class="outline" data-action="toggle-group-members">成员</button><button class="outline" data-action="hide-group">不显示此会话</button><button class="outline" data-action="leave-group">退出群聊</button></div></header>
+      <header class="chat-header"><div class="chat-identity"><span class="chat-avatar" id="group-avatar">群</span><div><strong id="group-name"></strong><small id="group-subtitle">群聊</small></div></div><div class="group-actions"><button class="outline" id="group-avatar-button" data-action="choose-group-avatar" hidden>群头像</button><button class="outline" id="group-avatar-remove" data-action="clear-group-avatar" hidden>移除头像</button><button class="outline" data-action="export-text" data-kind="group">导出文本</button><button class="outline" data-action="toggle-group-search">搜索</button><button class="outline" data-action="toggle-group-members">成员</button><button class="outline" data-action="hide-group">不显示此会话</button><button class="outline" data-action="leave-group" ${this.readOnly ? 'hidden' : ''}>退出群聊</button></div></header>
       <div class="group-search" id="group-search" hidden>
         <div class="search-row">
           <input id="group-search-query" type="search" maxlength="200" placeholder="搜索聊天记录" aria-label="搜索聊天记录">
@@ -83,13 +87,14 @@ export class GroupChat {
         <p id="group-search-status" role="status"></p>
         <ul id="group-search-results" class="search-results"></ul>
       </div>
-      <div class="chat-history" id="group-history" aria-label="群聊记录"><div class="group-members" id="group-members" hidden></div><button class="load-older" data-action="group-older" hidden>加载更早消息</button><div id="group-messages"></div></div>
-      <div class="chat-compose">
+      <div class="chat-history" id="group-history" aria-label="群聊记录"><div class="group-members" id="group-members" hidden></div><button class="load-older" data-action="group-older" hidden>加载更早消息</button><div id="group-offers" class="direct-offers" hidden></div><div id="group-messages"></div></div>
+      <p class="readonly-note" ${this.readOnly ? '' : 'hidden'}>你已退出这个群，只能查看历史记录；记录会一直保留，除非主动删除。</p>
+      <div class="chat-compose" ${this.readOnly ? 'hidden' : ''}>
         <div class="reply-bar" id="reply-bar" hidden><span id="reply-bar-text"></span><button class="outline" data-action="group-cancel-reply">取消引用</button></div>
         <label for="group-input">消息</label>
         <textarea id="group-input" rows="3" maxlength="32768" placeholder="发消息给群里的人…输入 @ 可选择成员"></textarea>
         <div class="mention-picker" id="mention-picker" hidden></div>
-        <div class="compose-footer"><span>Enter 发送 · Shift+Enter 换行</span><div class="compose-actions"><button class="outline" data-action="group-image">发送图片</button><button class="outline" data-action="group-file">发送文件</button><button class="outline" data-action="group-screenshot">截图</button><button data-action="group-send">发送</button></div></div>
+        ${composerTools('group', 'Enter 发送 · Shift+Enter 换行')}
         <p id="group-file-status" role="status"></p>
         <p id="group-error" role="status"></p>
       </div>
@@ -102,10 +107,10 @@ export class GroupChat {
   }
 
   clear(): void {
-    this.groupId = ''; this.generation++; this.membersOpen = false; this.quoted = null;
+    this.groupId = ''; this.readOnly = false; this.generation++; this.membersOpen = false; this.quoted = null;
     this.closePanel();
     this.setGroupAvatar(null);
-    this.thumbs.clear(); this.thumbPending.clear();
+    this.thumbs.clear(); this.thumbPending.clear(); this.offers = [];
     this.mentionQuery = null; this.mentioned.clear(); this.closeSearch();
   }
 
@@ -117,17 +122,23 @@ export class GroupChat {
     this.paintMentionPicker();
   }
 
-  async open(groupId: string, name: string): Promise<void> {
+  async open(groupId: string, name: string, readOnly = false): Promise<void> {
     if (!isTauri()) return;
     const generation = ++this.generation;
-    await invoke('v1_open_group', { groupId });
+    if (readOnly) {
+      const known = await invoke<boolean>('v1_open_group_history', { groupId });
+      if (!known) throw new Error('本机没有这个群聊的记录');
+    } else {
+      await invoke('v1_open_group', { groupId });
+    }
     if (generation !== this.generation) return;
+    this.readOnly = readOnly;
     this.groupId = groupId; this.name = name; this.messages = []; this.hasOlder = false;
     this.refreshBefore = null; this.loading = false; this.membersOpen = false;
     this.quoted = null; this.mentionQuery = null; this.mentioned.clear(); this.closeSearch();
     this.onChange();
     if (!this.self) { try { this.self = await invoke<string>('identity_fingerprint'); } catch { this.self = ''; } }
-    await Promise.all([this.load(false, true), this.loadMembers(), this.loadAvatar()]);
+    await Promise.all([this.load(false, true), this.loadMembers(), this.loadAvatar(), this.loadOffers()]);
   }
 
   async load(older = false, initial = false): Promise<void> {
@@ -183,6 +194,65 @@ export class GroupChat {
   }
 
   notify(text: string): void { this.status('#group-error', text); }
+
+  /// Group files waiting for a local yes/no after the sender's offer was deferred.
+  private async loadOffers(): Promise<void> {
+    if (!isTauri() || !this.groupId) return;
+    const groupId = this.groupId, generation = this.generation;
+    try {
+      const offers = await invoke<FileOffer[]>('v1_group_file_offer_requests', { groupId });
+      if (generation !== this.generation || groupId !== this.groupId) return;
+      this.offers = offers;
+      this.paintOffers();
+    } catch { /* the group view still works without the pending list */ }
+  }
+
+  private paintOffers(): void {
+    const box = this.root.querySelector<HTMLElement>('#group-offers');
+    if (!box) return;
+    box.replaceChildren();
+    box.hidden = this.offers.length === 0;
+    for (const offer of this.offers) {
+      const card = document.createElement('div'); card.className = 'offer-card';
+      const text = document.createElement('div'); text.className = 'offer-text';
+      const title = document.createElement('div'); title.className = 'file-title'; title.textContent = offer.name;
+      const meta = document.createElement('small'); meta.className = 'file-meta';
+      meta.textContent = `${this.formatSize(offer.total)} · ${new Date(offer.created_at * 1000).toLocaleString()} · 群文件等待确认`;
+      text.append(title, meta);
+      const actions = document.createElement('div'); actions.className = 'file-actions';
+      const accept = document.createElement('button'); accept.className = 'outline'; accept.textContent = '接收';
+      accept.dataset.action = 'accept-group-file-offer'; accept.dataset.id = offer.message_id;
+      const remember = document.createElement('button'); remember.className = 'outline'; remember.textContent = '接收并不再询问';
+      remember.dataset.action = 'accept-group-file-offer-remember'; remember.dataset.id = offer.message_id;
+      const saveAs = document.createElement('button'); saveAs.className = 'outline'; saveAs.textContent = '另存为…';
+      saveAs.dataset.action = 'saveas-group-file-offer'; saveAs.dataset.id = offer.message_id;
+      const reject = document.createElement('button'); reject.className = 'linkish'; reject.textContent = '拒绝';
+      reject.dataset.action = 'reject-group-file-offer'; reject.dataset.id = offer.message_id;
+      actions.append(accept, remember, saveAs, reject);
+      card.append(text, actions);
+      box.append(card);
+    }
+  }
+
+  async resolveOffer(id: string, accept: boolean, options: { dir?: string; remember?: boolean } = {}): Promise<void> {
+    if (!isTauri() || !id || !this.groupId) return;
+    try {
+      if (options.remember) await invoke('v1_remember_file_source', { source: `group:${this.groupId}` });
+      await invoke('v1_resolve_file_offer', { id, accept, dir: options.dir ?? null });
+      this.offers = this.offers.filter(offer => offer.message_id !== id);
+      this.paintOffers();
+      this.status('#group-file-status', accept ? '已接受，等待对方重新发送' : '已拒绝该群文件');
+    } catch (error) { this.status('#group-error', typeof error === 'string' ? error : '无法更新文件确认状态'); }
+  }
+
+  async saveOfferAs(id: string): Promise<void> {
+    if (!isTauri() || !id) return;
+    try {
+      const picked = await open({ directory: true, multiple: false, title: '选择该群文件的保存位置' });
+      if (typeof picked !== 'string') return;
+      await this.resolveOffer(id, true, { dir: picked });
+    } catch (error) { this.status('#group-error', typeof error === 'string' ? error : '无法选择保存位置'); }
+  }
 
   async pick(kind: 'image' | 'file'): Promise<void> {
     if (!isTauri() || !this.groupId || this.attaching) return;
@@ -292,7 +362,7 @@ export class GroupChat {
   async send(): Promise<void> {
     const input = this.root.querySelector<HTMLTextAreaElement>('#group-input');
     const button = this.root.querySelector<HTMLButtonElement>('button[data-action="group-send"]');
-    if (!this.groupId || !input || this.sending) return;
+    if (!this.groupId || this.readOnly || !input || this.sending) return;
     const groupId = this.groupId, generation = this.generation, body = input.value;
     if (!this.members.some(member => member.member === this.self && member.active)) {
       this.status('#group-error', '该群聊已解散，或你已不在群中'); return;

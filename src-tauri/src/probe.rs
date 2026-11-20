@@ -1,7 +1,7 @@
 
 //! Untrusted first-contact probe. It proves private-key possession but never grants
 //! trust and never exposes the TLS stream for chat or other application data.
-use std::{io, net::{SocketAddr, TcpStream}, sync::Arc, thread, time::{Duration, Instant}};
+use std::{io::{self, Read, Write}, net::{SocketAddr, TcpStream}, sync::Arc, thread, time::{Duration, Instant}};
 use rustls::{
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
     server::danger::{ClientCertVerified, ClientCertVerifier},
@@ -14,6 +14,21 @@ use crate::{address::is_unicast, certificate, identity::Identity};
 
 const ALPN: &[u8] = b"qbird-probe/1";
 const AUTO_ALPN: &[u8] = b"qbird-auto-probe/1";
+/// One-way "I added you" notice so a single add can become mutual. The TLS client
+/// certificate still proves the sender; the body only carries display hints.
+const CONTACT_ALPN: &[u8] = b"qbird-contact/1";
+const MAX_CONTACT_BYTES: usize = 512;
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ContactAnnounce {
+    #[serde(default)]
+    pub nickname: String,
+    #[serde(default)]
+    pub username: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProbeKind { Manual, Automatic, Contact }
 const TIMEOUT: Duration = Duration::from_secs(5);
 type ProbeResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -77,13 +92,15 @@ fn server_config(identity: &Identity) -> ProbeResult<ServerConfig> {
     let mut config = ServerConfig::builder_with_provider(Arc::new(default_provider()))
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_client_cert_verifier(Arc::new(ProbeVerifier)).with_single_cert(cert, key)?;
-    config.alpn_protocols = vec![ALPN.to_vec(), AUTO_ALPN.to_vec()];
+    config.alpn_protocols = vec![ALPN.to_vec(), AUTO_ALPN.to_vec(), CONTACT_ALPN.to_vec()];
     config.send_tls13_tickets = 0;
     Ok(config)
 }
 
 fn fingerprint(chain: Option<&[CertificateDer<'_>]>, alpn: Option<&[u8]>) -> ProbeResult<String> {
-    if alpn != Some(ALPN) && alpn != Some(AUTO_ALPN) { return Err(io::Error::new(io::ErrorKind::InvalidData, "unexpected probe protocol").into()); }
+    if alpn != Some(ALPN) && alpn != Some(AUTO_ALPN) && alpn != Some(CONTACT_ALPN) {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "unexpected probe protocol").into());
+    }
     let chain = chain.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "peer certificate missing"))?;
     if chain.len() != 1 { return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid peer certificate chain").into()); }
     certificate::fingerprint(chain[0].as_ref()).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e).into())
@@ -196,10 +213,82 @@ pub fn accept(identity: &Identity, mut stream: TcpStream) -> ProbeResult<String>
     accept_classified(identity, &mut stream).map(|(fingerprint, _)| fingerprint)
 }
 
-pub(crate) fn accept_classified(identity: &Identity, stream: &mut TcpStream) -> ProbeResult<(String, bool)> {
+pub(crate) fn accept_classified(identity: &Identity, stream: &mut TcpStream) -> ProbeResult<(String, ProbeKind)> {
     prepare(stream)?;
     let mut connection = rustls::Connection::Server(ServerConnection::new(Arc::new(server_config(identity)?))?);
     handshake(&mut connection, stream)?;
     let fingerprint = fingerprint(connection.peer_certificates(), connection.alpn_protocol())?;
-    Ok((fingerprint, connection.alpn_protocol() == Some(AUTO_ALPN)))
+    let kind = match connection.alpn_protocol() {
+        Some(AUTO_ALPN) => ProbeKind::Automatic,
+        Some(CONTACT_ALPN) => ProbeKind::Contact,
+        _ => ProbeKind::Manual,
+    };
+    Ok((fingerprint, kind))
+}
+
+/// Reads the bounded JSON body of a contact announcement. The caller must close the
+/// connection immediately afterwards; no chat payload is accepted on this ALPN.
+pub(crate) fn read_contact_announce(stream: &mut TcpStream) -> ProbeResult<ContactAnnounce> {
+    stream.set_nonblocking(false)?;
+    stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+    let mut header = [0u8; 3];
+    stream.read_exact(&mut header)?;
+    if header[0] != 1 { return Err(io::Error::new(io::ErrorKind::InvalidData, "unsupported contact version").into()); }
+    let length = u16::from_be_bytes([header[1], header[2]]) as usize;
+    if length == 0 || length > MAX_CONTACT_BYTES { return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid contact size").into()); }
+    let mut body = vec![0u8; length];
+    stream.read_exact(&mut body)?;
+    let announce: ContactAnnounce = serde_json::from_slice(&body)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid contact body"))?;
+    if announce.nickname.chars().count() > 64 || announce.nickname.chars().any(char::is_control) {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid nickname").into());
+    }
+    if let Some(username) = announce.username.as_deref() {
+        if username.len() > 20 || !username.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_') {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid username").into());
+        }
+    }
+    Ok(announce)
+}
+
+/// Sends one acknowledgement byte; `true` means the peer stored the contact.
+pub(crate) fn write_contact_ack(stream: &mut TcpStream, accepted: bool) -> ProbeResult<()> {
+    stream.set_nonblocking(false)?;
+    stream.set_write_timeout(Some(Duration::from_secs(3)))?;
+    stream.write_all(&[if accepted { 1 } else { 2 }])?;
+    stream.flush()?;
+    Ok(())
+}
+
+/// Tells a peer that we added it, so it can add us back without asking the user.
+/// The peer is offline or has automatic contact acceptance disabled: this is advisory.
+pub fn announce_contact(identity: &Identity, address: SocketAddr, announce: &ContactAnnounce) -> ProbeResult<bool> {
+    if address.port() == 0 || !is_unicast(address.ip()) { return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid address").into()); }
+    let body = serde_json::to_vec(announce).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "contact body"))?;
+    if body.is_empty() || body.len() > MAX_CONTACT_BYTES { return Err(io::Error::new(io::ErrorKind::InvalidInput, "contact body too large").into()); }
+    let mut stream = TcpStream::connect_timeout(&address, TIMEOUT)?;
+    prepare(&stream)?;
+    let (cert, key) = credentials(identity)?;
+    let mut config = ClientConfig::builder_with_provider(Arc::new(default_provider()))
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .dangerous().with_custom_certificate_verifier(Arc::new(ProbeVerifier))
+        .with_client_auth_cert(cert, key)?;
+    config.resumption = rustls::client::Resumption::disabled();
+    config.alpn_protocols = vec![CONTACT_ALPN.to_vec()];
+    let mut connection = rustls::Connection::Client(ClientConnection::new(Arc::new(config), ServerName::try_from("qbird.invalid")?.to_owned())?);
+    handshake(&mut connection, &mut stream)?;
+    if connection.alpn_protocol() != Some(CONTACT_ALPN) {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "peer does not accept contact notices").into());
+    }
+    stream.set_nonblocking(false)?;
+    stream.set_write_timeout(Some(Duration::from_secs(3)))?;
+    let length = u16::try_from(body.len()).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "contact body too large"))?;
+    stream.write_all(&[1])?;
+    stream.write_all(&length.to_be_bytes())?;
+    stream.write_all(&body)?;
+    stream.flush()?;
+    stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+    let mut ack = [0u8; 1];
+    stream.read_exact(&mut ack)?;
+    Ok(ack[0] == 1)
 }

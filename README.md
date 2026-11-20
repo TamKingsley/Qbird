@@ -1,47 +1,74 @@
-# Qbird 青鸟
+# Qbird
 
-Qbird 是面向局域网的本地优先聊天工具。项目计划先支持 Windows，后续再适配 Linux 和 macOS。
+**A local-first messenger for people on the same network.**
 
-> **0.1.9 开发测试版：** 桌面应用创建本机身份和 SQLite 数据库；发现页可浏览同网段 IPv4 mDNS 候选，通过发现结果或 IP:端口探测身份，双方可分别核对完整指纹并保存联系人。支持本地自聊、持久化记录、单聊文字与文件/图片点对点传输（离线排队、断点续传、SHA-256 完整性校验）、群聊文字（建群、邀请已确认联系人、成员管理、按成员离线补发、引用与跳转、@成员、群主转让/解散、群内搜索）、文件右侧工作区预览（图片/TXT/Markdown/HTML）、打开附件所在目录、可调存储配额、密码保护的数据库备份与合并/覆盖恢复、个人资料（昵称/邮箱/本机头像裁剪与预览）、发送方式与输入区高度设置、常用表情与本地表情收藏、会话未读计数、分区设置页与默认监听端口保存、网段限速扫描与黑名单、群文件（断点续传、图片缩略图、引用实验开关）、图片缩放/旋转/拖拽查看与选区截图、文件接收逐次确认、按群名搜索并申请加入、群头像、团队 Logo 与名称、联系人悬浮信息与拖拽进组、聊天记录加密导入导出、文字与多图同气泡、只读预览插件（docx/pdf 等由插件提供）、文件气泡右键打开、成员进群时间、图片工作区打开、悬浮 IP/MAC 开关、联系人备注与分组、联系人搜索、跨会话消息搜索、单聊/群聊/自聊纯文本导出、可选密码的应用锁与空闲自动锁定，以及隐藏会话。备份暂不含身份私钥与附件文件；应用锁只隐藏界面、不加密数据库，且尚未接入 Windows 身份验证重置；插件尚未接入。请勿用于真实通信或存储敏感信息。
+English · [简体中文](README_CN.md)
 
-## 开发环境
+Qbird (provisional Chinese name: **轻书灵雀**) is a desktop messenger designed for direct communication on a local network without a relay server. Windows is the first development target; Linux and macOS remain planned.
 
-- Windows x64；需 WebView2 Runtime、Microsoft C++ Build Tools、Rust（MSVC 工具链）。
-- Node.js 与 pnpm；以 `package.json`、`pnpm-lock.yaml` 和 `src-tauri/Cargo.lock` 为准。
-- 确保 Rust 工具链及 `cargo` 在 PATH 可用。
+> **Development preview · 0.1.11** — This is not a production release. Real two-device, multi-device and current desktop UI acceptance are still incomplete. The local database is not encrypted, and the project has not received an independent security audit. **Do not use it for real communication or sensitive information.**
 
-## 本地运行
+## Interface preview
+
+![An isolated Qbird desktop development instance with an empty conversation list](docs/assets/qbird-demo.png)
+
+*An isolated, empty development instance from the earlier 0.1.9 interface; 0.1.11 has since changed its onboarding and discovery screens. The application still displays the previous Chinese name; 轻书灵雀 is provisional and has only been introduced in the README.*
+
+## Features
+
+The following are implemented to varying degrees in the development build. Automated tests and real-world acceptance are different; see [the task list](docs/TASKS.md) for details.
+
+| Area | Development preview |
+| --- | --- |
+| **Getting started and discovery** | First-run onboarding; same-subnet mDNS discovery, manual addresses, rate-limited subnet scanning and a blocklist. Contact addition probes the peer's fingerprint; automatic acceptance can be disabled. |
+| **Conversations** | Local self-chat, direct and group chats, hidden conversations, unread counts, search, replies and group mentions. Text and up to nine images can share a message bubble. |
+| **Contacts and groups** | Contact profiles, notes and groups; group invitations, member management and join times, group search, join requests and avatars. Invitations require confirmation by default; automatic joining is optional. |
+| **Files and images** | Direct and group file transfers with queues, resume and SHA-256 checks; configurable receive directories and confirmation policies; image viewing and a preview workspace. Completed attachments can be opened with the system default app. |
+| **Workspace and extensions** | Emoji, local sticker favorites, input preferences, app lock and storage quota. An experimental, local **read-only preview plugin host** is available; viewer plugins are not bundled. |
+| **Export and backup** | Plain-text and password-protected chat export/import; password-protected database backup with merge or overwrite restore. Identity keys and attachments are not included in database backups. |
+
+Qbird is built with **Tauri, Rust, TypeScript, Vite and SQLite**. Records are stored locally and peer-to-peer communication does not use an intermediary server.
+
+## Getting started
+
+To run the development build on Windows x64, install:
+
+- WebView2 Runtime and Microsoft C++ Build Tools;
+- Rust with the MSVC toolchain and `cargo` on `PATH`;
+- Node.js and pnpm (the package manager version is specified in `package.json`).
+
+From the project directory:
 
 ```bash
 pnpm install --frozen-lockfile
 pnpm tauri dev
 ```
 
-构建检查：
+Checks:
 
 ```bash
 pnpm build
 cargo check --manifest-path src-tauri/Cargo.toml
 ```
 
-- `pnpm tauri build` 产出的 `src-tauri/target/release/qbird.exe` 为单文件程序，约 16 MB，可直接双击运行，无需安装；运行依赖系统 WebView2（Windows 11 自带，Windows 10 多数已具备）。
-- 当前未配置安装包（`bundle.active = false`），因此没有安装向导、开始菜单快捷方式和卸载程序；安装分发形态与数据位置见 `docs/PRD.md` 第 4.1 节。
-- 用户数据固定存放在 `%APPDATA%\im.qbird.desktop\`：`identity.bin`（DPAPI 保护的本机身份）、`qbird.sqlite3`（联系人、消息、群组、设置与传输记录）、`attachments\`（接收与暂存的附件）、`plugins\`、`stickers\`、`temp\`。删除或替换 exe 不会删除这些数据；换机需迁移该目录或使用备份恢复。
-- 本地开发服务器仅监听回环地址。
+`pnpm tauri build` is configured to build an NSIS installer and executable on Windows; generated packages and build outputs are not stored in this repository. For data-directory and distribution details, see [the product requirements](docs/PRD.md).
 
-## 文件与图片
+## Known limitations
 
-- 已确认的单聊可发送文件与图片：可使用“发送文件/发送图片”按钮或直接把文件拖入窗口。
-- 文件先保存在本机待发队列；对方离线时不会传输，双方重新在线后自动续传。单文件上限 512 MiB，传输使用同一 TLS 连接分块进行，接收端校验完整 SHA-256 后才确认完成并保存。
-- 收到的文件当前固定保存在应用数据目录的 `attachments/in/` 下，文件名来自消息 ID 加清洗后的原名；图片完成后显示缩略图，点击放大，仅限 8 MiB 以内。单聊与群聊分别自定义接收目录、默认逐次提醒的能力尚未实现，需求见 `docs/PRD.md` 第 3.12 节。
-- 已确认联系人发来的文件默认自动接收，可在设置页开启“接收文件前逐次确认”。收到或待接收的附件计入设置页的存储配额；右侧工作区可预览图片、TXT/日志/CSV/JSON、Markdown 与 HTML（禁用脚本），并可打开附件所在目录。
+- **Verification:** Real two-device, group concurrency, network-failure and current desktop UI acceptance remain incomplete. Successful local or automated tests do not establish production readiness.
+- **Offline delivery:** There is no relay. Queued messages and files can be delivered or resumed only when the relevant peers are online.
+- **Local data:** SQLite is not encrypted. The optional app lock hides the interface but does not encrypt stored data; Windows authentication reset is not implemented.
+- **Backups:** Database backups do not include the identity private key or attachment files. Backup passwords are separate from the app-lock password.
+- **Extensions and platforms:** The plugin host is experimental and read-only; editing, a plugin marketplace and bundled document viewers are not provided. Linux and macOS are not yet supported.
 
-## 安全与隐私
+## Security and privacy
 
-Windows 本机身份私钥由当前 Windows 用户的 DPAPI 保护；本地 SQLite 数据库未加密。身份文件损坏或缺失时不应静默生成替代身份；目前身份备份和恢复尚未实现。单聊使用需人工核对身份的双向 TLS 点对点加密传输，不使用中转服务器。应用锁使用 PBKDF2-HMAC-SHA256 保存密码摘要，只隐藏界面，不加密数据库；空闲自动锁定按 Windows 系统最后键鼠输入时间计算；备份密码与应用锁密码独立。传输加密不等于本地数据加密。请勿提交密钥、聊天记录或机器私有配置。
+On Windows, the local identity private key is protected with DPAPI and direct chat uses mutually authenticated TLS. Discovery data and network addresses do not establish identity. Contact notifications are automatically accepted by default in this preview; this can be disabled in settings. Verify full identity fingerprints through an independent, reliable channel before relying on a contact's identity. Transport encryption does not encrypt the local database. Never commit identity keys, chat databases, backups or machine-specific private configuration.
 
-发现页首次打开时会发出 mDNS 查询。点击“启动探测服务”会在指定 TCP 端口监听并发布 mDNS 探测服务；默认 42853，修改只对本次监听生效，不会保存。该服务只用于密钥持有证明和显示指纹，不接收聊天消息。发现信息和探测结果均不代表可信身份：双方应通过独立可靠渠道核对完整指纹，并在各自设备上分别确认；一方确认不会自动使另一方授信。探测记录仅保存在内存，监听停止或应用退出后收到的探测记录失效，主动探测只保留最近一次结果。防火墙、网络隔离或禁用组播可能导致无法发现或连接。探测服务停止或应用退出后应关闭监听；不使用中转服务器。
+## Project status
 
-## 许可证
+See [the task list](docs/TASKS.md) for implementation, test and acceptance status, [the product requirements](docs/PRD.md) for intended scope, and [the plugin API](docs/PLUGIN.md) for the experimental preview interface. Planned capabilities are not shipped features.
 
-本项目采用 [Apache License 2.0](LICENSE)。第三方依赖按各自许可证使用；发布前需要完成依赖、素材和版权审查。
+## License
+
+[Apache License 2.0](LICENSE). Third-party dependencies retain their respective licenses. Dependency, asset and copyright reviews remain necessary before a public release.

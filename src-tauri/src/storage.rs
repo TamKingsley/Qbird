@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 use rusqlite::{params, Connection, OptionalExtension, Result};
 use serde::{Deserialize, Serialize};
 
-const SCHEMA_VERSION: i64 = 16;
+const SCHEMA_VERSION: i64 = 20;
+/// Upper bound on remembered "do not ask again" senders.
+const MAX_REMEMBERED_SOURCES: usize = 200;
 
 /// Default cap for locally received attachments; the user may change it in settings.
 pub const DEFAULT_STORAGE_QUOTA: u64 = 2 * 1024 * 1024 * 1024;
@@ -37,11 +39,25 @@ pub struct GroupReply {
     pub preview: String,
 }
 
+/// An invitation that waits for the local user because auto-join is off (default).
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct GroupInvitation {
+    pub id: String,
+    pub group_id: String,
+    pub name: String,
+    pub owner: String,
+    pub owner_name: Option<String>,
+    pub member_count: u32,
+    pub created_at: i64,
+}
+
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct Contact {
     pub fingerprint: String,
     pub display_name: String,
     pub trust_state: String,
+    /// Peer username captured from LAN discovery or entered by the user. Display only.
+    pub username: Option<String>,
     /// Local-only note; never sent to peers and never changes identity.
     pub remark: Option<String>,
     /// Local-only category/group label used to organise the contact list.
@@ -52,6 +68,8 @@ pub struct Contact {
 pub struct Profile {
     pub nickname: String,
     pub email: String,
+    /// Searchable LAN name; not proof of identity and not globally unique.
+    pub username: String,
 }
 
 /// One message matched by the cross-conversation search.
@@ -244,6 +262,26 @@ pub struct GroupMessage {
     pub file_error: Option<String>,
 }
 
+/// Which conversation a received file belongs to; direct and group files keep
+/// separate default receive folders.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecvKind { Direct, Group }
+
+/// How incoming files are handled before bytes are written to disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FileAcceptMode { Always, Remember, Auto }
+
+impl FileAcceptMode {
+    pub fn as_str(self) -> &'static str {
+        match self { Self::Always => "always", Self::Remember => "remember", Self::Auto => "auto" }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value { "always" => Some(Self::Always), "remember" => Some(Self::Remember), "auto" => Some(Self::Auto), _ => None }
+    }
+}
+
 /// One received file offer waiting for a local yes/no.
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct FileOfferRequest {
@@ -253,6 +291,8 @@ pub struct FileOfferRequest {
     pub total: i64,
     pub created_at: i64,
     pub status: String,
+    /// Set for group files so the group view can list its own pending offers.
+    pub group_id: Option<String>,
 }
 
 /// One text message inside a chat archive; attachments stay on the original device.
@@ -747,7 +787,9 @@ impl Store {
                     name TEXT NOT NULL,
                     total INTEGER NOT NULL CHECK(total > 0 AND total <= 536870912),
                     created_at INTEGER NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'accepted', 'rejected'))
+                    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'accepted', 'rejected')),
+                    target_dir TEXT,
+                    group_id TEXT
                  );
                  CREATE INDEX IF NOT EXISTS file_offer_requests_by_peer ON file_offer_requests(peer, status);
                  PRAGMA user_version = 12;",
@@ -768,18 +810,94 @@ impl Store {
             transaction.execute_batch("PRAGMA user_version = 10;")?;
             transaction.commit()?;
         }
+        if version < 17 {
+            let transaction = connection.transaction()?;
+            // Per-offer destination chosen in the confirmation dialog. Fresh databases get
+            // both columns from the v12 table shape, so existing ones only need them added.
+            for statement in [
+                "ALTER TABLE file_offer_requests ADD COLUMN target_dir TEXT",
+                "ALTER TABLE file_offer_requests ADD COLUMN group_id TEXT",
+            ] {
+                if let Err(error) = transaction.execute_batch(statement) {
+                    let text = error.to_string();
+                    if !text.contains("duplicate column name") && !text.contains("no such table") { return Err(error); }
+                }
+            }
+            transaction.execute_batch("PRAGMA user_version = 17;")?;
+            transaction.commit()?;
+        }
+        if version < 18 {
+            let transaction = connection.transaction()?;
+            // Remembered "stop asking for this sender" choices get their own table so the
+            // list is not limited by the small size cap on settings values.
+            transaction.execute_batch(
+                "CREATE TABLE IF NOT EXISTS file_accept_sources (
+                    source TEXT PRIMARY KEY NOT NULL CHECK(length(source) BETWEEN 2 AND 71),
+                    added_at INTEGER NOT NULL
+                );
+                PRAGMA user_version = 18;",
+            )?;
+            // Carry the old JSON blob over once, then drop it.
+            let legacy: Option<String> = transaction.query_row(
+                "SELECT value FROM settings WHERE key = 'file_accept_remembered'", [], |row| row.get(0)).optional()?;
+            if let Some(raw) = legacy {
+                let list: Vec<String> = serde_json::from_str(&raw).unwrap_or_default();
+                for source in list.into_iter().filter(|item| valid_offer_source(item)).take(MAX_REMEMBERED_SOURCES) {
+                    transaction.execute(
+                        "INSERT OR IGNORE INTO file_accept_sources(source, added_at) VALUES (?1, 0)", [&source])?;
+                }
+                transaction.execute("DELETE FROM settings WHERE key = 'file_accept_remembered'", [])?;
+            }
+            transaction.commit()?;
+        }
+        if version < 19 {
+            let transaction = connection.transaction()?;
+            // Usernames come from peers over unauthenticated discovery; they are shown and
+            // searched but never used as identity or trust evidence. Qbird ID stays derived
+            // from the fingerprint.
+            if let Err(error) = transaction.execute_batch("ALTER TABLE contacts ADD COLUMN username TEXT") {
+                if !error.to_string().contains("duplicate column name") { return Err(error); }
+            }
+            transaction.execute_batch("PRAGMA user_version = 19;")?;
+            transaction.commit()?;
+        }
+        if version < 20 {
+            let transaction = connection.transaction()?;
+            // Invitations stay here until the user answers. Group rows and membership are
+            // created only after acceptance, so a declined invite never joins the group.
+            transaction.execute_batch(
+                "CREATE TABLE IF NOT EXISTS group_invitations (
+                    id TEXT PRIMARY KEY NOT NULL CHECK(length(id) BETWEEN 1 AND 128),
+                    group_id TEXT NOT NULL CHECK(length(group_id) = 32),
+                    name TEXT NOT NULL CHECK(length(name) BETWEEN 1 AND 128),
+                    owner TEXT NOT NULL CHECK(length(owner) = 64),
+                    members TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('pending', 'accepted', 'declined'))
+                );
+                CREATE INDEX IF NOT EXISTS group_invitations_by_status ON group_invitations(status, created_at);
+                PRAGMA user_version = 20;",
+            )?;
+            transaction.commit()?;
+        }
         Ok(Self { connection, data_dir, address_revision: std::cell::Cell::new(0) })
     }
 
     /// Records a candidate without replacing an existing trust decision.
     pub fn add_candidate(&self, fingerprint: &str, display_name: &str) -> Result<bool> {
+        self.add_candidate_with_username(fingerprint, display_name, None)
+    }
+
+    /// Same as `add_candidate`, also storing the peer's advertised username when present.
+    pub fn add_candidate_with_username(&self, fingerprint: &str, display_name: &str, username: Option<&str>) -> Result<bool> {
         if !valid_fingerprint(fingerprint) || display_name.len() > 256 {
             return Err(rusqlite::Error::InvalidQuery);
         }
+        let username = username.map(str::trim).filter(|value| valid_username(value));
         Ok(self.connection.execute(
-            "INSERT INTO contacts (fingerprint, display_name, trust_state)
-             VALUES (?1, ?2, 'pending') ON CONFLICT(fingerprint) DO NOTHING",
-            params![fingerprint, display_name],
+            "INSERT INTO contacts (fingerprint, display_name, trust_state, username)
+             VALUES (?1, ?2, 'pending', ?3) ON CONFLICT(fingerprint) DO NOTHING",
+            params![fingerprint, display_name, username],
         )? == 1)
     }
 
@@ -972,11 +1090,11 @@ impl Store {
 
     pub fn list_contacts(&self) -> Result<Vec<Contact>> {
         let mut statement = self.connection.prepare(
-            "SELECT fingerprint, display_name, trust_state, remark, category FROM contacts ORDER BY display_name, fingerprint LIMIT 1000"
+            "SELECT fingerprint, display_name, trust_state, username, remark, category FROM contacts ORDER BY display_name, fingerprint LIMIT 1000"
         )?;
         let rows = statement.query_map([], |row| Ok(Contact {
             fingerprint: row.get(0)?, display_name: row.get(1)?, trust_state: row.get(2)?,
-            remark: row.get(3)?, category: row.get(4)?,
+            username: row.get(3)?, remark: row.get(4)?, category: row.get(5)?,
         }))?;
         rows.collect()
     }
@@ -1000,7 +1118,11 @@ impl Store {
         let read = |key: &str| -> Result<Option<String>> {
             self.connection.query_row("SELECT value FROM settings WHERE key = ?1", [key], |row| row.get(0)).optional()
         };
-        Ok(Profile { nickname: read("profile_nickname")?.unwrap_or_default(), email: read("profile_email")?.unwrap_or_default() })
+        Ok(Profile {
+            nickname: read("profile_nickname")?.unwrap_or_default(),
+            email: read("profile_email")?.unwrap_or_default(),
+            username: read("profile_username")?.unwrap_or_default(),
+        })
     }
 
     pub fn set_profile(&self, nickname: &str, email: &str) -> Result<bool> {
@@ -1018,6 +1140,37 @@ impl Store {
         Ok(true)
     }
 
+    /// Adding a discovered peer also adds us on the peer side unless it opted out.
+    /// This is a local preference, never sent as a claim about trust.
+    pub fn auto_accept_contacts(&self) -> Result<bool> {
+        Ok(self.get_setting("auto_accept_contacts")?.as_deref() != Some("0"))
+    }
+
+    pub fn set_auto_accept_contacts(&self, enabled: bool) -> Result<()> {
+        self.set_setting("auto_accept_contacts", Some(if enabled { "1" } else { "0" }))?;
+        Ok(())
+    }
+
+    /// Usernames are display/search labels only; they never replace the fingerprint.
+    pub fn set_username(&self, username: &str) -> Result<bool> {
+        let username = username.trim();
+        if !valid_username(username) { return Ok(false); }
+        self.connection.execute(
+            "INSERT INTO settings(key, value) VALUES ('profile_username', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [username])?;
+        Ok(true)
+    }
+
+    pub fn set_onboarding_done(&self) -> Result<()> {
+        self.set_setting("onboarding_done", Some("1"))?;
+        Ok(())
+    }
+
+    pub fn onboarding_done(&self) -> Result<bool> {
+        Ok(self.get_setting("onboarding_done")?.as_deref() == Some("1"))
+    }
+
     /// Contact list search across name, local remark, category and fingerprint.
     pub fn search_contacts(&self, query: &str, limit: u32) -> Result<Vec<Contact>> {
         if query.chars().count() > 64 || limit == 0 || limit > 200 || query.chars().any(char::is_control) {
@@ -1025,14 +1178,15 @@ impl Store {
         }
         let pattern = like_pattern(query);
         let mut statement = self.connection.prepare(
-            "SELECT fingerprint, display_name, trust_state, remark, category FROM contacts
-             WHERE ?1 = '' OR display_name LIKE ?2 ESCAPE '\\' OR COALESCE(remark, '') LIKE ?2 ESCAPE '\\'
+            "SELECT fingerprint, display_name, trust_state, username, remark, category FROM contacts
+             WHERE ?1 = '' OR display_name LIKE ?2 ESCAPE '\\' OR COALESCE(username, '') LIKE ?2 ESCAPE '\\'
+                OR COALESCE(remark, '') LIKE ?2 ESCAPE '\\'
                 OR COALESCE(category, '') LIKE ?2 ESCAPE '\\' OR fingerprint LIKE ?2 ESCAPE '\\'
              ORDER BY display_name, fingerprint LIMIT ?3"
         )?;
         let rows = statement.query_map(params![query, pattern, limit], |row| Ok(Contact {
             fingerprint: row.get(0)?, display_name: row.get(1)?, trust_state: row.get(2)?,
-            remark: row.get(3)?, category: row.get(4)?,
+            username: row.get(3)?, remark: row.get(4)?, category: row.get(5)?,
         }))?;
         rows.collect()
     }
@@ -1094,7 +1248,53 @@ impl Store {
 
     pub fn attachments_dir(&self) -> PathBuf { self.data_dir.join("attachments") }
 
-    fn incoming_dir(&self) -> PathBuf { self.attachments_dir().join("in") }
+    /// Incoming files are separated by conversation kind so a direct chat and a
+    /// group never compete for the same file name.
+    fn default_recv_dir(&self, kind: RecvKind) -> PathBuf {
+        self.attachments_dir().join("in").join(match kind { RecvKind::Direct => "direct", RecvKind::Group => "group" })
+    }
+
+    /// Effective receive directory: the user's choice when set, otherwise the
+    /// built-in default. A missing or unreadable setting falls back silently here
+    /// because saving already validates the directory.
+    pub fn recv_dir(&self, kind: RecvKind) -> PathBuf {
+        let key = match kind { RecvKind::Direct => "file_recv_dir_direct", RecvKind::Group => "file_recv_dir_group" };
+        match self.get_setting(key) {
+            Ok(Some(value)) if !value.trim().is_empty() => PathBuf::from(value),
+            _ => self.default_recv_dir(kind),
+        }
+    }
+
+    /// Whether the user chose a custom directory for this conversation kind.
+    pub fn recv_dir_custom(&self, kind: RecvKind) -> bool {
+        let key = match kind { RecvKind::Direct => "file_recv_dir_direct", RecvKind::Group => "file_recv_dir_group" };
+        matches!(self.get_setting(key), Ok(Some(value)) if !value.trim().is_empty())
+    }
+
+    /// `None` clears the custom directory and restores the built-in default.
+    pub fn set_recv_dir(&self, kind: RecvKind, dir: Option<&str>) -> Result<()> {
+        let key = match kind { RecvKind::Direct => "file_recv_dir_direct", RecvKind::Group => "file_recv_dir_group" };
+        self.set_setting(key, dir.filter(|value| !value.trim().is_empty()))?;
+        Ok(())
+    }
+
+    /// Folder for one inbound file: an in-flight transfer keeps the folder it started
+    /// in, then a one-shot "save as" choice, then the configured default.
+    fn incoming_dir_for(&self, id: &str, kind: RecvKind) -> Result<PathBuf> {
+        if let Some(existing) = self.file_transfer_target(id)? {
+            if let Some(parent) = existing.parent() { return Ok(parent.to_path_buf()); }
+        }
+        if let Some(chosen) = self.file_offer_target_dir(id)? { return Ok(chosen); }
+        Ok(self.recv_dir(kind))
+    }
+
+    /// True when the directory is inside the app attachment store, which is the only
+    /// area the storage quota covers. Custom folders are managed by the user.
+    pub fn within_attachments(&self, dir: &Path) -> bool {
+        let base = self.attachments_dir().to_string_lossy().to_lowercase();
+        let candidate = dir.to_string_lossy().to_lowercase();
+        candidate == base || candidate.starts_with(&format!("{base}\\")) || candidate.starts_with(&format!("{base}/"))
+    }
 
     /// Bytes currently held by received attachments, including partial downloads.
     pub fn storage_used(&self) -> u64 { directory_usage(&self.attachments_dir()) }
@@ -1294,13 +1494,67 @@ impl Store {
         })
     }
 
-    /// Whether incoming files must be confirmed one by one (default: automatic).
+    /// Legacy boolean kept for reading settings written before the three-way mode.
     pub fn file_accept_confirm(&self) -> Result<bool> {
         Ok(self.get_setting("file_accept_confirm")?.map(|value| value == "1").unwrap_or(false))
     }
 
-    pub fn set_file_accept_confirm(&self, enabled: bool) -> Result<()> {
-        self.set_setting("file_accept_confirm", Some(if enabled { "1" } else { "0" }))?;
+    /// Three-way receive policy. Settings written by older versions (a boolean)
+    /// still map onto it, so an upgrade never silently changes the user's choice.
+    pub fn file_accept_mode(&self) -> Result<FileAcceptMode> {
+        if let Some(value) = self.get_setting("file_accept_mode")? {
+            if let Some(mode) = FileAcceptMode::parse(&value) { return Ok(mode); }
+        }
+        // A new install asks every time; an upgrade keeps whatever the user had.
+        Ok(match self.get_setting("file_accept_confirm")? {
+            Some(value) => if value == "1" { FileAcceptMode::Always } else { FileAcceptMode::Auto },
+            None => FileAcceptMode::Always,
+        })
+    }
+
+    pub fn set_file_accept_mode(&self, mode: FileAcceptMode) -> Result<()> {
+        self.set_setting("file_accept_mode", Some(mode.as_str()))?;
+        self.set_setting("file_accept_confirm", Some(if mode == FileAcceptMode::Auto { "0" } else { "1" }))?;
+        Ok(())
+    }
+
+    /// Senders and groups the user chose to accept without further prompts.
+    pub fn remembered_file_sources(&self) -> Result<Vec<String>> {
+        let mut statement = self.connection.prepare(
+            "SELECT source FROM file_accept_sources ORDER BY added_at, rowid LIMIT ?1")?;
+        let rows = statement.query_map([MAX_REMEMBERED_SOURCES as i64], |row| row.get(0))?;
+        rows.collect()
+    }
+
+    pub fn is_file_source_remembered(&self, source: &str) -> Result<bool> {
+        if !valid_offer_source(source) { return Ok(false); }
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM file_accept_sources WHERE source = ?1)", [source],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn remember_file_source(&self, source: &str) -> Result<()> {
+        if !valid_offer_source(source) { return Err(rusqlite::Error::InvalidQuery); }
+        let added_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_nanos() as i64).unwrap_or(0);
+        let transaction = self.connection.unchecked_transaction()?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO file_accept_sources(source, added_at) VALUES (?1, ?2)",
+            params![source, added_at],
+        )?;
+        // Bounded list: a peer that keeps changing its id cannot grow storage without limit.
+        transaction.execute(
+            "DELETE FROM file_accept_sources WHERE rowid IN (
+                SELECT rowid FROM file_accept_sources ORDER BY added_at DESC, rowid DESC
+                LIMIT -1 OFFSET ?1)",
+            [MAX_REMEMBERED_SOURCES as i64],
+        )?;
+        transaction.commit()
+    }
+
+    pub fn forget_file_sources(&self) -> Result<()> {
+        self.connection.execute("DELETE FROM file_accept_sources", [])?;
         Ok(())
     }
 
@@ -1313,15 +1567,17 @@ impl Store {
     }
 
     /// Records a deferred offer; repeated attempts keep the original request row.
-    pub fn record_file_offer_request(&self, peer: &str, id: &str, name: &str, size: u64, created_at: i64) -> Result<()> {
+    /// `group_id` is set only for group files, so the two views list disjoint sets.
+    pub fn record_file_offer_request(&self, peer: &str, id: &str, name: &str, size: u64, created_at: i64, group_id: Option<&str>) -> Result<()> {
         let clean = crate::files::sanitize_name(name).ok_or(rusqlite::Error::InvalidQuery)?;
         let size = i64::try_from(size).map_err(|_| rusqlite::Error::InvalidQuery)?;
         if !valid_fingerprint(peer) || !valid_message_id(id) { return Err(rusqlite::Error::InvalidQuery); }
+        if let Some(group) = group_id { if !valid_group_id(group) { return Err(rusqlite::Error::InvalidQuery); } }
         self.connection.execute(
-            "INSERT INTO file_offer_requests(message_id, peer, name, total, created_at, status)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'pending')
+            "INSERT INTO file_offer_requests(message_id, peer, name, total, created_at, status, group_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6)
              ON CONFLICT(message_id) DO NOTHING",
-            params![id, peer, clean, size, created_at],
+            params![id, peer, clean, size, created_at, group_id],
         )?;
         Ok(())
     }
@@ -1329,21 +1585,54 @@ impl Store {
     pub fn list_file_offer_requests(&self, peer: &str) -> Result<Vec<FileOfferRequest>> {
         if !valid_fingerprint(peer) { return Err(rusqlite::Error::InvalidQuery); }
         let mut statement = self.connection.prepare(
-            "SELECT message_id, peer, name, total, created_at, status FROM file_offer_requests
-             WHERE peer = ?1 AND status = 'pending' ORDER BY created_at DESC LIMIT 50")?;
+            "SELECT message_id, peer, name, total, created_at, status, group_id FROM file_offer_requests
+             WHERE peer = ?1 AND status = 'pending' AND group_id IS NULL ORDER BY created_at DESC LIMIT 50")?;
         let rows = statement.query_map([peer], |row| Ok(FileOfferRequest {
             message_id: row.get(0)?, peer: row.get(1)?, name: row.get(2)?, total: row.get(3)?,
-            created_at: row.get(4)?, status: row.get(5)?,
+            created_at: row.get(4)?, status: row.get(5)?, group_id: row.get(6)?,
         }))?;
         rows.collect()
     }
 
-    pub fn resolve_file_offer(&self, id: &str, accept: bool) -> Result<bool> {
+    pub fn list_group_file_offer_requests(&self, group_id: &str) -> Result<Vec<FileOfferRequest>> {
+        if !valid_group_id(group_id) { return Err(rusqlite::Error::InvalidQuery); }
+        let mut statement = self.connection.prepare(
+            "SELECT message_id, peer, name, total, created_at, status, group_id FROM file_offer_requests
+             WHERE group_id = ?1 AND status = 'pending' ORDER BY created_at DESC LIMIT 50")?;
+        let rows = statement.query_map([group_id], |row| Ok(FileOfferRequest {
+            message_id: row.get(0)?, peer: row.get(1)?, name: row.get(2)?, total: row.get(3)?,
+            created_at: row.get(4)?, status: row.get(5)?, group_id: row.get(6)?,
+        }))?;
+        rows.collect()
+    }
+
+    /// `target_dir` is an optional one-shot destination chosen in the dialog; it is
+    /// stored on the pending row so the later retry writes where the user asked.
+    pub fn resolve_file_offer(&self, id: &str, accept: bool, target_dir: Option<&str>) -> Result<bool> {
         if !valid_message_id(id) { return Err(rusqlite::Error::InvalidQuery); }
         Ok(self.connection.execute(
-            "UPDATE file_offer_requests SET status = ?2 WHERE message_id = ?1 AND status = 'pending'",
-            params![id, if accept { "accepted" } else { "rejected" }],
+            "UPDATE file_offer_requests SET status = ?2, target_dir = COALESCE(?3, target_dir)
+             WHERE message_id = ?1 AND status = 'pending'",
+            params![id, if accept { "accepted" } else { "rejected" }, target_dir],
         )? == 1)
+    }
+
+    /// Destination chosen for a pending or accepted offer, if any.
+    pub fn file_offer_target_dir(&self, id: &str) -> Result<Option<PathBuf>> {
+        if !valid_message_id(id) { return Err(rusqlite::Error::InvalidQuery); }
+        let value: Option<Option<String>> = self.connection.query_row(
+            "SELECT target_dir FROM file_offer_requests WHERE message_id = ?1", [id], |row| row.get(0),
+        ).optional()?;
+        Ok(value.flatten().filter(|text| !text.trim().is_empty()).map(PathBuf::from))
+    }
+
+    /// Target path recorded for a completed or in-flight transfer.
+    pub fn file_transfer_target(&self, id: &str) -> Result<Option<PathBuf>> {
+        if !valid_message_id(id) { return Err(rusqlite::Error::InvalidQuery); }
+        let value: Option<String> = self.connection.query_row(
+            "SELECT target_path FROM file_transfers WHERE message_id = ?1", [id], |row| row.get(0),
+        ).optional()?;
+        Ok(value.map(PathBuf::from))
     }
 
     /// Validate an offer against trust, existing records and any partial file.
@@ -1358,8 +1647,9 @@ impl Store {
         let tx = self.connection.unchecked_transaction()?;
         let verified: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM contacts WHERE fingerprint = ?1 AND trust_state = 'verified')", [peer], |r| r.get(0))?;
         if !verified { return Ok(FileOfferDecision::Untrusted); }
-        let target = crate::files::incoming_target(&self.incoming_dir(), id, &clean);
-        let partial = crate::files::incoming_partial(&self.incoming_dir(), id);
+        let dir = self.incoming_dir_for(id, RecvKind::Direct)?;
+        let target = crate::files::incoming_target(&dir, id, &clean);
+        let partial = crate::files::incoming_partial(&dir, id);
         let existing: Option<(String, String, Option<String>, Option<i64>, Option<String>, i64, i64)> = tx.query_row(
             "SELECT peer, sender, kind, file_size, file_sha256, created_at, logical FROM direct_messages WHERE id = ?1", [id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
@@ -1388,7 +1678,7 @@ impl Store {
         }
         let collision: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM messages WHERE id = ?1 UNION ALL SELECT 1 FROM local_messages WHERE id = ?1)", [id], |r| r.get(0))?;
         if collision { return Ok(FileOfferDecision::Conflict); }
-        if self.storage_used().saturating_add(size) > self.storage_quota()? {
+        if self.within_attachments(&dir) && self.storage_used().saturating_add(size) > self.storage_quota()? {
             return Ok(FileOfferDecision::NoSpace);
         }
         if tx.execute("UPDATE logical_clock SET value = max(value, ?1) + 1 WHERE singleton = 1 AND value < 9223372036854775807", [logical])? != 1 {
@@ -1774,6 +2064,40 @@ impl Store {
         tx.execute("DELETE FROM group_control WHERE group_id = ?1 AND kind != 'dissolve' AND status = 'pending'", [group_id])?;
         tx.commit()?;
         Ok(true)
+    }
+
+    /// `None` means the local user never joined; `Some(false)` means left but history remains.
+    pub fn group_membership(&self, group_id: &str, self_id: &str) -> Result<Option<bool>> {
+        if !valid_group_id(group_id) || !valid_fingerprint(self_id) { return Err(rusqlite::Error::InvalidQuery); }
+        let active: Option<i64> = self.connection.query_row(
+            "SELECT active FROM group_members WHERE group_id = ?1 AND member = ?2",
+            params![group_id, self_id], |row| row.get(0)).optional()?;
+        Ok(active.map(|value| value == 1))
+    }
+
+    /// Groups the user left, kept so history stays reachable. Messages are never deleted here.
+    pub fn list_left_groups(&self, self_id: &str) -> Result<Vec<GroupSummary>> {
+        if !valid_fingerprint(self_id) { return Err(rusqlite::Error::InvalidQuery); }
+        let mut statement = self.connection.prepare(
+            "SELECT g.id, g.name, g.owner, 0,
+                (SELECT count(*) FROM group_members x WHERE x.group_id = g.id AND x.active = 1),
+                COALESCE((SELECT m.body FROM group_messages m WHERE m.group_id = g.id
+                          ORDER BY m.logical DESC, m.sender DESC, m.id DESC LIMIT 1), ''),
+                COALESCE((SELECT m.logical FROM group_messages m WHERE m.group_id = g.id
+                          ORDER BY m.logical DESC, m.sender DESC, m.id DESC LIMIT 1), 0)
+             FROM groups g JOIN group_members gm ON gm.group_id = g.id
+             WHERE gm.member = ?1 AND gm.active = 0 AND g.active = 1
+               AND EXISTS(SELECT 1 FROM group_messages m WHERE m.group_id = g.id)
+             ORDER BY 7 DESC LIMIT 100"
+        )?;
+        let rows = statement.query_map([self_id], |row| {
+            let owner: String = row.get(2)?;
+            Ok(GroupSummary {
+                id: row.get(0)?, name: row.get(1)?, owner: owner.clone(), member_count: row.get(4)?,
+                hidden: true, is_owner: owner == self_id, last_body: row.get(5)?, last_logical: row.get(6)?,
+            })
+        })?;
+        rows.collect()
     }
 
     pub fn open_group(&self, group_id: &str, self_id: &str) -> Result<bool> {
@@ -2324,10 +2648,13 @@ impl Store {
             "SELECT EXISTS(SELECT 1 FROM groups WHERE id = ?1)", [group_id], |row| row.get(0),
         )?;
         if !known_group && !members.iter().any(|member| member == self_id) { return Ok(GroupFileDecision::NotMember); }
-        let target = crate::files::incoming_target(&self.incoming_dir(), id, &clean);
-        let partial = crate::files::incoming_partial(&self.incoming_dir(), id);
+        let dir = self.incoming_dir_for(id, RecvKind::Group)?;
+        let target = crate::files::incoming_target(&dir, id, &clean);
+        let partial = crate::files::incoming_partial(&dir, id);
         // A partial download may already occupy space; count the full offer conservatively.
-        if self.storage_used().saturating_add(size) > self.storage_quota()? { return Ok(GroupFileDecision::NoSpace); }
+        if self.within_attachments(&dir) && self.storage_used().saturating_add(size) > self.storage_quota()? {
+            return Ok(GroupFileDecision::NoSpace);
+        }
         let result = self.receive_group(self_id, peer, group_id, name, owner, members, id, &clean, created_at, logical,
             None, None, None, &[], now)?;
         if matches!(result, IncomingResult::NotMember) { return Ok(GroupFileDecision::NotMember); }
@@ -2903,6 +3230,86 @@ impl Store {
     }
 
     /// Applies an inbound invite / member update / removal / leave notice.
+    /// A new invitation asks the user first unless auto-join is enabled.
+    pub fn auto_join_groups(&self) -> Result<bool> {
+        Ok(self.get_setting("auto_join_groups")?.as_deref() == Some("1"))
+    }
+
+    pub fn set_auto_join_groups(&self, enabled: bool) -> Result<()> {
+        self.set_setting("auto_join_groups", Some(if enabled { "1" } else { "0" }))?;
+        Ok(())
+    }
+
+    pub fn pending_group_invitations(&self, self_id: &str) -> Result<Vec<GroupInvitation>> {
+        if !valid_fingerprint(self_id) { return Err(rusqlite::Error::InvalidQuery); }
+        let mut statement = self.connection.prepare(
+            "SELECT i.id, i.group_id, i.name, i.owner, c.display_name, i.members, i.created_at
+             FROM group_invitations i LEFT JOIN contacts c ON c.fingerprint = i.owner
+             WHERE i.status = 'pending' AND i.owner != ?1
+             ORDER BY i.created_at DESC LIMIT 64",
+        )?;
+        let rows = statement.query_map([self_id], |row| {
+            let members: String = row.get(5)?;
+            let count = serde_json::from_str::<Vec<String>>(&members).map(|list| list.len()).unwrap_or(0) as u32;
+            Ok(GroupInvitation {
+                id: row.get(0)?, group_id: row.get(1)?, name: row.get(2)?, owner: row.get(3)?,
+                owner_name: row.get(4)?, member_count: count, created_at: row.get(6)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Joins the announced roster. Returns the group id so the UI can open it.
+    pub fn accept_group_invitation(&self, id: &str, self_id: &str, now: i64) -> Result<Option<String>> {
+        if !valid_group_id_is(id) || !valid_fingerprint(self_id) { return Err(rusqlite::Error::InvalidQuery); }
+        let tx = self.connection.unchecked_transaction()?;
+        let row: Option<(String, String, String, String)> = tx.query_row(
+            "SELECT group_id, name, owner, members FROM group_invitations WHERE id = ?1 AND status = 'pending'",
+            [id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).optional()?;
+        let Some((group_id, name, owner, members_json)) = row else { return Ok(None); };
+        let members: Vec<String> = serde_json::from_str(&members_json).map_err(|_| rusqlite::Error::InvalidQuery)?;
+        if !valid_fingerprint(&owner) || members.is_empty() || members.len() > MAX_GROUP_MEMBERS_LOCAL
+            || !members.iter().all(|m| valid_fingerprint(m)) || !members.iter().any(|m| m == &owner)
+        { return Err(rusqlite::Error::InvalidQuery); }
+        let existing_owner: Option<String> = tx.query_row("SELECT owner FROM groups WHERE id = ?1", [&group_id], |row| row.get(0)).optional()?;
+        match existing_owner {
+            Some(local) if local != owner => return Ok(None),
+            Some(_) => { tx.execute("UPDATE groups SET name = ?2, active = 1 WHERE id = ?1", params![group_id, name])?; },
+            None => { tx.execute("INSERT INTO groups(id, name, owner, created_at) VALUES (?1, ?2, ?3, ?4)",
+                params![group_id, name, owner, now])?; },
+        }
+        for member in &members {
+            let role = if member == &owner { "owner" } else { "member" };
+            tx.execute(
+                "INSERT INTO group_members(group_id, member, role, joined_at, active, hidden) VALUES (?1, ?2, ?3, ?4, 1, 0)
+                 ON CONFLICT(group_id, member) DO UPDATE SET active = 1, hidden = 0, role = excluded.role",
+                params![group_id, member, role, now])?;
+        }
+        tx.execute("UPDATE group_invitations SET status = 'accepted' WHERE id = ?1", [id])?;
+        tx.commit()?;
+        Ok(Some(group_id))
+    }
+
+    /// Declines an invitation and tells the owner to drop us from its delivery list.
+    pub fn decline_group_invitation(&self, id: &str, self_id: &str, now: i64) -> Result<bool> {
+        if !valid_group_id_is(id) || !valid_fingerprint(self_id) { return Err(rusqlite::Error::InvalidQuery); }
+        let tx = self.connection.unchecked_transaction()?;
+        let row: Option<(String, String)> = tx.query_row(
+            "SELECT group_id, owner FROM group_invitations WHERE id = ?1 AND status = 'pending'",
+            [id], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?;
+        let Some((group_id, owner)) = row else { return Ok(false); };
+        tx.execute("UPDATE group_invitations SET status = 'declined' WHERE id = ?1", [id])?;
+        let payload = serde_json::json!({ "group_id": group_id, "member": self_id }).to_string();
+        tx.execute(
+            "INSERT INTO group_control(id, group_id, target, kind, payload, status, created_at)
+             VALUES (lower(hex(randomblob(16))), ?1, ?2, 'leave', ?3, 'pending', ?4)",
+            params![group_id, owner, payload, now])?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     pub fn receive_group_control(&self, self_id: &str, peer: &str, kind: &str, group_id: &str, payload: &str, now: i64) -> Result<IncomingResult> {
         if !valid_fingerprint(self_id) || !valid_fingerprint(peer) || !valid_group_id(group_id)
             || payload.is_empty() || payload.len() > 65536 {
@@ -2929,6 +3336,23 @@ impl Store {
                 if peer != owner { return Ok(IncomingResult::Unverified); }
                 if !members.iter().any(|m| m == self_id) { return Ok(IncomingResult::NotMember); }
                 let existing_owner: Option<String> = tx.query_row("SELECT owner FROM groups WHERE id = ?1", [group_id], |row| row.get(0)).optional()?;
+                // A first invitation waits for the user unless auto-join is enabled.
+                let active_member: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM group_members WHERE group_id = ?1 AND member = ?2 AND active = 1)",
+                    params![group_id, self_id], |row| row.get(0),
+                )?;
+                let auto_join = tx.query_row("SELECT value FROM settings WHERE key = 'auto_join_groups'",
+                    [], |row| row.get::<_, String>(0)).optional()?.as_deref() == Some("1");
+                if existing_owner.is_none() && !active_member && !auto_join {
+                    let members_json = serde_json::to_string(&members).map_err(|_| rusqlite::Error::InvalidQuery)?;
+                    tx.execute(
+                        "INSERT INTO group_invitations(id, group_id, name, owner, members, created_at, status)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending')
+                         ON CONFLICT(id) DO UPDATE SET name = excluded.name, owner = excluded.owner, members = excluded.members",
+                        params![group_id, group_id, name, owner, members_json, now])?;
+                    tx.commit()?;
+                    return Ok(IncomingResult::Inserted);
+                }
                 match existing_owner {
                     Some(local) if local != owner => return Ok(IncomingResult::IdConflict),
                     Some(_) => { tx.execute("UPDATE groups SET name = ?2 WHERE id = ?1", params![group_id, name])?; },
@@ -3188,8 +3612,34 @@ fn valid_message_id(value: &str) -> bool {
     !value.is_empty() && value.len() <= 128 && value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
+/// Remembered sources are a contact fingerprint or a group id prefixed with "group:".
+fn valid_offer_source(value: &str) -> bool {
+    if let Some(group) = value.strip_prefix("group:") {
+        valid_group_id(group)
+    } else {
+        valid_fingerprint(value)
+    }
+}
+
 fn valid_fingerprint(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+pub fn valid_fingerprint_public(value: &str) -> bool { valid_fingerprint(value) }
+
+pub fn valid_username_public(value: &str) -> bool { valid_username(value) }
+
+/// Invitation ids are the same bounded opaque tokens as group control ids.
+fn valid_group_id_is(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
+}
+
+const MAX_GROUP_MEMBERS_LOCAL: usize = 256;
+
+/// Usernames are 2-20 lowercase ASCII letters, digits, `-` or `_`.
+fn valid_username(value: &str) -> bool {
+    (2..=20).contains(&value.len())
+        && value.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
 }
 
 /// Group ids are random 128-bit values, never derived from a fingerprint.
@@ -3203,6 +3653,51 @@ mod tests {
 
     fn memory_store() -> Store {
         Store::initialize(Connection::open_in_memory().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn receive_policy_defaults_to_asking_and_remembers_sources() {
+        let store = memory_store();
+        // A fresh install asks before receiving any file.
+        assert_eq!(store.file_accept_mode().unwrap(), FileAcceptMode::Always);
+        let peer = "c".repeat(64);
+        assert!(!store.is_file_source_remembered(&peer).unwrap());
+        store.set_file_accept_mode(FileAcceptMode::Remember).unwrap();
+        store.remember_file_source(&peer).unwrap();
+        assert!(store.is_file_source_remembered(&peer).unwrap());
+        assert_eq!(store.file_accept_mode().unwrap(), FileAcceptMode::Remember);
+        store.forget_file_sources().unwrap();
+        assert!(!store.is_file_source_remembered(&peer).unwrap());
+        assert!(store.remember_file_source("not-a-source").is_err());
+    }
+
+    #[test]
+    fn receive_directories_are_separate_and_fall_back_to_defaults() {
+        let store = memory_store();
+        assert!(!store.recv_dir_custom(RecvKind::Direct));
+        assert_ne!(store.recv_dir(RecvKind::Direct), store.recv_dir(RecvKind::Group));
+        let chosen = PathBuf::from("D:\\收件\\单聊");
+        store.set_recv_dir(RecvKind::Direct, Some("D:\\收件\\单聊")).unwrap();
+        assert!(store.recv_dir_custom(RecvKind::Direct));
+        assert!(!store.recv_dir_custom(RecvKind::Group));
+        assert_eq!(store.recv_dir(RecvKind::Direct), chosen);
+        store.set_recv_dir(RecvKind::Direct, None).unwrap();
+        assert!(!store.recv_dir_custom(RecvKind::Direct));
+        assert_eq!(store.recv_dir(RecvKind::Direct), store.default_recv_dir(RecvKind::Direct));
+    }
+
+    #[test]
+    fn save_as_directory_is_kept_for_the_next_attempt() {
+        let store = memory_store();
+        let peer = "e".repeat(64);
+        let id = "f".repeat(32);
+        store.record_file_offer_request(&peer, &id, "a.txt", 10, 1, None).unwrap();
+        assert_eq!(store.file_offer_target_dir(&id).unwrap(), None);
+        store.resolve_file_offer(&id, true, Some("D:\\另存为")).unwrap();
+        assert_eq!(store.file_offer_target_dir(&id).unwrap(), Some(PathBuf::from("D:\\另存为")));
+        // Group offers stay out of the direct view.
+        assert!(store.list_file_offer_requests(&peer).unwrap().is_empty());
+        assert_eq!(store.list_group_file_offer_requests(&"a".repeat(32)).unwrap().len(), 0);
     }
 
     #[test]
@@ -4005,10 +4500,83 @@ mod tests {
         assert_eq!(control.kind, "join");
         assert_eq!(control.target, owner);
 
-        // Receiving the roster update settles the pending application.
+        // Receiving the roster update settles the pending application (auto-join mode).
+        store.set_auto_join_groups(true).unwrap();
         store.receive_group_control(&me, &owner, "invite", &group.id,
             &serde_json::json!({ "name": "Team", "owner": owner, "members": [owner.clone(), me.clone()] }).to_string(), 5).unwrap();
         assert!(store.list_out_join_requests(&me).unwrap().is_empty());
+    }
+
+    #[test]
+    fn group_invite_waits_for_confirmation_and_decline_notifies_owner() {
+        let owner_store = memory_store();
+        let me_store = memory_store();
+        let owner = "b".repeat(64);
+        let me = "a".repeat(64);
+        for (store, peer, name) in [(&owner_store, &me, "Me"), (&me_store, &owner, "Owner")] {
+            store.add_candidate_with_username(peer, name, None).unwrap();
+            store.confirm_candidate(peer).unwrap();
+        }
+        me_store.set_contact_address(&owner, "127.0.0.1:7000").unwrap();
+        let group = owner_store.create_group(&owner, "Team", &[me.clone()], 1).unwrap();
+        let payload = serde_json::json!({ "name": "Team", "owner": owner, "members": [owner.clone(), me.clone()] }).to_string();
+
+        // Default: the invite becomes a local request and no group row is created.
+        assert!(!me_store.auto_join_groups().unwrap());
+        assert_eq!(me_store.receive_group_control(&me, &owner, "invite", &group.id, &payload, 5).unwrap(), IncomingResult::Inserted);
+        assert_eq!(me_store.group_membership(&group.id, &me).unwrap(), None);
+        assert!(me_store.list_groups(&me).unwrap().is_empty());
+        let pending = me_store.pending_group_invitations(&me).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].name, "Team");
+        assert_eq!(pending[0].owner_name.as_deref(), Some("Owner"));
+
+        // Re-delivery of the same invite does not create duplicates.
+        assert_eq!(me_store.receive_group_control(&me, &owner, "invite", &group.id, &payload, 6).unwrap(), IncomingResult::Inserted);
+        assert_eq!(me_store.pending_group_invitations(&me).unwrap().len(), 1);
+
+        // Accepting creates membership and keeps history reachable.
+        let id = me_store.pending_group_invitations(&me).unwrap()[0].id.clone();
+        assert_eq!(me_store.accept_group_invitation(&id, &me, 7).unwrap(), Some(group.id.clone()));
+        assert_eq!(me_store.group_membership(&group.id, &me).unwrap(), Some(true));
+        assert_eq!(me_store.list_groups(&me).unwrap().len(), 1);
+        assert!(me_store.pending_group_invitations(&me).unwrap().is_empty());
+
+        // A fresh invitation can be declined; the owner gets a leave notice instead.
+        let other = owner_store.create_group(&owner, "Other", &[me.clone()], 8).unwrap();
+        let payload = serde_json::json!({ "name": "Other", "owner": owner, "members": [owner.clone(), me.clone()] }).to_string();
+        me_store.receive_group_control(&me, &owner, "invite", &other.id, &payload, 9).unwrap();
+        let id = me_store.pending_group_invitations(&me).unwrap()[0].id.clone();
+        assert!(me_store.decline_group_invitation(&id, &me, 10).unwrap());
+        assert_eq!(me_store.group_membership(&other.id, &me).unwrap(), None);
+        assert!(me_store.pending_group_invitations(&me).unwrap().is_empty());
+        let control = me_store.next_pending_control(None).unwrap().unwrap();
+        assert_eq!(control.kind, "leave");
+        assert_eq!(control.target, owner);
+    }
+
+    #[test]
+    fn auto_join_accepts_contacts_and_groups_by_preference() {
+        let store = memory_store();
+        assert!(store.auto_accept_contacts().unwrap(), "mutual add is the default");
+        store.set_auto_accept_contacts(false).unwrap();
+        assert!(!store.auto_accept_contacts().unwrap());
+        store.set_auto_accept_contacts(true).unwrap();
+        assert!(store.auto_accept_contacts().unwrap());
+
+        let owner_store = memory_store();
+        let owner = "b".repeat(64);
+        let me = "a".repeat(64);
+        for (store, peer) in [(&owner_store, &me), (&store, &owner)] {
+            store.add_candidate(peer, "P").unwrap();
+            store.confirm_candidate(peer).unwrap();
+        }
+        let group = owner_store.create_group(&owner, "Team", &[me.clone()], 1).unwrap();
+        store.set_auto_join_groups(true).unwrap();
+        let payload = serde_json::json!({ "name": "Team", "owner": owner, "members": [owner.clone(), me.clone()] }).to_string();
+        store.receive_group_control(&me, &owner, "invite", &group.id, &payload, 2).unwrap();
+        assert_eq!(store.group_membership(&group.id, &me).unwrap(), Some(true));
+        assert!(store.pending_group_invitations(&me).unwrap().is_empty());
     }
 
     #[test]
@@ -4217,10 +4785,11 @@ mod tests {
     fn contact_remark_category_and_profile_are_local_only() {
         let store = memory_store();
         let peer = "b".repeat(64);
-        store.add_candidate(&peer, "Bob").unwrap();
+        store.add_candidate_with_username(&peer, "Bob", Some("robert")).unwrap();
         store.confirm_candidate(&peer).unwrap();
         assert!(store.set_contact_profile(&peer, Some("项目对接人"), Some("研发部")).unwrap());
         let contact = store.list_contacts().unwrap().into_iter().find(|item| item.fingerprint == peer).unwrap();
+        assert_eq!(contact.username.as_deref(), Some("robert"), "LAN username is display-only but must persist");
         assert_eq!(contact.remark.as_deref(), Some("项目对接人"));
         assert_eq!(contact.category.as_deref(), Some("研发部"));
         assert_eq!(contact.trust_state, "verified", "local notes must not change trust");
@@ -4230,15 +4799,24 @@ mod tests {
         assert!(store.set_contact_profile(&peer, Some(&"x".repeat(65)), None).is_err());
         assert!(store.set_contact_profile(&peer, Some("对接"), Some("研发部")).unwrap());
 
-        assert_eq!(store.get_profile().unwrap(), Profile { nickname: String::new(), email: String::new() });
+        assert_eq!(store.get_profile().unwrap(), Profile { nickname: String::new(), email: String::new(), username: String::new() });
         assert!(store.set_profile("青鸟测试", "a@example.com").unwrap());
-        assert_eq!(store.get_profile().unwrap(), Profile { nickname: "青鸟测试".into(), email: "a@example.com".into() });
+        assert_eq!(store.get_profile().unwrap(), Profile { nickname: "青鸟测试".into(), email: "a@example.com".into(), username: String::new() });
         assert!(!store.set_profile(&"x".repeat(65), "").unwrap());
         assert!(!store.set_profile("ok", "not-an-email").unwrap());
         assert_eq!(store.get_profile().unwrap().email, "a@example.com");
+        assert!(store.set_username("bob_1").unwrap());
+        assert_eq!(store.get_profile().unwrap().username, "bob_1");
+        assert!(!store.set_username("Bad Name").unwrap());
+        assert!(!store.set_username("a").unwrap());
+        assert!(!store.set_username(&"x".repeat(21)).unwrap());
+        assert!(!store.onboarding_done().unwrap());
+        store.set_onboarding_done().unwrap();
+        assert!(store.onboarding_done().unwrap());
 
         assert_eq!(store.search_contacts("研发", 20).unwrap().len(), 1);
         assert_eq!(store.search_contacts("Bob", 20).unwrap().len(), 1);
+        assert_eq!(store.search_contacts("robert", 20).unwrap().len(), 1, "search must match the peer username");
         assert_eq!(store.search_contacts(&peer[..8], 20).unwrap().len(), 1);
         assert!(store.search_contacts("missing", 20).unwrap().is_empty());
         assert_eq!(store.search_contacts("", 20).unwrap().len(), 1);
@@ -4282,6 +4860,186 @@ mod tests {
         assert!(store.export_conversation(&me, "group", &"f".repeat(32)).is_err());
         assert!(store.export_conversation(&me, "direct", &"d".repeat(64)).is_err());
         assert!(store.export_conversation(&me, "unknown", "self").is_err());
+    }
+
+    #[test]
+    fn fresh_database_reaches_latest_schema_and_accepts_offer_destinations() {
+        let store = memory_store();
+        let version: i64 = store.connection
+            .pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
+        assert_eq!(version, SCHEMA_VERSION, "a new database must start at the latest schema");
+        // Regression: the v17 column migration used to run before the table existed,
+        // so a fresh database rejected every group offer and one-shot destination.
+        let peer = "b".repeat(64);
+        let id = "m".repeat(32);
+        store.record_file_offer_request(&peer, &id, "a.pdf", 10, 1, Some(&"c".repeat(32))).unwrap();
+        assert!(store.resolve_file_offer(&id, true, Some("D:\\接收")).unwrap());
+        assert_eq!(store.file_offer_target_dir(&id).unwrap(), Some(PathBuf::from("D:\\接收")));
+    }
+
+    #[test]
+    fn v12_database_gains_offer_destination_columns() {
+        use std::{fs, time::{SystemTime, UNIX_EPOCH}};
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("storage-tests");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("offers-{}-{}.sqlite", std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        {
+            let store = Store::open(&path).unwrap();
+            store.connection.execute_batch(
+                "CREATE TABLE offers_old (
+                    message_id TEXT PRIMARY KEY NOT NULL,
+                    peer TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    total INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    target_dir TEXT
+                 );
+                 DROP TABLE file_offer_requests;
+                 ALTER TABLE offers_old RENAME TO file_offer_requests;
+                 PRAGMA user_version = 12;",
+            ).unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let version: i64 = store.connection
+            .pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let id = "m".repeat(32);
+        store.record_file_offer_request(&"b".repeat(64), &id, "群文件.pdf", 10, 1, Some(&"c".repeat(32))).unwrap();
+        assert_eq!(store.list_group_file_offer_requests(&"c".repeat(32)).unwrap().len(), 1);
+        assert!(store.resolve_file_offer(&id, true, None).unwrap());
+        drop(store);
+        // Reopening an upgraded database must not be rejected as "too new".
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.file_offer_status(&id).unwrap().as_deref(), Some("accepted"));
+        drop(store);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn file_accept_mode_defaults_from_legacy_flag_and_persists() {
+        let store = memory_store();
+        assert_eq!(store.file_accept_mode().unwrap(), FileAcceptMode::Always);
+        store.set_setting("file_accept_confirm", Some("0")).unwrap();
+        assert_eq!(store.file_accept_mode().unwrap(), FileAcceptMode::Auto);
+        store.set_file_accept_mode(FileAcceptMode::Remember).unwrap();
+        assert_eq!(store.file_accept_mode().unwrap(), FileAcceptMode::Remember);
+        assert_eq!(store.get_setting("file_accept_confirm").unwrap().as_deref(), Some("1"));
+        store.set_file_accept_mode(FileAcceptMode::Auto).unwrap();
+        assert_eq!(store.get_setting("file_accept_confirm").unwrap().as_deref(), Some("0"));
+        // An unreadable stored value falls back to the legacy boolean, never to "auto".
+        store.set_setting("file_accept_mode", Some("bogus")).unwrap();
+        assert_eq!(store.file_accept_mode().unwrap(), FileAcceptMode::Auto);
+        store.set_setting("file_accept_confirm", Some("1")).unwrap();
+        assert_eq!(store.file_accept_mode().unwrap(), FileAcceptMode::Always);
+        for mode in [FileAcceptMode::Always, FileAcceptMode::Remember, FileAcceptMode::Auto] {
+            assert_eq!(FileAcceptMode::parse(mode.as_str()), Some(mode));
+        }
+        assert_eq!(FileAcceptMode::parse("Ask"), None);
+    }
+
+    #[test]
+    fn receive_directories_default_customize_and_reset_per_kind() {
+        let store = memory_store();
+        let attachments = store.attachments_dir();
+        assert_eq!(store.recv_dir(RecvKind::Direct), attachments.join("in").join("direct"));
+        assert_eq!(store.recv_dir(RecvKind::Group), attachments.join("in").join("group"));
+        assert!(!store.recv_dir_custom(RecvKind::Direct));
+        store.set_recv_dir(RecvKind::Direct, Some("D:\\接收\\单聊")).unwrap();
+        assert!(store.recv_dir_custom(RecvKind::Direct));
+        assert_eq!(store.recv_dir(RecvKind::Direct), PathBuf::from("D:\\接收\\单聊"));
+        assert!(!store.recv_dir_custom(RecvKind::Group));
+        // Clearing restores the built-in default instead of an empty path.
+        store.set_recv_dir(RecvKind::Direct, Some("   ")).unwrap();
+        assert!(!store.recv_dir_custom(RecvKind::Direct));
+        assert_eq!(store.recv_dir(RecvKind::Direct), attachments.join("in").join("direct"));
+        store.set_recv_dir(RecvKind::Group, Some("D:\\接收\\群")).unwrap();
+        assert_eq!(store.recv_dir(RecvKind::Group), PathBuf::from("D:\\接收\\群"));
+        store.set_recv_dir(RecvKind::Group, None).unwrap();
+        assert_eq!(store.recv_dir(RecvKind::Group), attachments.join("in").join("group"));
+    }
+
+    #[test]
+    fn quota_only_counts_the_attachment_store() {
+        let store = memory_store();
+        let attachments = store.attachments_dir();
+        assert!(store.within_attachments(&attachments));
+        assert!(store.within_attachments(&attachments.join("in").join("direct")));
+        assert!(!store.within_attachments(&attachments.parent().unwrap().join("elsewhere")));
+        assert!(!store.within_attachments(Path::new("D:\\接收")));
+        // A sibling that only shares the prefix must not be treated as internal.
+        let sibling = PathBuf::from(format!("{}2", attachments.to_string_lossy()));
+        assert!(!store.within_attachments(&sibling));
+    }
+
+    #[test]
+    fn remembered_sources_are_validated_deduplicated_and_cleared() {
+        let store = memory_store();
+        let peer = "b".repeat(64);
+        let group = "c".repeat(32);
+        assert!(store.remembered_file_sources().unwrap().is_empty());
+        assert!(!store.is_file_source_remembered(&peer).unwrap());
+        store.remember_file_source(&peer).unwrap();
+        store.remember_file_source(&peer).unwrap();
+        store.remember_file_source(&format!("group:{group}")).unwrap();
+        assert_eq!(store.remembered_file_sources().unwrap(), vec![peer.clone(), format!("group:{group}")]);
+        assert!(store.is_file_source_remembered(&peer).unwrap());
+        assert!(store.is_file_source_remembered(&format!("group:{group}")).unwrap());
+        assert!(!store.is_file_source_remembered(&"d".repeat(64)).unwrap());
+        for bad in ["", "xyz", "group:123", "group:", &"B".repeat(64)] {
+            assert!(store.remember_file_source(bad).is_err(), "{bad} must be refused");
+        }
+        assert!(!store.is_file_source_remembered("xyz").unwrap());
+        // The list is bounded, so an attacker cannot grow settings without limit.
+        for index in 0..205u64 {
+            store.remember_file_source(&format!("{index:064x}")).unwrap();
+        }
+        let sources = store.remembered_file_sources().unwrap();
+        assert_eq!(sources.len(), 200);
+        assert!(!sources.contains(&"0".repeat(64)));
+        assert!(sources.contains(&format!("{:064x}", 204u64)));
+        store.forget_file_sources().unwrap();
+        assert!(store.remembered_file_sources().unwrap().is_empty());
+        assert!(!store.is_file_source_remembered(&peer).unwrap());
+    }
+
+    #[test]
+    fn pending_offers_stay_per_conversation_and_keep_one_shot_target() {
+        let store = memory_store();
+        let peer = "b".repeat(64);
+        let group = "c".repeat(32);
+        let direct_id = "a".repeat(32);
+        let group_id = "d".repeat(32);
+        store.record_file_offer_request(&peer, &direct_id, "报告.pdf", 100, 10, None).unwrap();
+        store.record_file_offer_request(&peer, &group_id, "群文件.pdf", 50, 11, Some(&group)).unwrap();
+        // Repeated offers keep the original row instead of duplicating it.
+        store.record_file_offer_request(&peer, &direct_id, "改名.pdf", 100, 12, None).unwrap();
+        assert_eq!(store.file_offer_status(&direct_id).unwrap().as_deref(), Some("pending"));
+        assert_eq!(store.file_offer_target_dir(&direct_id).unwrap(), None);
+        let direct = store.list_file_offer_requests(&peer).unwrap();
+        assert_eq!(direct.len(), 1);
+        assert_eq!(direct[0].message_id, direct_id);
+        assert_eq!(direct[0].name, "报告.pdf");
+        assert_eq!(direct[0].group_id, None);
+        let grouped = store.list_group_file_offer_requests(&group).unwrap();
+        assert_eq!(grouped.len(), 1);
+        assert_eq!(grouped[0].message_id, group_id);
+        assert_eq!(grouped[0].group_id.as_deref(), Some(group.as_str()));
+        assert!(store.resolve_file_offer(&direct_id, true, Some("D:\\接收")).unwrap());
+        assert_eq!(store.file_offer_status(&direct_id).unwrap().as_deref(), Some("accepted"));
+        assert_eq!(store.file_offer_target_dir(&direct_id).unwrap(), Some(PathBuf::from("D:\\接收")));
+        assert!(store.list_file_offer_requests(&peer).unwrap().is_empty());
+        // A resolved offer cannot be flipped again, so a late click cannot widen access.
+        assert!(!store.resolve_file_offer(&direct_id, false, None).unwrap());
+        assert_eq!(store.file_offer_status(&direct_id).unwrap().as_deref(), Some("accepted"));
+        assert_eq!(store.file_offer_target_dir(&direct_id).unwrap(), Some(PathBuf::from("D:\\接收")));
+        assert!(store.resolve_file_offer("bad id", true, None).is_err());
+        assert!(store.file_offer_status("bad id").is_err());
+        assert!(store.file_offer_target_dir("bad id").is_err());
+        assert!(store.record_file_offer_request(&peer, &direct_id, "..", 1, 1, None).is_err());
+        assert!(store.record_file_offer_request("bad", &"e".repeat(32), "a.pdf", 1, 1, None).is_err());
+        assert!(store.record_file_offer_request(&peer, &"e".repeat(32), "a.pdf", 1, 1, Some("bad")).is_err());
     }
 
     #[test]

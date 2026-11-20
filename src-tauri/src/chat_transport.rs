@@ -263,12 +263,18 @@ fn receive_file(stream: &mut StreamOwned<ServerConnection, DeadlineStream>, gate
     let FileOffer { id, name, size, sha256, created_at, logical, batch_id, caption } = offer;
     {
         let store = store.lock().map_err(|_| invalid("store unavailable"))?;
-        if store.file_accept_confirm()? {
+        let mode = store.file_accept_mode()?;
+        let skip_prompt = match mode {
+            crate::storage::FileAcceptMode::Auto => true,
+            crate::storage::FileAcceptMode::Remember => store.is_file_source_remembered(peer)?,
+            crate::storage::FileAcceptMode::Always => false,
+        };
+        if !skip_prompt {
             match store.file_offer_status(&id)?.as_deref() {
                 Some("accepted") => {}
                 Some("rejected") => { drop(store); let _ = reject(stream, gate, &id, "declined"); return Err(invalid("declined").into()); }
                 _ => {
-                    store.record_file_offer_request(peer, &id, &name, size, created_at)?;
+                    store.record_file_offer_request(peer, &id, &name, size, created_at, None)?;
                     drop(store);
                     let _ = reject(stream, gate, &id, "defer");
                     return Err(invalid("waiting for local confirmation").into());
@@ -284,9 +290,12 @@ fn receive_file(stream: &mut StreamOwned<ServerConnection, DeadlineStream>, gate
         FileOfferDecision::Conflict => { let _ = reject(stream, gate, &id, "conflict"); return Err(invalid("file offer conflict").into()); }
         FileOfferDecision::NoSpace => { let _ = reject(stream, gate, &id, "no_space"); return Err(invalid("storage quota reached").into()); }
         FileOfferDecision::Complete => {
-            let dir = store.lock().map_err(|_| invalid("store unavailable"))?.attachments_dir();
-            let target = files::incoming_target(&dir.join("in"), &id, &files::sanitize_name(&name).ok_or_else(|| invalid("invalid name"))?);
-            (size, target, files::incoming_partial(&dir.join("in"), &id))
+            // A completed transfer keeps the path recorded at offer time, so a later
+            // receive-directory change never points the check at a missing file.
+            let target = store.lock().map_err(|_| invalid("store unavailable"))?
+                .file_transfer_target(&id)?.ok_or_else(|| invalid("missing transfer record"))?;
+            let partial = target.with_file_name(format!("{id}.part"));
+            (size, target, partial)
         }
         FileOfferDecision::Ready { offset, target, partial } => (offset, target, partial),
     };
@@ -381,12 +390,19 @@ fn receive_group_file(stream: &mut StreamOwned<ServerConnection, DeadlineStream>
     let GroupFilePayload { id, group_id, name, owner, members, file_name, size, sha256, created_at, logical, batch_id, caption } = offer;
     {
         let store = store.lock().map_err(|_| invalid("store unavailable"))?;
-        if store.file_accept_confirm()? {
+        let mode = store.file_accept_mode()?;
+        let source = format!("group:{group_id}");
+        let skip_prompt = match mode {
+            crate::storage::FileAcceptMode::Auto => true,
+            crate::storage::FileAcceptMode::Remember => store.is_file_source_remembered(&source)?,
+            crate::storage::FileAcceptMode::Always => false,
+        };
+        if !skip_prompt {
             match store.file_offer_status(&id)?.as_deref() {
                 Some("accepted") => {}
                 Some("rejected") => { drop(store); let _ = reject(stream, gate, &id, "declined"); return Err(invalid("declined").into()); }
                 _ => {
-                    store.record_file_offer_request(peer, &id, &file_name, size, created_at)?;
+                    store.record_file_offer_request(peer, &id, &file_name, size, created_at, Some(&group_id))?;
                     drop(store);
                     let _ = reject(stream, gate, &id, "defer");
                     return Err(invalid("waiting for local confirmation").into());
@@ -402,9 +418,10 @@ fn receive_group_file(stream: &mut StreamOwned<ServerConnection, DeadlineStream>
         GroupFileDecision::Conflict => { let _ = reject(stream, gate, &id, "conflict"); return Err(invalid("group file conflict").into()); }
         GroupFileDecision::NoSpace => { let _ = reject(stream, gate, &id, "no_space"); return Err(invalid("storage quota reached").into()); }
         GroupFileDecision::Complete => {
-            let clean = files::sanitize_name(&file_name).ok_or_else(|| invalid("invalid name"))?;
-            let dir = store.lock().map_err(|_| invalid("store unavailable"))?.attachments_dir();
-            (size, files::incoming_target(&dir.join("in"), &id, &clean), files::incoming_partial(&dir.join("in"), &id))
+            let target = store.lock().map_err(|_| invalid("store unavailable"))?
+                .file_transfer_target(&id)?.ok_or_else(|| invalid("missing transfer record"))?;
+            let partial = target.with_file_name(format!("{id}.part"));
+            (size, target, partial)
         }
         GroupFileDecision::Ready { offset, target, partial } => (offset, target, partial),
     };

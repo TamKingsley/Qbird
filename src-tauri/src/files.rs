@@ -78,6 +78,60 @@ pub fn outgoing_source(store: &Path, id: &str, name: &str) -> PathBuf {
     store.join(format!("{id}-{name}"))
 }
 
+const MAX_RECV_PATH: usize = 240;
+
+fn trimmed_lower(path: &str) -> String {
+    path.trim().trim_end_matches(|c| c == '\\' || c == '/').to_lowercase()
+}
+
+fn is_or_inside(candidate: &str, base: &str) -> bool {
+    candidate == base || candidate.starts_with(&format!("{base}\\")) || candidate.starts_with(&format!("{base}/"))
+}
+
+/// Validate and normalize a user-chosen receive directory.
+/// The directory must be absolute, writable and outside Windows/Program Files and
+/// the install directory, because uninstalling or overwriting those would delete
+/// user attachments. Returns the path to persist on success.
+pub fn validate_recv_dir(raw: &str, exe_dir: Option<&Path>, data_dir: Option<&Path>) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() { return Err("请选择接收目录".into()); }
+    if trimmed.len() > MAX_RECV_PATH { return Err("路径过长（最多 240 个字符）".into()); }
+    let path = Path::new(trimmed);
+    if !path.is_absolute() { return Err("请选择完整的绝对路径".into()); }
+    if path.components().any(|part| matches!(part, std::path::Component::ParentDir)) {
+        return Err("路径不能包含 ..".into());
+    }
+    let lower = trimmed_lower(trimmed);
+    if lower.len() <= 2 && lower.ends_with(':') { return Err("不能选择磁盘根目录".into()); }
+    for variable in ["WINDIR", "ProgramFiles", "ProgramFiles(x86)"] {
+        if let Ok(value) = std::env::var(variable) {
+            let protected = trimmed_lower(&value);
+            if !protected.is_empty() && is_or_inside(&lower, &protected) {
+                return Err("不能选择 Windows 或 Program Files 等受保护目录".into());
+            }
+        }
+    }
+    if let Some(exe_dir) = exe_dir {
+        let install = trimmed_lower(&exe_dir.to_string_lossy());
+        // The install directory is protected except its data folder, which is the
+        // documented data location of an installed build.
+        let allowed = data_dir.map(|dir| trimmed_lower(&dir.to_string_lossy())).filter(|dir| !dir.is_empty());
+        let inside_data = allowed.as_deref().map(|dir| is_or_inside(&lower, dir)).unwrap_or(false);
+        if !install.is_empty() && is_or_inside(&lower, &install) && !inside_data {
+            return Err("不能选择程序安装目录，卸载或覆盖安装可能删除附件".into());
+        }
+    }
+    if !path.exists() {
+        fs::create_dir_all(path).map_err(|_| "无法创建目录，请检查路径与权限".to_owned())?;
+    }
+    if !path.is_dir() { return Err("所选路径不是文件夹".into()); }
+    // Probe writability without leaving a file behind.
+    let probe = path.join(format!(".qbird-write-test-{}", std::process::id()));
+    fs::write(&probe, b"probe").map_err(|_| "目录不可写，请换一个位置".to_owned())?;
+    let _ = fs::remove_file(&probe);
+    Ok(trimmed.trim_end_matches(|c| c == '\\' || c == '/').to_owned())
+}
+
 pub fn sha256_file(path: &Path) -> io::Result<String> {
     let mut file = File::open(path)?;
     let mut hasher = Sha256::new();
@@ -169,6 +223,25 @@ mod tests {
         remove_quietly(&text);
         remove_quietly(&binary);
         remove_quietly(&large);
+    }
+
+    #[test]
+    fn receive_directory_validation_rejects_unsafe_paths() {
+        assert!(validate_recv_dir("", None, None).is_err());
+        assert!(validate_recv_dir("relative\\dir", None, None).is_err());
+        assert!(validate_recv_dir("C:\\", None, None).is_err());
+        if let Ok(windir) = std::env::var("WINDIR") {
+            assert!(validate_recv_dir(&windir, None, None).is_err());
+        }
+        let base = std::env::temp_dir().join(format!("qbird-recv-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let inner = base.join("附件");
+        let saved = validate_recv_dir(&inner.to_string_lossy(), None, None).unwrap();
+        assert!(Path::new(&saved).is_dir());
+        // Anything inside the install directory is refused, except its data folder.
+        assert!(validate_recv_dir(&inner.to_string_lossy(), Some(&base), None).is_err());
+        assert!(validate_recv_dir(&inner.to_string_lossy(), Some(&base), Some(&base)).is_ok());
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
