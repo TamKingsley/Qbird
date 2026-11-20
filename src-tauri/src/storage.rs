@@ -882,6 +882,22 @@ impl Store {
             )?;
             transaction.commit()?;
         }
+        if version < 21 {
+            let transaction = connection.transaction()?;
+            // Mute is local UI state; it suppresses the numeric badge without changing
+            // message delivery or conversation ordering.
+            for statement in [
+                "ALTER TABLE conversations ADD COLUMN muted INTEGER NOT NULL DEFAULT 0 CHECK(muted IN (0, 1))",
+                "ALTER TABLE direct_conversations ADD COLUMN muted INTEGER NOT NULL DEFAULT 0 CHECK(muted IN (0, 1))",
+                "ALTER TABLE group_members ADD COLUMN muted INTEGER NOT NULL DEFAULT 0 CHECK(muted IN (0, 1))",
+            ] {
+                if let Err(error) = transaction.execute_batch(statement) {
+                    if !error.to_string().contains("duplicate column name") { return Err(error); }
+                }
+            }
+            transaction.execute_batch("PRAGMA user_version = 21;")?;
+            transaction.commit()?;
+        }
         Ok(Self { connection, data_dir, address_revision: std::cell::Cell::new(0) })
     }
 
