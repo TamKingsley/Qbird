@@ -158,11 +158,19 @@ fn migrate_legacy_data(legacy: &Path, target: &Path) {
     let result = std::fs::copy(&legacy_identity, target.join("identity.bin"))
         .and_then(|_| std::fs::copy(&legacy_db, &migrated))
         .and_then(|_| copy_stickers());
-    if result.is_err() {
-        // Never leave a half migration: a copied database without a usable identity
-        // would block startup.
-        let _ = std::fs::remove_file(target.join("identity.bin"));
-        let _ = std::fs::remove_file(&migrated);
+    match result {
+        Ok(()) => {
+            // Remember where the data came from so the UI can explain why a fresh
+            // install already shows old records.
+            let _ = std::fs::write(target.join("migration-source.txt"), legacy.to_string_lossy().as_bytes());
+        }
+        Err(_) => {
+            // Never leave a half migration: a copied database without a usable identity
+            // would block startup.
+            let _ = std::fs::remove_file(target.join("identity.bin"));
+            let _ = std::fs::remove_file(&migrated);
+            crate::log_error!("迁移旧数据失败，已回滚");
+        }
     }
 }
 
@@ -321,6 +329,7 @@ pub fn run() {
             app_state::v1_network_repair,
             app_state::v1_space_diagnostics,
             app_state::v1_read_logs,
+            app_state::v1_migration_notice,
             app_state::v1_open_logs_dir,
             app_state::v1_create_group,
             app_state::v1_list_groups,

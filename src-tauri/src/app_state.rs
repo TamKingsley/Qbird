@@ -665,6 +665,18 @@ pub async fn v1_space_diagnostics(app: tauri::AppHandle) -> Result<crate::diagno
     }).await.map_err(|_| "空间检测任务异常".to_owned())?
 }
 
+/// Where this install migrated legacy data from, if any; consumed once so the
+/// notice shows exactly one time after a fresh install.
+#[tauri::command]
+pub fn v1_migration_notice(state: tauri::State<'_, AppState>) -> Result<Option<String>, String> {
+    let marker = state.data_dir.join("migration-source.txt");
+    if !marker.is_file() { return Ok(None); }
+    match std::fs::read_to_string(&marker) {
+        Ok(text) => { let _ = std::fs::remove_file(&marker); Ok(Some(text.trim().to_owned())) }
+        Err(_) => Ok(None),
+    }
+}
+
 /// Recent application log text for the debug panel (at most 256 KiB).
 #[tauri::command]
 pub fn v1_read_logs() -> Result<String, String> {

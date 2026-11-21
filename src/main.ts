@@ -3581,6 +3581,13 @@ app.addEventListener('click', (event) => {
 });
 render();
 void refreshOnboarding();
+// One-time notice after an install migrated legacy data, so old records are
+// not mistaken for pre-seeded content.
+if (isTauri()) {
+  void invoke<string | null>('v1_migration_notice').then((source) => {
+    if (source) workspace.notify(t('检测到本次安装从旧数据目录迁移了聊天数据，旧记录因此可见：') + source);
+  }).catch(() => undefined);
+}
 // Prefer the language persisted on the Rust side (authoritative for the tray).
 if (isTauri()) {
   void import('@tauri-apps/api/core').then(({ invoke }) => invoke<string>('v1_get_language'))
