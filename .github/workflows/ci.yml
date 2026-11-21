@@ -29,7 +29,37 @@ jobs:
         run: pnpm build
 
   rust:
-    name: Rust tests (Windows)
+    name: Rust tests (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - name: Install Tauri system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential file libayatana-appindicator3-dev libssl-dev \
+            libwebkit2gtk-4.1-dev librsvg2-dev libxdo-dev patchelf pkg-config
+      # The Tauri config points at ../dist, so the frontend must exist before the
+      # backend is built or tested.
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.22.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - name: cargo test
+        working-directory: src-tauri
+        run: cargo test --locked
+
+  rust-windows:
+    name: Rust tests compile (Windows)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -48,6 +78,6 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
-      - name: cargo test
+      - name: Compile Rust tests without launching the Windows test runner
         working-directory: src-tauri
-        run: cargo test --locked
+        run: cargo test --locked --no-run
