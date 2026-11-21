@@ -802,6 +802,13 @@ impl AppState {
         }
         let identity = Arc::new(Identity::load_or_create(&identity_path)?);
         let store = Store::open(&database_path)?;
+        // Bug fix: create the default receive folders eagerly so the settings page
+        // no longer reports "directory missing" on a fresh install.
+        for kind in [crate::storage::RecvKind::Direct, crate::storage::RecvKind::Group] {
+            if let Err(error) = std::fs::create_dir_all(store.recv_dir(kind)) {
+                crate::log_warn!("创建接收目录失败({kind:?}): {error}");
+            }
+        }
         // A configured lock always starts locked, even after a crash.
         let locked = crate::lock::is_configured(&store).unwrap_or(false);
         Ok(Self { identity, store: Arc::new(Mutex::new(store)), discovery: Mutex::new(None), probe_service: Mutex::new(None), retry_queue: Mutex::new(None), outbound_probe: Arc::new(AtomicBool::new(false)), outbound_chat: Arc::new(AtomicBool::new(false)), last_outbound_fingerprint: Arc::new(Mutex::new(None)), locked: AtomicBool::new(locked), data_dir: Arc::new(dir.to_path_buf()), capture: Mutex::new(None), chat_listener: AtomicBool::new(false) })
