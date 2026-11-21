@@ -111,6 +111,21 @@ jobs:
           @('Qbird portable build', '', 'Windows 10/11 x64. The Microsoft WebView2 Runtime must already be installed.', 'This ZIP does not install WebView2 or add Start Menu shortcuts.', 'Qbird stores its profile and chat history locally. The local database is not encrypted.', 'Qbird has not received an independent security audit; do not use this preview for sensitive or production communication.', 'See the repository README for features and limitations.') -join [Environment]::NewLine | Set-Content -Encoding utf8 (Join-Path $portable 'README.txt')
           Compress-Archive -Path (Join-Path $portable '*') -DestinationPath (Join-Path $assets "Qbird-$env:VERSION-windows-x64-portable.zip") -CompressionLevel Optimal
           Get-ChildItem $assets -File | Select-Object Name,Length | Format-Table -AutoSize
+      - name: Extract changelog section for the tag
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $lines = Get-Content 'CHANGELOG.md'
+          $start = -1; $end = -1
+          for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($start -lt 0 -and $lines[$i] -match "^## \[$env:VERSION\]") { $start = $i; continue }
+            if ($start -ge 0 -and $lines[$i] -match '^## ') { $end = $i; break }
+          }
+          if ($start -lt 0) { throw "CHANGELOG.md has no section for version $env:VERSION" }
+          $stop = if ($end -ge 0) { $end } else { $lines.Count }
+          ($lines[($start+1)..($stop-1)] -join [Environment]::NewLine).Trim() | Set-Content -Encoding utf8 release-notes.md
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -118,6 +133,7 @@ jobs:
           name: Qbird ${{ steps.release.outputs.tag }}
           prerelease: true
           generate_release_notes: true
+          body_path: release-notes.md
           fail_on_unmatched_files: true
           overwrite_files: true
           files: |
