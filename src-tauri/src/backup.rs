@@ -12,6 +12,10 @@ use sha2::{Digest, Sha256};
 use crate::storage::{RestoreReport, Store};
 
 const MAGIC: &[u8; 14] = b"QBIRD-BACKUP-1";
+/// Format 2 wraps the v1 payload plus the attachment files, so chat images and
+/// files travel with the backup and are restored to the local attachments dir.
+const MAGIC2: &[u8; 14] = b"QBIRD-BACKUP-2";
+const MAX_ATTACH_TOTAL: u64 = 512 * 1024 * 1024;
 const SNAP_MAGIC: &[u8; 10] = b"QBIRDSNAP1";
 const FORMAT_VERSION: u8 = 1;
 const ITERATIONS: u32 = 200_000;
@@ -24,7 +28,7 @@ const MAX_SNAPSHOT: u64 = 256 * 1024 * 1024;
 const MAX_BACKUP: u64 = MAX_SNAPSHOT + 4096;
 const CHECKSUM_HEX: usize = 64;
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct BackupInfo {
     pub created_at: i64,
     pub include_chat: bool,
@@ -129,6 +133,7 @@ pub(crate) fn decrypt_with(magic: &[u8], password: &str, data: &[u8], max: u64) 
     Ok(plaintext.to_vec())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn encrypt(password: &str, payload: &[u8]) -> Result<Vec<u8>, String> {
     encrypt_with(MAGIC, password, payload)
 }
@@ -210,7 +215,11 @@ pub fn create(password: &str, store: &Store, destination: &Path, include_chat: b
         let snapshot = fs::read(&temp).map_err(|_| invalid("无法读取数据库快照"))?;
         let message_count = if include_chat { count_messages(&temp)? } else { 0 };
         let (info, payload) = build_payload(&snapshot, include_chat, message_count, unix_now());
-        let encrypted = encrypt(password, &payload)?;
+        // Format 2 keeps the verified v1 payload and wraps it with attachments.
+        let files = if include_chat { collect_attachments(store)? } else { Vec::new() };
+        let bundle = BackupBundle { info: info.clone(), snapshot_b64: crate::base64::encode(&payload), files };
+        let json = serde_json::to_vec(&bundle).map_err(|_| invalid("无法生成备份内容"))?;
+        let encrypted = encrypt_with(MAGIC2, password, &json)?;
         let mut file = fs::OpenOptions::new().write(true).create_new(true).open(destination)
             .map_err(|_| invalid("无法创建备份文件"))?;
         file.write_all(&encrypted).and_then(|_| file.sync_all()).map_err(|_| invalid("写入备份文件失败"))?;
@@ -226,6 +235,9 @@ pub fn inspect(password: &str, path: &Path) -> Result<BackupInfo, String> {
     let metadata = fs::metadata(path).map_err(|_| invalid("无法读取备份文件"))?;
     if metadata.len() as u64 > MAX_BACKUP { return Err("备份文件超出大小限制".into()); }
     let data = fs::read(path).map_err(|_| invalid("无法读取备份文件"))?;
+    if data.starts_with(MAGIC2) {
+        return parse_bundle(password, &data).map(|(info, _, _)| info);
+    }
     parse_payload(password, &data).map(|(info, _)| info)
 }
 
@@ -235,7 +247,15 @@ pub fn restore(password: &str, path: &Path, store: &mut Store, overwrite: bool) 
     let metadata = fs::metadata(path).map_err(|_| invalid("无法读取备份文件"))?;
     if metadata.len() as u64 > MAX_BACKUP { return Err("备份文件超出大小限制".into()); }
     let data = fs::read(path).map_err(|_| invalid("无法读取备份文件"))?;
-    let (_, snapshot) = parse_payload(password, &data)?;
+    let v2 = data.starts_with(MAGIC2);
+    let (info, snapshot, files) = if v2 {
+        let (info, snapshot, files) = parse_bundle(password, &data)?;
+        (info, snapshot, Some(files))
+    } else {
+        let (info, snapshot) = parse_payload(password, &data)?;
+        (info, snapshot, None)
+    };
+    let _ = info;
     let temp = temp_path(store, "restore-src");
     let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&temp)
         .map_err(|_| invalid("无法写入临时恢复文件"))?;
@@ -243,10 +263,113 @@ pub fn restore(password: &str, path: &Path, store: &mut Store, overwrite: bool) 
     drop(file);
     let result = store.restore_from(&temp, overwrite, unix_now());
     let _ = fs::remove_file(&temp);
-    result.map_err(|error| match error {
+    let result = result.map_err(|error| match error {
         rusqlite::Error::InvalidQuery => invalid("备份内容与本地数据不兼容").to_owned(),
         other => format!("恢复失败：{other}"),
-    })
+    });
+    let result = match (result, files) {
+        (Ok(report), Some(files)) => write_attachments(store, &files).map(|restored| {
+            crate::log_info!("备份恢复附件 {restored} 个文件");
+            let _ = remap_attachment_paths(store);
+            RestoreReport { restored_attachments: restored, ..report }
+        }),
+        (result, _) => result,
+    };
+    result
+}
+
+// ---- Format 2: snapshot + attachments -------------------------------------
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct AttachEntry { path: String, data_b64: String }
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct BackupBundle { info: BackupInfo, snapshot_b64: String, files: Vec<AttachEntry> }
+
+fn collect_attachments(store: &Store) -> Result<Vec<AttachEntry>, String> {
+    let root = store.attachments_dir();
+    let mut files = Vec::new();
+    let mut total = 0u64;
+    fn walk(dir: &std::path::Path, root: &std::path::Path, files: &mut Vec<AttachEntry>, total: &mut u64) -> Result<(), String> {
+        let entries = fs::read_dir(dir).map_err(|_| invalid("无法读取附件目录"))?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, root, files, total)?;
+            } else if path.is_file() {
+                let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                if name.ends_with(".part") { continue; }
+                let data = fs::read(&path).map_err(|_| invalid("无法读取附件文件"))?;
+                *total += data.len() as u64;
+                if *total > MAX_ATTACH_TOTAL { return Err("附件总量超过备份大小限制（512 MB）".into()); }
+                let rel = path.strip_prefix(root).map(|p| p.to_string_lossy().to_string())
+                    .map_err(|_| invalid("附件路径无效"))?;
+                files.push(AttachEntry { path: rel.replace('\\', "/"), data_b64: crate::base64::encode(&data) });
+            }
+        }
+        Ok(())
+    }
+    if root.is_dir() { walk(&root, &root, &mut files, &mut total)?; }
+    Ok(files)
+}
+
+fn write_attachments(store: &Store, files: &[AttachEntry]) -> Result<u64, String> {
+    let root = store.attachments_dir();
+    let mut restored = 0u64;
+    for entry in files {
+        // Path safety: reject absolute paths, parent traversal and drive letters.
+        let rel = std::path::Path::new(&entry.path);
+        if entry.path.starts_with('/') || entry.path.contains(':') { return Err("备份附件路径无效".into()); }
+        if rel.components().any(|component| matches!(component, std::path::Component::ParentDir)) {
+            return Err("备份附件路径无效".into());
+        }
+        let target = root.join(rel);
+        if target.exists() { continue; }
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).map_err(|_| invalid("无法创建附件目录"))?;
+        }
+        let data = crate::base64::decode(&entry.data_b64).ok_or_else(|| invalid("备份附件数据损坏"))?;
+        fs::write(&target, &data).map_err(|_| invalid("无法写入附件文件"))?;
+        restored += 1;
+    }
+    Ok(restored)
+}
+
+/// Remaps absolute attachment paths recorded in the restored database to the
+/// local attachments dir, when they point under some other attachments folder.
+fn remap_attachment_paths(store: &Store) -> Result<u64, String> {
+    let marker = "\\attachments\\";
+    let root = store.attachments_dir();
+    let mut updates: Vec<(String, String)> = Vec::new();
+    {
+        let connection = store.raw_connection();
+        let mut statement = connection.prepare("SELECT message_id, COALESCE(target_path, source_path) FROM file_transfers WHERE target_path IS NOT NULL OR source_path IS NOT NULL")
+            .map_err(|_| invalid("无法读取附件路径"))?;
+        let rows = statement.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            .map_err(|_| invalid("无法读取附件路径"))?;
+        for row in rows.flatten() {
+            let (id, path) = row;
+            let lower = path.to_lowercase();
+            if let Some(position) = lower.find(marker) {
+                let suffix = &path[position + marker.len()..];
+                let new_path = root.join(suffix.replace('/', "\\")).to_string_lossy().to_string();
+                if new_path != path { updates.push((id, new_path)); }
+            }
+        }
+    }
+    let count = updates.len() as u64;
+    for (id, new_path) in updates {
+        let connection = store.raw_connection();
+        connection.execute("UPDATE file_transfers SET target_path = ?2, source_path = NULL WHERE message_id = ?1", rusqlite::params![id, new_path])
+            .map_err(|_| invalid("无法更新附件路径"))?;
+    }
+    Ok(count)
+}
+
+fn parse_bundle(password: &str, data: &[u8]) -> Result<(BackupInfo, Vec<u8>, Vec<AttachEntry>), String> {
+    let plaintext = decrypt_with(MAGIC2, password, data, MAX_BACKUP + MAX_ATTACH_TOTAL * 2)?;
+    let bundle: BackupBundle = serde_json::from_slice(&plaintext).map_err(|_| invalid("备份内容损坏"))?;
+    Ok((bundle.info, crate::base64::decode(&bundle.snapshot_b64).ok_or_else(|| invalid("备份内容损坏"))?, bundle.files))
 }
 
 #[cfg(test)]

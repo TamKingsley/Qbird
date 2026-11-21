@@ -26,6 +26,8 @@ pub struct RestoreReport {
     pub skipped: u64,
     pub conflicts: u64,
     pub snapshot_path: Option<String>,
+    /// Attachment files restored from a format-2 backup; zero for v1 backups.
+    pub restored_attachments: u64,
 }
 
 /// Upper bound for a quoted snippet, kept short so it fits one compose bar.
@@ -1506,7 +1508,10 @@ impl Store {
         Ok(StorageUsage { used: self.storage_used(), quota: self.storage_quota()? })
     }
 
-    pub fn data_dir(&self) -> &Path { &self.data_dir }
+    pub fn data_dir(&self) -> &Path { &self.data_dir }
+
+    /// Direct access for maintenance tasks (backup path remapping); read-write.
+    pub fn raw_connection(&self) -> &rusqlite::Connection { &self.connection }
 
     /// Writes a consistent SQLite snapshot with `VACUUM INTO`. When chat history is
     /// excluded only contacts/groups remain; the destination must not exist yet.
@@ -1568,7 +1573,7 @@ impl Store {
         )?;
         if conflicts > 0 {
             tx.commit()?;
-            return Ok(RestoreReport { mode: "merge".into(), inserted: 0, skipped: 0, conflicts: conflicts as u64, snapshot_path });
+            return Ok(RestoreReport { mode: "merge".into(), inserted: 0, skipped: 0, conflicts: conflicts as u64, snapshot_path, restored_attachments: 0 });
         }
         let snapshot_messages: i64 = tx.query_row(
             "SELECT (SELECT count(*) FROM src.direct_messages) + (SELECT count(*) FROM src.group_messages)
@@ -1637,7 +1642,7 @@ impl Store {
         tx.commit()?;
         let inserted = if overwrite { snapshot_messages as u64 } else { (after - before).max(0) as u64 };
         let skipped = if overwrite { 0 } else { (snapshot_messages - (after - before)).max(0) as u64 };
-        Ok(RestoreReport { mode: if overwrite { "overwrite".into() } else { "merge".into() }, inserted, skipped, conflicts: 0, snapshot_path })
+        Ok(RestoreReport { mode: if overwrite { "overwrite".into() } else { "merge".into() }, inserted, skipped, conflicts: 0, snapshot_path, restored_attachments: 0 })
     }
 
     /// Queue an outgoing file. The file stays at `source`; the receiver verifies the hash.

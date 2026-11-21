@@ -200,7 +200,7 @@ let diagnosticsNotice = '';
 let diagnosticsLoading = false;
 let repairBusy = false;
 type BackupInfo = { created_at: number; include_chat: boolean; message_count: number; checksum: string };
-type RestoreReport = { mode: string; inserted: number; skipped: number; conflicts: number; snapshot_path: string | null };
+type RestoreReport = { mode: string; inserted: number; skipped: number; conflicts: number; snapshot_path: string | null; restored_attachments: number };
 let backupPassword = '';
 let backupPath = '';
 let backupInfo: BackupInfo | null = null;
@@ -1629,7 +1629,7 @@ async function restoreBackup(overwrite: boolean): Promise<void> {
     const report = await invoke<RestoreReport>('v1_restore_backup', { password: backupPassword, path: backupPath, overwrite });
     backupNotice = report.conflicts > 0
       ? `发现 ${report.conflicts} 条相同 ID 但内容不同的消息，已中止恢复，未修改任何数据。`
-      : `恢复完成：${report.mode === 'overwrite' ? t('覆盖') : t('合并')}，新增 ${report.inserted} 条消息${report.skipped ? `，跳过 ${report.skipped} 条已有消息` : ''}。${report.snapshot_path ? t('恢复前快照已保存在本机数据目录。') : ''}`;
+      : `恢复完成：${report.mode === 'overwrite' ? t('覆盖') : t('合并')}，新增 ${report.inserted} 条消息${report.skipped ? `，跳过 ${report.skipped} 条已有消息` : ''}${report.restored_attachments ? `，恢复附件 ${report.restored_attachments} 个文件` : ''}。${report.snapshot_path ? t('恢复前快照已保存在本机数据目录。') : ''}`;
     await refreshConversations();
   } catch (error) { backupNotice = trError(error, t('恢复失败，现有数据未被修改')); }
   finally { backupBusy = false; if (page === 'settings') render(); }
