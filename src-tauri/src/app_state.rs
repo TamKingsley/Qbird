@@ -1979,14 +1979,21 @@ pub fn v1_open_records_window(app: tauri::AppHandle, kind: String, id: String) -
     WebviewWindowBuilder::new(&app, &label, WebviewUrl::App(format!("records.html?kind={kind}&id={id}").into()))
         .title("聊天记录").inner_size(880.0, 620.0).min_inner_size(600.0, 420.0)
         .icon(icon).map_err(|error| error.to_string())?
-        .build().map_err(|error| error.to_string())?;
+        .build().map_err(|error| {
+            crate::log_error!("创建聊天记录窗口失败({label}): {error}");
+            error.to_string()
+    })?;
+    crate::log_info!("已创建聊天记录窗口: {label}");
     Ok(())
 }
 
 /// Closes the webview window that asked for it (records windows).
 #[tauri::command]
-pub fn v1_close_current_window(window: tauri::Window) -> Result<(), String> {
-    window.close().map_err(|error| error.to_string())
+pub fn v1_close_current_window(window: tauri::WebviewWindow) -> Result<(), String> {
+    window.close().map_err(|error| {
+        crate::log_error!("关闭聊天记录窗口失败({}): {error}", window.label());
+        error.to_string()
+    })
 }
 
 /// Deletes selected local messages of one conversation by id.

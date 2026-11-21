@@ -893,7 +893,16 @@ export class GroupChat {
       items.push({ label: t('撤回'), danger: true, run: () => { void this.recall(message); } });
     }
     items.push({ label: t('复制文字'), run: () => { void navigator.clipboard?.writeText(message.body).catch(() => {}); } });
+    items.push({ label: t('删除'), danger: true, run: () => { void this.deleteLocal(message.id); } });
     showContextMenu(event, items);
+  }
+
+  /// Deletes this message from the local record only.
+  async deleteLocal(messageId: string): Promise<void> {
+    try {
+      await invoke('v1_delete_messages', { kind: 'group', id: this.groupId, ids: [messageId] });
+      await this.load(false, true);
+    } catch (error) { workspace.notify(trError(error, t('删除失败'))); }
   }
 
   async recall(message: GroupMessage): Promise<void> {

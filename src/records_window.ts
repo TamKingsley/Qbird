@@ -131,7 +131,12 @@ function render(): void {
       </div>
       <footer class="records-foot">${t('已选')}${selected.size}${t('条 · 删除仅影响本机记录')}</footer>
     </div>`;
-  document.getElementById('records-close')!.addEventListener('click', () => { void invoke('v1_close_current_window'); });
+  document.getElementById('records-close')!.addEventListener('click', () => {
+    void invoke('v1_close_current_window').catch((error) => {
+      console.error('close failed', error);
+      window.alert(`${t('关闭窗口失败：')}${String(error)}`);
+    });
+  });
   const search = document.getElementById('records-search') as HTMLInputElement;
   search.addEventListener('input', () => { filter = search.value.trim(); render(); search.focus(); });
   const caret = search.value.length;
@@ -168,9 +173,10 @@ async function deleteSelected(): Promise<void> {
 }
 
 export async function runRecordsWindow(): Promise<void> {
-  window.addEventListener('error', (event) => fail(`${t('页面出错：')}${event.message}`));
+  console.info('[records] boot', window.location.href);
+  window.addEventListener('error', (event) => { console.error('[records] error', event); fail(`${t('页面出错：')}${event.message}`); });
   window.addEventListener('unhandledrejection', (event) => fail(`${t('页面出错：')}${String(event.reason)}`));
-  if (!parseConversation()) { fail(t('聊天记录窗口参数无效。')); return; }
+  if (!parseConversation()) { fail(`${t('聊天记录窗口参数无效。')} ${window.location.search}`); return; }
   await resolveTitle();
   try { await loadRows(); }
   catch (error) { fail(`${t('无法加载聊天记录：')}${String(error)}`); return; }

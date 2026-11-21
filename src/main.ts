@@ -486,10 +486,26 @@ function paintSelfMessages(scroll: 'bottom' | 'preserve'): void {
   for (const message of selfMessages) {
     const row = document.createElement('div'); row.className = 'message-row'; row.dataset.id = message.id;
     const body = document.createElement('div'); body.className = 'message-bubble'; body.append(linkifiedText(message.body));
+    body.addEventListener('contextmenu', (event) => {
+      event.preventDefault();
+      showContextMenu(event, [
+        { label: t('复制文字'), run: () => { void navigator.clipboard?.writeText(message.body).catch(() => {}); } },
+        { label: t('删除'), danger: true, run: () => { void deleteSelfMessage(message.id); } },
+      ]);
+    });
     row.append(body); list.append(row);
   }
   older.hidden = !selfHasOlder;
   history.scrollTop = scroll === 'bottom' ? history.scrollHeight : previousTop + history.scrollHeight - previousHeight;
+}
+
+async function deleteSelfMessage(messageId: string): Promise<void> {
+  if (!isTauri()) return;
+  try {
+    await invoke('v1_delete_messages', { kind: 'self', id: '', ids: [messageId] });
+    selfMessages = selfMessages.filter((m) => m.id !== messageId);
+    paintSelfMessages('preserve');
+  } catch (error) { workspace.notify(displayError(error)); }
 }
 
 async function loadSelfMessages(older: boolean): Promise<void> {

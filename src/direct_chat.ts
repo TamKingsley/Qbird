@@ -321,7 +321,17 @@ export class DirectChat {
       items.push({ label: t('撤回'), danger: true, run: () => { void this.recall(message); } });
     }
     items.push({ label: t('复制文字'), run: () => { void navigator.clipboard?.writeText(message.body).catch(() => {}); } });
+    items.push({ label: t('删除'), danger: true, run: () => { void this.deleteLocal(message.id); } });
     showContextMenu(event, items);
+  }
+
+  /// Deletes this message from the local record only.
+  async deleteLocal(messageId: string): Promise<void> {
+    if (!isTauri()) return;
+    try {
+      await invoke('v1_delete_messages', { kind: 'direct', id: this.peer, ids: [messageId] });
+      this.load(true);
+    } catch (error) { workspace.notify(trError(error, t('删除失败'))); }
   }
 
   private canRecall(message: DirectMessage): boolean {
