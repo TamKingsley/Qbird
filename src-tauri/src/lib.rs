@@ -3,6 +3,8 @@ pub mod app_state;
 pub mod avatar;
 pub mod base64;
 pub mod network_info;
+pub mod notice;
+mod tray_lang;
 pub mod plugins;
 pub mod backup;
 mod auto_address;
@@ -28,9 +30,9 @@ use std::path::{Path, PathBuf};
 use tauri::{Emitter, Manager, WindowEvent};
 
 /// Keeps the tray icon alive: the icon is removed as soon as the last handle drops.
-struct TrayHandle(#[allow(dead_code)] tauri::tray::TrayIcon<tauri::Wry>);
+pub struct TrayHandle(#[allow(dead_code)] tauri::tray::TrayIcon<tauri::Wry>);
 
-fn show_main_window(app: &tauri::AppHandle) {
+pub(crate) fn show_main_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.unminimize();
         let _ = window.show();
@@ -48,14 +50,13 @@ fn saved_close_action(app: &tauri::AppHandle) -> String {
 
 /// Tray icon with a menu to reopen the window or quit while it is hidden.
 fn setup_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
-    use tauri::menu::{Menu, MenuItem};
     use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 
-    let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
-    let quit = MenuItem::with_id(app, "quit", "退出 Qbird", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show, &quit])?;
+    let lang = tray_lang::read_language_pub(app);
+    let (tooltip, _, _) = tray_lang::tray_texts(&lang);
+    let menu = tray_lang::build_tray_menu(app, &lang)?;
     let mut builder = TrayIconBuilder::with_id("qbird-tray")
-        .tooltip("Qbird 青鸟")
+        .tooltip(tooltip)
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
@@ -70,8 +71,11 @@ fn setup_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
         });
     if let Some(icon) = app.default_window_icon() {
         builder = builder.icon(icon.clone());
+        notice::set_alert_icon(icon);
     }
-    let _ = app.manage(TrayHandle(builder.build(app)?));
+    let tray = builder.build(app)?;
+    notice::set_tray(tray.clone());
+    let _ = app.manage(TrayHandle(tray));
     Ok(())
 }
 
@@ -180,6 +184,7 @@ pub fn run() {
             app_state::start_listener_on_launch(app.handle().clone());
             app_state::watch_listener(app.handle().clone());
             setup_tray(app.handle())?;
+            notice::attach(app.handle().clone());
             install_close_behavior(app.handle());
             Ok(())
         })
@@ -289,6 +294,9 @@ pub fn run() {
             app_state::v1_open_self,
             app_state::v1_hide_self,
             app_state::v1_list_conversations,
+            app_state::v1_delete_messages,
+            app_state::v1_close_current_window,
+            app_state::v1_open_records_window,
             app_state::v1_list_self_messages,
             app_state::v1_send_self,
             app_state::v1_discovery_snapshot,
@@ -325,6 +333,8 @@ pub fn run() {
             app_state::v1_read_group_attachment,
             app_state::v1_reveal_group_attachment,
             app_state::v1_transfer_group_owner,
+            app_state::v1_group_notice,
+            app_state::v1_set_group_notice,
             app_state::v1_dissolve_group,
             app_state::v1_search_direct,
             app_state::v1_search_group,
@@ -347,6 +357,24 @@ pub fn run() {
             app_state::v1_add_group_member,
             app_state::v1_remove_group_member,
             app_state::v1_leave_group,
+            app_state::v1_recall_message,
+            app_state::v1_cancel_file_transfer,
+            app_state::v1_list_dissolved_groups,
+            app_state::v1_delete_group_history,
+            app_state::v1_request_contact,
+            app_state::v1_contact_requests,
+            app_state::v1_respond_contact_request,
+            app_state::v1_withdraw_contact_request,
+            app_state::v1_lan_visibility,
+            app_state::v1_set_lan_visibility,
+            app_state::v1_notice_settings,
+            tray_lang::v1_get_language,
+            tray_lang::v1_set_language,
+            app_state::v1_set_notice_settings,
+            notice::v1_flash_tray,
+            notice::v1_show_notice,
+            notice::v1_hide_notice,
+            notice::v1_open_notice,
             app_state::v1_probe_peer
         ])
         .run(tauri::generate_context!())

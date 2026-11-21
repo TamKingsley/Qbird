@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::{params, Connection, OptionalExtension, Result};
 use serde::{Deserialize, Serialize};
 
-const SCHEMA_VERSION: i64 = 21;
+const SCHEMA_VERSION: i64 = 23;
 /// Upper bound on remembered "do not ask again" senders.
 const MAX_REMEMBERED_SOURCES: usize = 200;
 
@@ -122,6 +122,8 @@ pub struct DirectMessage {
     pub file_status: Option<String>,
     pub file_transferred: Option<i64>,
     pub file_error: Option<String>,
+    /// Unix time when the sender withdrew this message; body is blank in that case.
+    pub recalled_at: Option<i64>,
 }
 
 /// Transfer state exposed to the UI; paths stay on the backend.
@@ -172,7 +174,7 @@ pub enum GroupFileDecision {
     NotMember,
 }
 
-const MESSAGE_COLUMNS: &str = "m.id, m.peer, m.sender, m.body, m.created_at, m.logical, m.status, m.kind, m.file_name, m.file_size, m.file_sha256, f.status, f.transferred, f.error";
+const MESSAGE_COLUMNS: &str = "m.id, m.peer, m.sender, m.body, m.created_at, m.logical, m.status, m.kind, m.file_name, m.file_size, m.file_sha256, f.status, f.transferred, f.error, m.recalled_at";
 
 #[derive(Debug, serde::Deserialize)]
 pub struct DirectCursor {
@@ -227,6 +229,52 @@ pub struct GroupSummary {
     pub last_logical: i64,
 }
 
+/// How long after sending a message may still be withdrawn (both direct and group).
+pub const RECALL_WINDOW_SECONDS: i64 = 120;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum RecallResult {
+    Recalled { delivered: bool },
+    TooLate,
+    NotYours,
+    Missing,
+    Already,
+    NotMember,
+}
+
+/// One message still owed a recall notice, retried until the peer is reachable.
+#[derive(Debug, PartialEq, Eq)]
+pub struct PendingRecall {
+    pub id: String,
+    pub peer: String,
+    pub address: String,
+    pub message_id: String,
+}
+
+/// A friend request in either direction; `in` rows wait for a local answer.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ContactRequest {
+    pub id: String,
+    pub direction: String,
+    pub peer: String,
+    pub nickname: String,
+    pub username: Option<String>,
+    pub address: Option<String>,
+    pub created_at: i64,
+    pub status: String,
+}
+
+/// A group that no longer exists but keeps its local history.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct DissolvedGroup {
+    pub id: String,
+    pub name: String,
+    pub owner: String,
+    pub dissolved_at: Option<i64>,
+    pub last_body: String,
+    pub last_logical: i64,
+}
+
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct GroupMember {
     pub group_id: String,
@@ -262,6 +310,8 @@ pub struct GroupMessage {
     pub file_status: Option<String>,
     pub file_transferred: Option<i64>,
     pub file_error: Option<String>,
+    /// Unix time when the sender withdrew this message; body is blank in that case.
+    pub recalled_at: Option<i64>,
 }
 
 /// Which conversation a received file belongs to; direct and group files keep
@@ -884,8 +934,8 @@ impl Store {
         }
         if version < 21 {
             let transaction = connection.transaction()?;
-            // Mute is local UI state; it suppresses the numeric badge without changing
-            // message delivery or conversation ordering.
+            // "Mute" is local UI state like `hidden` and `unread`: it only silences the
+            // numeric badge, never the message flow or the conversation order.
             for statement in [
                 "ALTER TABLE conversations ADD COLUMN muted INTEGER NOT NULL DEFAULT 0 CHECK(muted IN (0, 1))",
                 "ALTER TABLE direct_conversations ADD COLUMN muted INTEGER NOT NULL DEFAULT 0 CHECK(muted IN (0, 1))",
@@ -896,6 +946,87 @@ impl Store {
                 }
             }
             transaction.execute_batch("PRAGMA user_version = 21;")?;
+            transaction.commit()?;
+        }
+        if version < 22 {
+            let transaction = connection.transaction()?;
+            // Recall marks stay on the message row; bodies are replaced with a single space
+            // because both message tables require a non-empty body.
+            for statement in [
+                "ALTER TABLE direct_messages ADD COLUMN recalled_at INTEGER",
+                "ALTER TABLE group_messages ADD COLUMN recalled_at INTEGER",
+                "ALTER TABLE groups ADD COLUMN dissolved_at INTEGER",
+                "ALTER TABLE groups ADD COLUMN dissolved_by TEXT",
+            ] {
+                if let Err(error) = transaction.execute_batch(statement) {
+                    if !error.to_string().contains("duplicate column name") { return Err(error); }
+                }
+            }
+            transaction.execute_batch(
+                "CREATE TABLE IF NOT EXISTS contact_requests (
+                    id TEXT PRIMARY KEY NOT NULL CHECK(length(id) = 32),
+                    direction TEXT NOT NULL CHECK(direction IN ('in', 'out')),
+                    peer TEXT NOT NULL CHECK(length(peer) = 64),
+                    nickname TEXT NOT NULL DEFAULT '',
+                    username TEXT,
+                    address TEXT,
+                    created_at INTEGER NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('pending', 'accepted', 'rejected'))
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS contact_requests_pending_pair
+                    ON contact_requests(peer, direction) WHERE status = 'pending';
+                CREATE INDEX IF NOT EXISTS contact_requests_by_state ON contact_requests(direction, status, created_at);
+                CREATE TABLE IF NOT EXISTS direct_recalls (
+                    id TEXT PRIMARY KEY NOT NULL CHECK(length(id) = 32),
+                    peer TEXT NOT NULL CHECK(length(peer) = 64),
+                    message_id TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('pending', 'delivered'))
+                );
+                CREATE INDEX IF NOT EXISTS direct_recalls_pending ON direct_recalls(peer, status);
+                CREATE TABLE group_control_v22 (
+                    id TEXT PRIMARY KEY NOT NULL CHECK(length(id) = 32),
+                    group_id TEXT NOT NULL,
+                    target TEXT NOT NULL CHECK(length(target) = 64),
+                    kind TEXT NOT NULL CHECK(kind IN ('invite', 'members', 'remove', 'leave', 'transfer', 'dissolve', 'recall')),
+                    payload TEXT NOT NULL CHECK(length(payload) <= 65536),
+                    status TEXT NOT NULL CHECK(status IN ('pending', 'delivered')),
+                    created_at INTEGER NOT NULL
+                );
+                INSERT INTO group_control_v22(id, group_id, target, kind, payload, status, created_at)
+                    SELECT id, group_id, target, kind, payload, status, created_at FROM group_control;
+                DROP TABLE group_control;
+                ALTER TABLE group_control_v22 RENAME TO group_control;
+                CREATE INDEX IF NOT EXISTS group_control_pending ON group_control(target, status);
+                PRAGMA user_version = 22;",
+            )?;
+            transaction.commit()?;
+        }
+        if version < 23 {
+            let transaction = connection.transaction()?;
+            transaction.execute_batch(
+                "CREATE TABLE group_control_v23 (
+                    id TEXT PRIMARY KEY NOT NULL CHECK(length(id) = 32),
+                    group_id TEXT NOT NULL,
+                    target TEXT NOT NULL CHECK(length(target) = 64),
+                    kind TEXT NOT NULL CHECK(kind IN ('invite', 'members', 'remove', 'leave', 'transfer', 'dissolve', 'recall', 'notice')),
+                    payload TEXT NOT NULL CHECK(length(payload) <= 65536),
+                    status TEXT NOT NULL CHECK(status IN ('pending', 'delivered')),
+                    created_at INTEGER NOT NULL
+                );
+                INSERT INTO group_control_v23(id, group_id, target, kind, payload, status, created_at)
+                    SELECT id, group_id, target, kind, payload, status, created_at FROM group_control;
+                DROP TABLE group_control;
+                ALTER TABLE group_control_v23 RENAME TO group_control;
+                CREATE INDEX IF NOT EXISTS group_control_pending ON group_control(target, status);
+                CREATE TABLE IF NOT EXISTS group_notices (
+                    group_id TEXT PRIMARY KEY NOT NULL REFERENCES groups(id),
+                    notice TEXT NOT NULL CHECK(length(notice) <= 2048),
+                    updated_at INTEGER NOT NULL,
+                    updated_by TEXT NOT NULL CHECK(length(updated_by) = 64)
+                );
+                PRAGMA user_version = 23;",
+            )?;
             transaction.commit()?;
         }
         Ok(Self { connection, data_dir, address_revision: std::cell::Cell::new(0) })
@@ -976,7 +1107,7 @@ impl Store {
         };
         let mut statement = self.connection.prepare(&format!(
             "SELECT {MESSAGE_COLUMNS} FROM direct_messages m LEFT JOIN file_transfers f ON f.message_id = m.id
-             WHERE m.peer = ?1 AND {category_filter}
+             WHERE m.peer = ?1 AND m.recalled_at IS NULL AND {category_filter}
                AND (?2 = '' OR m.body LIKE ?3 ESCAPE '\\' OR COALESCE(m.file_name, '') LIKE ?3 ESCAPE '\\')
              ORDER BY m.logical DESC, m.sender DESC, m.id DESC LIMIT ?4 OFFSET ?5"
         ))?;
@@ -1256,6 +1387,7 @@ impl Store {
         Ok(DirectMessage {
             id, peer: peer.into(), sender: sender.into(), body: body.into(), created_at, logical, status: "pending".into(),
             kind: "text".into(), file_name: None, file_size: None, file_sha256: None, file_status: None, file_transferred: None, file_error: None,
+            recalled_at: None,
         })
     }
 
@@ -1536,6 +1668,7 @@ impl Store {
             id, peer: peer.into(), sender: sender.into(), body: clean.clone(), created_at, logical, status: "pending".into(),
             kind: "file".into(), file_name: Some(clean), file_size: Some(size), file_sha256: Some(sha256.into()),
             file_status: Some("pending".into()), file_transferred: Some(0), file_error: None,
+            recalled_at: None,
         })
     }
 
@@ -2092,6 +2225,45 @@ impl Store {
         Ok(true)
     }
 
+    /// Reads the current announcement of one group, if any.
+    pub fn group_notice(&self, group_id: &str) -> Result<Option<String>> {
+        if !valid_group_id(group_id) { return Err(rusqlite::Error::InvalidQuery); }
+        let notice: Option<String> = self.connection.query_row(
+            "SELECT notice FROM group_notices WHERE group_id = ?1", [group_id], |row| row.get(0)).optional()?;
+        Ok(notice)
+    }
+
+    /// Publishes (or clears with an empty string) the group announcement as the
+    /// owner, and queues a notice control message for every other member.
+    pub fn set_group_notice(&self, group_id: &str, actor: &str, notice: &str, now: i64) -> Result<bool> {
+        if !valid_group_id(group_id) || !valid_fingerprint(actor)
+            || notice.chars().count() > 2048
+            || notice.chars().any(|c| c.is_control() && c != '\n' && c != '\t') {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        let tx = self.connection.unchecked_transaction()?;
+        let owner: Option<String> = tx.query_row("SELECT owner FROM groups WHERE id = ?1 AND active = 1", [group_id], |row| row.get(0)).optional()?;
+        let Some(owner) = owner else { return Ok(false); };
+        if owner != actor { return Ok(false); }
+        tx.execute(
+            "INSERT INTO group_notices(group_id, notice, updated_at, updated_by) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(group_id) DO UPDATE SET notice = excluded.notice, updated_at = excluded.updated_at, updated_by = excluded.updated_by",
+            params![group_id, notice, now, actor])?;
+        let payload = serde_json::json!({ "notice": notice }).to_string();
+        let mut statement = tx.prepare("SELECT member FROM group_members WHERE group_id = ?1 AND active = 1")?;
+        let members: Vec<String> = statement.query_map([group_id], |row| row.get(0))?.collect::<Result<Vec<String>>>()?;
+        drop(statement);
+        for member in &members {
+            if member == actor { continue; }
+            tx.execute(
+                "INSERT INTO group_control(id, group_id, target, kind, payload, status, created_at)
+                 VALUES (lower(hex(randomblob(16))), ?1, ?2, 'notice', ?3, 'pending', ?4)",
+                params![group_id, member, payload, now])?;
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
     /// Dissolves a group: every member is notified, local membership ends and undelivered
     /// messages/cancelled notices are dropped, while history stays readable on this device.
     pub fn dissolve_group(&self, group_id: &str, actor: &str, now: i64) -> Result<bool> {
@@ -2150,6 +2322,378 @@ impl Store {
             })
         })?;
         rows.collect()
+    }
+
+    /// Sender-side recall for a direct message. Unsent messages are removed from the
+    /// queue outright; delivered ones enqueue a recall notice that survives restarts.
+    pub fn recall_direct(&self, self_id: &str, message_id: &str, now: i64) -> Result<RecallResult> {
+        if !valid_fingerprint(self_id) || message_id.is_empty() || message_id.len() > 128 {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        let tx = self.connection.unchecked_transaction()?;
+        let row: Option<(String, String, i64, Option<i64>, String, Option<String>)> = tx.query_row(
+            "SELECT sender, status, created_at, recalled_at, kind, file_status FROM direct_messages WHERE id = ?1",
+            [message_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+        ).optional()?;
+        let Some((sender, status, created_at, recalled_at, kind, file_status)) = row else {
+            return Ok(RecallResult::Missing);
+        };
+        if sender != self_id { return Ok(RecallResult::NotYours); }
+        if recalled_at.is_some() { return Ok(RecallResult::Already); }
+        if now - created_at > RECALL_WINDOW_SECONDS { return Ok(RecallResult::TooLate); }
+        let delivered = status != "pending";
+        if !delivered {
+            tx.execute("DELETE FROM file_offer_requests WHERE message_id = ?1", [message_id])?;
+            tx.execute("DELETE FROM file_transfers WHERE message_id = ?1", [message_id])?;
+            tx.execute("DELETE FROM direct_messages WHERE id = ?1", [message_id])?;
+            tx.commit()?;
+            return Ok(RecallResult::Recalled { delivered: false });
+        }
+        tx.execute("UPDATE direct_messages SET body = ' ', recalled_at = ?2 WHERE id = ?1", params![message_id, now])?;
+        if kind == "file" && file_status.as_deref() != Some("completed") {
+            tx.execute("UPDATE file_transfers SET status = 'failed', error = 'recalled', updated_at = ?2 WHERE message_id = ?1",
+                params![message_id, now])?;
+            tx.execute("DELETE FROM file_offer_requests WHERE message_id = ?1", [message_id])?;
+            tx.execute("UPDATE direct_messages SET file_status = 'cancelled', file_error = 'recalled' WHERE id = ?1", [message_id])?;
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO direct_recalls(id, peer, message_id, created_at, status)
+             SELECT lower(hex(randomblob(16))), peer, id, ?2, 'pending' FROM direct_messages WHERE id = ?1",
+            params![message_id, now],
+        )?;
+        tx.commit()?;
+        Ok(RecallResult::Recalled { delivered: true })
+    }
+
+    /// Receiver-side recall. Files that already completed stay untouched by design.
+    pub fn receive_recall_direct(&self, self_id: &str, peer: &str, message_id: &str, now: i64) -> Result<IncomingResult> {
+        if !valid_fingerprint(self_id) || !valid_fingerprint(peer) || message_id.is_empty() || message_id.len() > 128 {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        let tx = self.connection.unchecked_transaction()?;
+        let verified: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM contacts WHERE fingerprint = ?1 AND trust_state = 'verified')",
+            [peer], |r| r.get(0))?;
+        if !verified { return Ok(IncomingResult::Unverified); }
+        let row: Option<(String, Option<i64>, String, Option<String>)> = tx.query_row(
+            "SELECT sender, recalled_at, kind, file_status FROM direct_messages WHERE id = ?1 AND peer = ?2",
+            params![message_id, peer],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        ).optional()?;
+        let Some((sender, recalled_at, kind, file_status)) = row else { return Ok(IncomingResult::Duplicate); };
+        if sender != peer { return Ok(IncomingResult::Unverified); }
+        if recalled_at.is_some() { return Ok(IncomingResult::Duplicate); }
+        if kind == "file" && file_status.as_deref() == Some("completed") { return Ok(IncomingResult::Duplicate); }
+        tx.execute("UPDATE direct_messages SET body = ' ', recalled_at = ?2 WHERE id = ?1", params![message_id, now])?;
+        if kind == "file" {
+            tx.execute("UPDATE file_transfers SET status = 'failed', error = 'recalled', updated_at = ?2 WHERE message_id = ?1",
+                params![message_id, now])?;
+            tx.execute("DELETE FROM file_offer_requests WHERE message_id = ?1", [message_id])?;
+            tx.execute("UPDATE direct_messages SET file_status = 'cancelled', file_error = 'recalled' WHERE id = ?1", [message_id])?;
+        }
+        tx.commit()?;
+        Ok(IncomingResult::Inserted)
+    }
+
+    /// Recall notices waiting for a reachable address; keyset order keeps retries fair.
+    pub fn next_pending_recall(&self, after: Option<&str>) -> Result<Option<PendingRecall>> {
+        let mut statement = self.connection.prepare(
+            "SELECT r.id, r.peer, a.address, r.message_id FROM direct_recalls r
+             JOIN contact_addresses a ON a.peer = r.peer
+             WHERE r.status = 'pending' AND (?1 IS NULL OR r.peer > ?1)
+             ORDER BY r.peer, r.created_at, r.id LIMIT 1",
+        )?;
+        let rows = statement.query_map([after], |row| Ok(PendingRecall {
+            id: row.get(0)?, peer: row.get(1)?, address: row.get(2)?, message_id: row.get(3)?,
+        }))?;
+        let mut rows = rows;
+        rows.next().transpose()
+    }
+
+    pub fn ack_recall(&self, id: &str) -> Result<bool> {
+        Ok(self.connection.execute("UPDATE direct_recalls SET status = 'delivered' WHERE id = ?1", [id])? == 1)
+    }
+
+    /// Sender-side group recall: dropped from unsent outbox rows, fanned out as a
+    /// `recall` control message for members that already have it.
+    pub fn recall_group(&self, self_id: &str, group_id: &str, message_id: &str, now: i64) -> Result<RecallResult> {
+        if !valid_fingerprint(self_id) || !valid_group_id(group_id) || message_id.is_empty() || message_id.len() > 128 {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        let tx = self.connection.unchecked_transaction()?;
+        let member: Option<i64> = tx.query_row(
+            "SELECT active FROM group_members WHERE group_id = ?1 AND member = ?2",
+            params![group_id, self_id], |r| r.get(0)).optional()?;
+        if member != Some(1) { return Ok(RecallResult::NotMember); }
+        let row: Option<(String, i64, Option<i64>, String, Option<String>)> = tx.query_row(
+            "SELECT sender, created_at, recalled_at, kind, file_status FROM group_messages WHERE id = ?1 AND group_id = ?2",
+            params![message_id, group_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        ).optional()?;
+        let Some((sender, created_at, recalled_at, kind, file_status)) = row else { return Ok(RecallResult::Missing); };
+        if sender != self_id { return Ok(RecallResult::NotYours); }
+        if recalled_at.is_some() { return Ok(RecallResult::Already); }
+        if now - created_at > RECALL_WINDOW_SECONDS { return Ok(RecallResult::TooLate); }
+        let delivered: Vec<String> = {
+            let mut statement = tx.prepare(
+                "SELECT member FROM group_outbox WHERE message_id = ?1 AND status = 'delivered' ORDER BY member")?;
+            let rows = statement.query_map([message_id], |row| row.get(0))?;
+            rows.collect::<Result<Vec<String>>>()?
+        };
+        tx.execute("UPDATE group_messages SET body = ' ', recalled_at = ?2 WHERE id = ?1", params![message_id, now])?;
+        tx.execute("DELETE FROM group_outbox WHERE message_id = ?1 AND status = 'pending'", [message_id])?;
+        if kind == "file" && file_status.as_deref() != Some("completed") {
+            tx.execute("UPDATE group_file_transfers SET status = 'failed', error = 'recalled', updated_at = ?2 WHERE message_id = ?1",
+                params![message_id, now])?;
+            tx.execute("DELETE FROM file_offer_requests WHERE message_id = ?1", [message_id])?;
+            tx.execute("UPDATE group_messages SET file_status = 'cancelled', file_error = 'recalled' WHERE id = ?1", [message_id])?;
+        }
+        let payload = serde_json::json!({ "message_id": message_id }).to_string();
+        for target in &delivered {
+            tx.execute(
+                "INSERT INTO group_control(id, group_id, target, kind, payload, status, created_at)
+                 VALUES (lower(hex(randomblob(16))), ?1, ?2, 'recall', ?3, 'pending', ?4)",
+                params![group_id, target, payload, now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(RecallResult::Recalled { delivered: !delivered.is_empty() })
+    }
+
+    /// Cancels an unsent or in-flight file and forgets the pending offer.
+    pub fn cancel_file(&self, message_id: &str, now: i64) -> Result<bool> {
+        let tx = self.connection.unchecked_transaction()?;
+        tx.execute("UPDATE file_transfers SET status = 'failed', error = 'recalled', updated_at = ?2 WHERE message_id = ?1",
+            params![message_id, now])?;
+        tx.execute("UPDATE group_file_transfers SET status = 'failed', error = 'recalled', updated_at = ?2 WHERE message_id = ?1",
+            params![message_id, now])?;
+        tx.execute("DELETE FROM file_offer_requests WHERE message_id = ?1", [message_id])?;
+        let changed = tx.execute(
+            "UPDATE direct_messages SET file_status = 'cancelled', file_error = 'recalled' WHERE id = ?1 AND kind = 'file'",
+            [message_id])?;
+        let changed_group = if changed == 0 {
+            tx.execute("UPDATE group_messages SET file_status = 'cancelled', file_error = 'recalled' WHERE id = ?1 AND kind = 'file'", [message_id])?
+        } else { changed };
+        tx.commit()?;
+        Ok(changed_group > 0)
+    }
+
+    /// Groups the user once belonged to that are no longer active (dissolved or left).
+    pub fn list_dissolved_groups(&self, self_id: &str) -> Result<Vec<DissolvedGroup>> {
+        if !valid_fingerprint(self_id) { return Err(rusqlite::Error::InvalidQuery); }
+        let mut statement = self.connection.prepare(
+            "SELECT g.id, g.name, g.owner, g.dissolved_at,
+                COALESCE((SELECT m.body FROM group_messages m WHERE m.group_id = g.id
+                          ORDER BY m.logical DESC, m.sender DESC, m.id DESC LIMIT 1), ''),
+                COALESCE((SELECT m.logical FROM group_messages m WHERE m.group_id = g.id
+                          ORDER BY m.logical DESC, m.sender DESC, m.id DESC LIMIT 1), 0)
+             FROM groups g JOIN group_members gm ON gm.group_id = g.id
+             WHERE gm.member = ?1 AND g.active = 0
+               AND EXISTS(SELECT 1 FROM group_messages m WHERE m.group_id = g.id)
+             ORDER BY 6 DESC, g.id LIMIT 100",
+        )?;
+        let rows = statement.query_map([self_id], |row| Ok(DissolvedGroup {
+            id: row.get(0)?, name: row.get(1)?, owner: row.get(2)?, dissolved_at: row.get(3)?,
+            last_body: row.get(4)?, last_logical: row.get(5)?,
+        }))?;
+        rows.collect()
+    }
+
+    /// Removes every local trace of a group, including downloaded attachments.
+    pub fn delete_group_history(&self, group_id: &str) -> Result<bool> {
+        if !valid_group_id(group_id) { return Err(rusqlite::Error::InvalidQuery); }
+        let paths: Vec<String> = {
+            let mut statement = self.connection.prepare(
+                "SELECT f.target_path FROM group_file_transfers f
+                 JOIN group_messages m ON m.id = f.message_id
+                 WHERE m.group_id = ?1 AND f.target_path IS NOT NULL")?;
+            let rows = statement.query_map([group_id], |row| row.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<String>>>()?
+        };
+        for path in paths {
+            let _ = std::fs::remove_file(path);
+        }
+        let tx = self.connection.unchecked_transaction()?;
+        tx.execute("DELETE FROM file_transfers WHERE message_id IN (SELECT id FROM group_messages WHERE group_id = ?1)", [group_id])?;
+        tx.execute("DELETE FROM file_offer_requests WHERE group_id = ?1", [group_id])?;
+        tx.execute("DELETE FROM group_outbox WHERE group_id = ?1", [group_id])?;
+        tx.execute("DELETE FROM group_control WHERE group_id = ?1", [group_id])?;
+        tx.execute("DELETE FROM group_messages WHERE group_id = ?1", [group_id])?;
+        tx.execute("DELETE FROM group_members WHERE group_id = ?1", [group_id])?;
+        let removed = tx.execute("DELETE FROM groups WHERE id = ?1 AND active = 0", [group_id])?;
+        tx.commit()?;
+        Ok(removed == 1)
+    }
+
+    /// Deletes the selected messages from one local conversation. Only local
+    /// rows are removed; peers keep their own copies of the same messages.
+    pub fn delete_messages(&self, kind: &str, id: &str, ids: &[String]) -> Result<usize> {
+        if ids.is_empty() || ids.len() > 1000 || ids.iter().any(|mid| mid.is_empty() || mid.len() > 128) {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        let tx = self.connection.unchecked_transaction()?;
+        let mut removed = 0usize;
+        match kind {
+            "self" => {
+                let mut statement = tx.prepare("DELETE FROM local_messages WHERE conversation_id = 'self' AND id = ?1")?;
+                for mid in ids { removed += statement.execute([mid])?; }
+            }
+            "direct" => {
+                let mut statement = tx.prepare("DELETE FROM direct_messages WHERE peer = ?1 AND id = ?2")?;
+                for mid in ids { removed += statement.execute([id, mid])?; }
+            }
+            "group" => {
+                let mut statement = tx.prepare("SELECT id FROM group_messages WHERE group_id = ?1 AND id = ?2")?;
+                let mut doomed: Vec<String> = Vec::new();
+                for mid in ids {
+                    if statement.query_row([id, mid], |row| row.get::<_, String>(0)).is_ok() {
+                        doomed.push(mid.clone());
+                    }
+                }
+                drop(statement);
+                let mut outbox = tx.prepare("DELETE FROM group_outbox WHERE message_id = ?1")?;
+                let mut transfers = tx.prepare("DELETE FROM file_transfers WHERE message_id = ?1")?;
+                let mut group_files = tx.prepare("DELETE FROM group_file_transfers WHERE message_id = ?1")?;
+                for mid in &doomed {
+                    outbox.execute([mid])?;
+                    transfers.execute([mid])?;
+                    group_files.execute([mid])?;
+                }
+                drop(outbox); drop(transfers); drop(group_files);
+                let mut statement = tx.prepare("DELETE FROM group_messages WHERE group_id = ?1 AND id = ?2")?;
+                for mid in &doomed { removed += statement.execute([id, mid])?; }
+            }
+            _ => return Err(rusqlite::Error::InvalidQuery),
+        }
+        tx.commit()?;
+        Ok(removed)
+    }
+
+    /// Friend requests are separate rows so a declined or withdrawn request never
+    /// becomes a contact. `direction` is `in` for requests received by this device.
+    pub fn create_contact_request(&self, direction: &str, peer: &str, nickname: &str,
+        username: Option<&str>, address: Option<&str>, now: i64) -> Result<Option<ContactRequest>> {
+        if !matches!(direction, "in" | "out") || !valid_fingerprint(peer) || nickname.len() > 128
+            || address.is_some_and(|value| value.is_empty() || value.len() > 128) {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        if let Some(existing) = self.pending_contact_request(peer, direction)? { return Ok(Some(existing)); }
+        let tx = self.connection.unchecked_transaction()?;
+        let id: String = tx.query_row("SELECT lower(hex(randomblob(16)))", [], |row| row.get(0))?;
+        tx.execute(
+            "INSERT INTO contact_requests(id, direction, peer, nickname, username, address, created_at, status)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending')",
+            params![id, direction, peer, nickname, username, address, now],
+        )?;
+        // A pending outgoing request keeps the local contact visible but not usable.
+        if direction == "out" {
+            tx.execute(
+                "INSERT INTO direct_conversations(peer, hidden) VALUES (?1, 1) ON CONFLICT(peer) DO NOTHING",
+                [peer],
+            )?;
+        }
+        tx.commit()?;
+        self.contact_request(&id)
+    }
+
+    pub fn contact_request(&self, id: &str) -> Result<Option<ContactRequest>> {
+        self.connection.query_row(
+            "SELECT id, direction, peer, nickname, username, address, created_at, status
+             FROM contact_requests WHERE id = ?1", [id],
+            |row| Ok(ContactRequest {
+                id: row.get(0)?, direction: row.get(1)?, peer: row.get(2)?, nickname: row.get(3)?,
+                username: row.get(4)?, address: row.get(5)?, created_at: row.get(6)?, status: row.get(7)?,
+            }),
+        ).optional()
+    }
+
+    pub fn pending_contact_request(&self, peer: &str, direction: &str) -> Result<Option<ContactRequest>> {
+        self.connection.query_row(
+            "SELECT id, direction, peer, nickname, username, address, created_at, status
+             FROM contact_requests WHERE peer = ?1 AND direction = ?2 AND status = 'pending'",
+            params![peer, direction],
+            |row| Ok(ContactRequest {
+                id: row.get(0)?, direction: row.get(1)?, peer: row.get(2)?, nickname: row.get(3)?,
+                username: row.get(4)?, address: row.get(5)?, created_at: row.get(6)?, status: row.get(7)?,
+            }),
+        ).optional()
+    }
+
+    pub fn list_contact_requests(&self, direction: &str) -> Result<Vec<ContactRequest>> {
+        if !matches!(direction, "in" | "out") { return Err(rusqlite::Error::InvalidQuery); }
+        let mut statement = self.connection.prepare(
+            "SELECT id, direction, peer, nickname, username, address, created_at, status
+             FROM contact_requests WHERE direction = ?1 ORDER BY created_at DESC LIMIT 200")?;
+        let rows = statement.query_map([direction], |row| Ok(ContactRequest {
+            id: row.get(0)?, direction: row.get(1)?, peer: row.get(2)?, nickname: row.get(3)?,
+            username: row.get(4)?, address: row.get(5)?, created_at: row.get(6)?, status: row.get(7)?,
+        }))?;
+        rows.collect()
+    }
+
+    /// Answers a request. Accepting an inbound or outbound request makes the peer a
+    /// verified contact; rejecting only closes the request row.
+    pub fn resolve_contact_request(&self, id: &str, accept: bool, now: i64) -> Result<Option<ContactRequest>> {
+        let Some(request) = self.contact_request(id)? else { return Ok(None); };
+        if request.status != "pending" { return Ok(None); }
+        let tx = self.connection.unchecked_transaction()?;
+        tx.execute("UPDATE contact_requests SET status = ?2 WHERE id = ?1",
+            params![id, if accept { "accepted" } else { "rejected" }])?;
+        if accept {
+            tx.execute(
+                "INSERT INTO contacts(fingerprint, display_name, trust_state, created_at, username)
+                 VALUES (?1, ?2, 'verified', ?3, ?4)
+                 ON CONFLICT(fingerprint) DO UPDATE SET trust_state = 'verified', display_name = excluded.display_name",
+                params![request.peer, request.nickname, now, request.username],
+            )?;
+            if let Some(address) = request.address.as_deref() {
+                tx.execute(
+                    "INSERT INTO contact_addresses(peer, address) VALUES (?1, ?2)
+                     ON CONFLICT(peer) DO UPDATE SET address = excluded.address",
+                    params![request.peer, address])?;
+            }
+            tx.execute("INSERT INTO direct_conversations(peer, hidden) VALUES (?1, 0) ON CONFLICT(peer) DO UPDATE SET hidden = 0",
+                [request.peer])?;
+        }
+        tx.commit()?;
+        self.contact_request(id)
+    }
+
+    /// Answers the pending request with this peer, if any; used by the contact protocol.
+    pub fn resolve_contact_request_by_peer(&self, peer: &str, direction: &str, accept: bool, now: i64) -> Result<bool> {
+        if !valid_fingerprint(peer) || !matches!(direction, "in" | "out") {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        let Some(request) = self.pending_contact_request(peer, direction)? else { return Ok(false); };
+        Ok(self.resolve_contact_request(&request.id, accept, now)?.is_some())
+    }
+
+    pub fn withdraw_contact_request(&self, peer: &str) -> Result<bool> {
+        if !valid_fingerprint(peer) { return Err(rusqlite::Error::InvalidQuery); }
+        Ok(self.connection.execute(
+            "UPDATE contact_requests SET status = 'rejected' WHERE peer = ?1 AND direction = 'out' AND status = 'pending'",
+            [peer])? == 1)
+    }
+
+    pub fn lan_visible(&self) -> Result<bool> {
+        Ok(self.get_setting("lan_visible")?.as_deref() != Some("0"))
+    }
+
+    pub fn set_lan_visible(&self, visible: bool) -> Result<()> {
+        self.set_setting("lan_visible", Some(if visible { "1" } else { "0" }))?;
+        Ok(())
+    }
+
+    /// `ask` (default) requires a local answer; `auto` accepts every request.
+    pub fn contact_request_mode(&self) -> Result<String> {
+        Ok(self.get_setting("contact_request_mode")?.unwrap_or_else(|| "ask".into()))
+    }
+
+    pub fn set_contact_request_mode(&self, mode: &str) -> Result<()> {
+        if !matches!(mode, "ask" | "auto") { return Err(rusqlite::Error::InvalidQuery); }
+        self.set_setting("contact_request_mode", Some(mode))?;
+        Ok(())
     }
 
     pub fn open_group(&self, group_id: &str, self_id: &str) -> Result<bool> {
@@ -2305,6 +2849,7 @@ impl Store {
             mentions: unique_mentions,
             kind: "text".into(), file_name: None, file_size: None, file_sha256: None,
             file_status: None, file_transferred: None, file_error: None,
+            recalled_at: None,
         })
     }
 
@@ -2318,7 +2863,7 @@ impl Store {
             "SELECT m.id, m.group_id, m.sender, COALESCE(c.display_name, substr(m.sender, 1, 8)), m.body, m.created_at, m.logical,
                 (SELECT count(*) FROM group_outbox o WHERE o.message_id = m.id AND o.status = 'pending'),
                 m.reply_to, m.reply_sender, m.reply_preview, m.mentions,
-                m.kind, m.file_name, m.file_size, m.file_sha256, f.status, f.transferred, f.error
+                m.kind, m.file_name, m.file_size, m.file_sha256, f.status, f.transferred, f.error, m.recalled_at
              FROM group_messages m LEFT JOIN contacts c ON c.fingerprint = m.sender
              LEFT JOIN group_file_transfers f ON f.message_id = m.id
              WHERE m.group_id = ?1 AND (?2 IS NULL OR (m.logical, m.sender, m.id) < (?2, ?3, ?4))
@@ -2463,11 +3008,11 @@ impl Store {
         let mut statement = self.connection.prepare(
             "SELECT m.id, m.group_id, m.sender, COALESCE(c.display_name, substr(m.sender, 1, 8)), m.body, m.created_at, m.logical,
                 0, m.reply_to, m.reply_sender, m.reply_preview, m.mentions,
-                m.kind, m.file_name, m.file_size, m.file_sha256, f.status, f.transferred, f.error
+                m.kind, m.file_name, m.file_size, m.file_sha256, f.status, f.transferred, f.error, m.recalled_at
              FROM group_messages m
              LEFT JOIN contacts c ON c.fingerprint = m.sender
              LEFT JOIN group_file_transfers f ON f.message_id = m.id
-             WHERE m.group_id = ?1
+             WHERE m.group_id = ?1 AND m.recalled_at IS NULL
                AND ((?7 IN ('all', 'text') AND m.kind = 'text' AND (?2 = '' OR m.body LIKE ?3 ESCAPE '\\'))
                  OR (?7 IN ('all', 'file') AND m.kind = 'file'
                      AND (?2 = '' OR m.body LIKE ?3 ESCAPE '\\' OR COALESCE(m.file_name, '') LIKE ?3 ESCAPE '\\'))
@@ -2584,6 +3129,7 @@ impl Store {
             reply_to: None, reply_sender: None, reply_preview: None, mentions: Vec::new(),
             kind: "file".into(), file_name: Some(clean), file_size: Some(size_i64), file_sha256: Some(sha256.into()),
             file_status: Some("pending".into()), file_transferred: Some(0), file_error: None,
+            recalled_at: None,
         })
     }
 
@@ -3528,9 +4074,60 @@ impl Store {
                 let current: Option<String> = tx.query_row("SELECT owner FROM groups WHERE id = ?1 AND active = 1", [group_id], |row| row.get(0)).optional()?;
                 let Some(current) = current else { return Ok(IncomingResult::NotMember); };
                 if current != peer { return Ok(IncomingResult::Unverified); }
-                tx.execute("UPDATE groups SET active = 0 WHERE id = ?1", [group_id])?;
+                tx.execute("UPDATE groups SET active = 0, dissolved_at = ?2, dissolved_by = ?3 WHERE id = ?1",
+                    params![group_id, now, peer])?;
                 tx.execute("UPDATE group_members SET active = 0, hidden = 1 WHERE group_id = ?1", [group_id])?;
                 tx.execute("DELETE FROM group_outbox WHERE group_id = ?1 AND status = 'pending'", [group_id])?;
+                tx.commit()?;
+                Ok(IncomingResult::Inserted)
+            }
+            "recall" => {
+                let message_id = serde_json::from_str::<serde_json::Value>(payload).ok()
+                    .and_then(|value| value.get("message_id").and_then(|item| item.as_str()).map(str::to_string));
+                let Some(message_id) = message_id else { return Err(rusqlite::Error::InvalidQuery); };
+                let member: Option<i64> = tx.query_row(
+                    "SELECT active FROM group_members WHERE group_id = ?1 AND member = ?2",
+                    params![group_id, self_id], |row| row.get(0)).optional()?;
+                if member != Some(1) { return Ok(IncomingResult::NotMember); }
+                let row: Option<(String, Option<i64>, String, Option<String>)> = tx.query_row(
+                    "SELECT sender, recalled_at, kind, file_status FROM group_messages WHERE id = ?1 AND group_id = ?2",
+                    params![message_id, group_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).optional()?;
+                let Some((sender, recalled_at, kind, file_status)) = row else { return Ok(IncomingResult::Duplicate); };
+                if sender != peer { return Ok(IncomingResult::Unverified); }
+                if recalled_at.is_some() { return Ok(IncomingResult::Duplicate); }
+                if kind == "file" && file_status.as_deref() == Some("completed") { return Ok(IncomingResult::Duplicate); }
+                tx.execute("UPDATE group_messages SET body = ' ', recalled_at = ?3 WHERE id = ?1 AND group_id = ?2",
+                    params![message_id, group_id, now])?;
+                if kind == "file" {
+                    tx.execute("UPDATE group_file_transfers SET status = 'failed', error = 'recalled', updated_at = ?2 WHERE message_id = ?1",
+                        params![message_id, now])?;
+                    tx.execute("DELETE FROM file_offer_requests WHERE message_id = ?1", [&message_id])?;
+                    tx.execute("UPDATE group_messages SET file_status = 'cancelled', file_error = 'recalled' WHERE id = ?1", [&message_id])?;
+                }
+                tx.commit()?;
+                Ok(IncomingResult::Inserted)
+            }
+            "notice" => {
+                // Only the current owner may publish an announcement, and only
+                // active members keep it.
+                let owner: Option<String> = tx.query_row("SELECT owner FROM groups WHERE id = ?1", [group_id], |row| row.get(0)).optional()?;
+                let Some(owner) = owner else { return Ok(IncomingResult::NotMember); };
+                if owner != peer { return Ok(IncomingResult::Unverified); }
+                let active: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM group_members WHERE group_id = ?1 AND member = ?2 AND active = 1)",
+                    params![group_id, self_id], |row| row.get(0))?;
+                if !active { return Ok(IncomingResult::NotMember); }
+                let value: serde_json::Value = serde_json::from_str(payload).map_err(|_| rusqlite::Error::InvalidQuery)?;
+                let notice = value.get("notice").and_then(|v| v.as_str()).ok_or(rusqlite::Error::InvalidQuery)?;
+                if notice.chars().count() > 2048
+                    || notice.chars().any(|c| c.is_control() && c != '\n' && c != '\t') {
+                    return Err(rusqlite::Error::InvalidQuery);
+                }
+                tx.execute(
+                    "INSERT INTO group_notices(group_id, notice, updated_at, updated_by) VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(group_id) DO UPDATE SET notice = excluded.notice, updated_at = excluded.updated_at, updated_by = excluded.updated_by",
+                    params![group_id, notice, now, peer])?;
                 tx.commit()?;
                 Ok(IncomingResult::Inserted)
             }
@@ -3625,6 +4222,7 @@ fn group_message_row(row: &rusqlite::Row<'_>) -> Result<GroupMessage> {
         mentions: parse_mentions(&row.get::<_, String>(11)?),
         kind: row.get(12)?, file_name: row.get(13)?, file_size: row.get(14)?, file_sha256: row.get(15)?,
         file_status: row.get(16)?, file_transferred: row.get(17)?, file_error: row.get(18)?,
+        recalled_at: row.get(19)?,
     })
 }
 
@@ -3674,6 +4272,7 @@ fn map_message(row: &rusqlite::Row<'_>) -> Result<DirectMessage> {
         created_at: row.get(4)?, logical: row.get(5)?, status: row.get(6)?, kind: row.get(7)?,
         file_name: row.get(8)?, file_size: row.get(9)?, file_sha256: row.get(10)?,
         file_status: row.get(11)?, file_transferred: row.get(12)?, file_error: row.get(13)?,
+        recalled_at: row.get(14)?,
     })
 }
 
@@ -4890,8 +5489,8 @@ mod tests {
         assert!(!store.set_username("1abc").unwrap());
         assert!(!store.set_username("bob-1").unwrap());
         assert!(!store.set_username("青鸟").unwrap());
-        assert!(store.set_username("_Tam_01").unwrap());
-        assert_eq!(store.get_profile().unwrap().username, "_Tam_01");
+        assert!(store.set_username("_Demo_01").unwrap());
+        assert_eq!(store.get_profile().unwrap().username, "_Demo_01");
         assert!(!store.onboarding_done().unwrap());
         store.set_onboarding_done().unwrap();
         assert!(store.onboarding_done().unwrap());

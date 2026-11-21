@@ -2,6 +2,13 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "main",
   "description": "Qbird main window base permissions",
-  "windows": ["main"],
-  "permissions": ["core:default", "dialog:default"]
+  "windows": [
+    "main",
+    "notice",
+    "records*"
+  ],
+  "permissions": [
+    "core:default",
+    "dialog:default"
+  ]
 }

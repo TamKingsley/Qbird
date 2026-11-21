@@ -10,7 +10,9 @@ export default defineConfig({
       // The capture overlay runs in its own frameless fullscreen window.
       input: {
         main: resolve(__dirname, 'index.html'),
+        records: resolve(__dirname, 'records.html'),
         capture: resolve(__dirname, 'capture.html'),
+        notify: resolve(__dirname, 'notify.html'),
       },
     },
   },

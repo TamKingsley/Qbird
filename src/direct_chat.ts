@@ -6,6 +6,7 @@ import { base64ToBytes } from './plugin_view';
 import { workspace, type LoadedTab } from './workspace';
 import { linkifiedText } from './linkify';
 import { showContextMenu } from './context_menu';
+import { t, trError } from './i18n';
 
 type DirectMessage = {
   id: string; peer: string; sender: string; body: string; created_at: number; logical: number;
@@ -13,6 +14,7 @@ type DirectMessage = {
   kind: 'text' | 'file';
   file_name: string | null; file_size: number | null; file_sha256: string | null;
   file_status: 'pending' | 'transferring' | 'completed' | 'failed' | null; file_transferred: number | null; file_error: string | null;
+  recalled_at: number | null;
 };
 type TextPreview = { name: string; kind: string; text: string };
 type FileOffer = { message_id: string; peer: string; name: string; total: number; created_at: number; status: string; group_id?: string | null };
@@ -51,10 +53,10 @@ export class DirectChat {
   constructor(private root: HTMLElement, private onChange: () => void) {}
 
   view(): string {
-    return `<section class="self-chat" aria-label="单聊">
-      <header class="chat-header"><div><strong id="direct-name"></strong><span id="direct-presence" class="presence-dot" hidden></span><span id="direct-presence-text" class="presence-text"></span><small>端到端加密 · 已添加联系人</small></div><div class="group-actions"><button class="outline" data-action="export-text" data-kind="direct">导出文本</button><button class="outline" data-action="hide-direct">不显示此会话</button></div></header>
-      <div class="chat-history" id="direct-history" aria-label="单聊记录"><div class="direct-address"><label for="direct-address">联系人地址（仅连接提示）</label><div class="probe-row"><input id="direct-address" type="text" placeholder="192.168.1.8:42853"><button class="outline" data-action="save-direct-address">保存地址</button></div><small>地址不代表身份，连接时仍核对指纹。请在发现页面启动聊天服务；离线消息与文件须双方同时在线才能补发或续传。</small><p id="direct-address-status" role="status"></p></div><button class="load-older" data-action="direct-older" hidden>加载更早消息</button><div id="direct-messages"></div><div id="direct-offers" class="direct-offers" hidden></div></div>
-      <div class="chat-compose"><label for="direct-input">消息</label><div class="compose-staging" id="direct-staging" aria-label="待发送附件" hidden></div><textarea id="direct-input" rows="3" maxlength="32768" placeholder="写点什么，或把文件/图片拖进窗口…"></textarea>${composerTools('direct', 'Enter 发送 · Shift+Enter 换行')}<p id="direct-file-status" role="status"></p><p id="direct-error" role="status"></p></div>
+    return `<section class="self-chat" aria-label="${t('单聊')}">
+      <header class="chat-header"><div><strong id="direct-name"></strong><span id="direct-presence" class="presence-dot" hidden></span><span id="direct-presence-text" class="presence-text"></span><small>${t('端到端加密 · 已添加联系人')}</small></div><div class="group-actions"><button class="outline chat-more" data-action="chat-menu" data-kind="direct" aria-label="${t('会话菜单')}" title="${t('会话菜单')}">⋯</button></div></header>
+      <div class="chat-history" id="direct-history" aria-label="${t('单聊记录')}"><div class="direct-address"><label for="direct-address">${t('联系人地址（仅连接提示）')}</label><div class="probe-row"><input id="direct-address" type="text" placeholder="192.168.1.8:42853"><button class="outline" data-action="save-direct-address">${t('保存地址')}</button></div><small>${t('地址不代表身份，连接时仍核对指纹。请在发现页面启动聊天服务；离线消息与文件须双方同时在线才能补发或续传。')}</small><p id="direct-address-status" role="status"></p></div><button class="load-older" data-action="direct-older" hidden>${t('加载更早消息')}</button><div id="direct-messages"></div><div id="direct-offers" class="direct-offers" hidden></div></div>
+      <div class="chat-compose"><label for="direct-input">${t('消息')}</label><div class="compose-staging" id="direct-staging" aria-label="${t('待发送附件')}" hidden></div><textarea id="direct-input" rows="3" maxlength="32768" placeholder="${t('写点什么，或把文件/图片拖进窗口…')}"></textarea>${composerTools('direct', t('Enter 发送 · Shift+Enter 换行'))}<p id="direct-file-status" role="status"></p><p id="direct-error" role="status"></p></div>
     </section>`;
   }
 
@@ -69,7 +71,7 @@ export class DirectChat {
     try {
       await invoke('v1_hide_direct', { peer });
       if (generation === this.generation) { this.clear(); this.onChange(); }
-    } catch { if (generation === this.generation) this.status('#direct-error', '无法隐藏会话'); }
+    } catch { if (generation === this.generation) this.status('#direct-error', t('无法隐藏会话')); }
   }
 
   async saveAddress(): Promise<void> {
@@ -80,19 +82,19 @@ export class DirectChat {
       await invoke('v1_set_contact_address', { peer, address });
       if (generation === this.generation) {
         this.address = address; if (input.value.trim() === address) this.addressDrafts.delete(peer);
-        this.status('#direct-address-status', '地址已保存，正在尝试发送待发送消息…');
+        this.status('#direct-address-status', t('地址已保存，正在尝试发送待发送消息…'));
       }
       let sent = 0; let failure = '';
       try { sent = await invoke<number>('v1_flush_direct', { peer }); }
-      catch (error) { failure = typeof error === 'string' ? error : '发送未确认'; }
+      catch (error) { failure = trError(error, t('发送未确认')); }
       if (generation === this.generation) {
         this.status('#direct-address-status', failure
-          ? `${failure}。地址已保存，可稍后重试。`
-          : sent > 0 ? `地址已保存，已发送 ${sent} 条待发送消息。` : '地址已保存；当前没有待发送消息。');
+          ? `${failure}${t('。地址已保存，可稍后重试。')}`
+          : sent > 0 ? `${t('地址已保存，已发送')}${sent}${t('条待发送消息。')}` : t('地址已保存；当前没有待发送消息。'));
         await this.load(false);
       }
     } catch (error) {
-      if (generation === this.generation) this.status('#direct-address-status', typeof error === 'string' ? error : '无法保存地址');
+      if (generation === this.generation) this.status('#direct-address-status', trError(error, t('无法保存地址')));
     }
   }
 
@@ -102,7 +104,7 @@ export class DirectChat {
     if (!this.peer || !input || this.sending) return;
     const peer = this.peer, generation = this.generation, body = input.value;
     const staged = this.staged.slice();
-    if (!body.trim() && !staged.length) { this.status('#direct-error', '请输入消息，或先添加图片/文件'); return; }
+    if (!body.trim() && !staged.length) { this.status('#direct-error', t('请输入消息，或先添加图片/文件')); return; }
     this.sending = true; if (button) button.disabled = true; this.status('#direct-error', '');
     try {
       if (staged.length) {
@@ -120,8 +122,8 @@ export class DirectChat {
           await this.load(false, true);
           this.onChangeConversations();
           this.status('#direct-file-status', images.length
-            ? `已加入待发送：${images.length} 张图片${body.trim() ? '与文字' : ''}（对方在线后自动发送）`
-            : `已加入待发送：${files.length} 个文件${body.trim() ? '，文字已单独发送' : ''}（对方在线后自动发送）`);
+            ? `${t('已加入待发送：')}${images.length}${t('张图片')}${body.trim() ? t('与文字') : ''}${t('（对方在线后自动发送）')}`
+            : `${t('已加入待发送：')}${files.length}${t('个文件')}${body.trim() ? '，文字已单独发送' : ''}${t('（对方在线后自动发送）')}`);
         }
         return;
       }
@@ -133,7 +135,7 @@ export class DirectChat {
         this.paint('bottom'); this.onChangeConversations();
       }
     } catch (error) {
-      if (generation === this.generation) this.status('#direct-error', typeof error === 'string' ? error : '无法保存待发送消息');
+      if (generation === this.generation) this.status('#direct-error', trError(error, t('无法保存待发送消息')));
     } finally { this.sending = false; if (button?.isConnected) button.disabled = false; }
   }
 
@@ -145,14 +147,14 @@ export class DirectChat {
       const selected = await open({
         multiple: true,
         directory: false,
-        title: kind === 'image' ? '选择图片' : '选择文件',
-        filters: kind === 'image' ? [{ name: '图片', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp'] }] : undefined,
+        title: kind === 'image' ? t('选择图片') : t('选择文件'),
+        filters: kind === 'image' ? [{ name: t('图片'), extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp'] }] : undefined,
       });
       if (!selected) return;
       const paths = Array.isArray(selected) ? selected : [selected];
       await this.stagePaths(paths);
     } catch (error) {
-      this.status('#direct-error', typeof error === 'string' ? error : '无法打开文件选择器');
+      this.status('#direct-error', trError(error, t('无法打开文件选择器')));
     } finally { this.attaching = false; }
   }
 
@@ -164,7 +166,7 @@ export class DirectChat {
     const input = this.root.querySelector<HTMLTextAreaElement>('#direct-input');
     const caption = input?.value ?? '';
     this.attaching = true;
-    this.status('#direct-file-status', '正在计算校验值…');
+    this.status('#direct-file-status', t('正在计算校验值…'));
     try {
       const messages = await invoke<DirectMessage[]>('v1_queue_direct_images', { peer, paths, caption });
       if (generation !== this.generation) return;
@@ -175,9 +177,9 @@ export class DirectChat {
       if (input && caption) input.value = '';
       await this.loadBatches();
       this.paint('bottom'); this.onChangeConversations();
-      this.status('#direct-file-status', `已加入待发送：${messages.length} 张图片（对方在线后自动发送）`);
+      this.status('#direct-file-status', `${t('已加入待发送：')}${messages.length}${t('张图片（对方在线后自动发送）')}`);
     } catch (error) {
-      if (generation === this.generation) this.status('#direct-file-status', typeof error === 'string' ? error : '无法加入图片');
+      if (generation === this.generation) this.status('#direct-file-status', trError(error, t('无法加入图片')));
     } finally { this.attaching = false; }
   }
 
@@ -203,15 +205,15 @@ export class DirectChat {
 
   private async queuePath(path: string): Promise<void> {
     const peer = this.peer, generation = this.generation;
-    this.status('#direct-file-status', '正在计算校验值…');
+    this.status('#direct-file-status', t('正在计算校验值…'));
     try {
       const message = await invoke<DirectMessage>('v1_queue_direct_file', { peer, path });
       if (generation !== this.generation) return;
       if (!this.messages.some(item => item.id === message.id)) { this.messages.push(message); this.messages.sort(compare); }
       this.paint('bottom'); this.onChangeConversations();
-      this.status('#direct-file-status', `已加入待发送：${message.file_name ?? message.body}（对方在线后自动发送）`);
+      this.status('#direct-file-status', `${t('已加入待发送：')}${message.file_name ?? message.body}${t('（对方在线后自动发送）')}`);
     } catch (error) {
-      if (generation === this.generation) this.status('#direct-file-status', typeof error === 'string' ? error : '无法加入文件');
+      if (generation === this.generation) this.status('#direct-file-status', trError(error, t('无法加入文件')));
     }
   }
 
@@ -220,7 +222,7 @@ export class DirectChat {
   async stagePaths(paths: string[]): Promise<void> {
     if (!isTauri() || !this.peer || !paths.length) return;
     this.attaching = true;
-    this.status('#direct-file-status', '正在准备预览…');
+    this.status('#direct-file-status', t('正在准备预览…'));
     try {
       for (const path of paths) {
         const name = path.split(/[\\/]/).pop() ?? path;
@@ -231,7 +233,7 @@ export class DirectChat {
       }
       this.paintStaging();
       this.status('#direct-file-status', this.staged.length
-        ? `已添加 ${this.staged.length} 个附件：可继续写文字，点「发送」一起发出。`
+        ? `${t('已添加')}${this.staged.length}${t('个附件：可继续写文字，点「发送」一起发出。')}`
         : '');
     } finally { this.attaching = false; }
   }
@@ -240,7 +242,7 @@ export class DirectChat {
     if (index < 0 || index >= this.staged.length) return;
     this.staged.splice(index, 1);
     this.paintStaging();
-    this.status('#direct-file-status', this.staged.length ? `还剩 ${this.staged.length} 个附件` : '已清空附件');
+    this.status('#direct-file-status', this.staged.length ? `${t('还剩')}${this.staged.length}${t('个附件')}` : t('已清空附件'));
   }
 
   private paintStaging(): void {
@@ -249,9 +251,9 @@ export class DirectChat {
     box.hidden = this.staged.length === 0;
     if (!this.staged.length) { box.innerHTML = ''; return; }
     box.innerHTML = this.staged.map((item, index) => item.image
-      ? `<div class="staged-item is-image" title="${escapeHtml(item.name)}"><img src="${item.preview ?? ''}" alt=""><button type="button" class="staged-remove" data-action="direct-unstage" data-index="${index}" aria-label="移除 ${escapeHtml(item.name)}">×</button></div>`
-      : `<div class="staged-item is-file" title="${escapeHtml(item.name)}"><span class="staged-name">${escapeHtml(item.name)}</span><button type="button" class="staged-remove" data-action="direct-unstage" data-index="${index}" aria-label="移除 ${escapeHtml(item.name)}">×</button></div>`
-    ).join('') + '<span class="staged-hint">发送时随文字一起发出</span>';
+      ? `<div class="staged-item is-image" title="${escapeHtml(item.name)}"><img src="${item.preview ?? ''}" alt=""><button type="button" class="staged-remove" data-action="direct-unstage" data-index="${index}" aria-label="${t('移除')}${escapeHtml(item.name)}">×</button></div>`
+      : `<div class="staged-item is-file" title="${escapeHtml(item.name)}"><span class="staged-name">${escapeHtml(item.name)}</span><button type="button" class="staged-remove" data-action="direct-unstage" data-index="${index}" aria-label="${t('移除')}${escapeHtml(item.name)}">×</button></div>`
+    ).join('') + `${t('发送时随文字一起发出')}`;
   }
 
   /// Opens one completed attachment in the global workspace panel. The workspace
@@ -265,14 +267,14 @@ export class DirectChat {
   /// Resolver entry used by the workspace for live opens and restored tabs.
   async loadWorkspaceFile(source: { messageId: string; name: string }): Promise<LoadedTab> {
     try { return await this.loadPreview(source.messageId, source.name); }
-    catch (error) { return { kind: 'error', message: typeof error === 'string' ? error : '无法读取该文件' }; }
+    catch (error) { return { kind: 'error', message: trError(error, t('无法读取该文件')) }; }
   }
 
   private async loadPreview(messageId: string, name: string): Promise<LoadedTab> {
     const kind = previewKind(name);
     if (kind === 'image') {
       const preview = await invoke<{ name: string; data_url: string } | null>('v1_read_attachment', { messageId });
-      if (!preview) return { kind: 'unsupported', reason: '图片过大或无法读取，未能预览' };
+      if (!preview) return { kind: 'unsupported', reason: t('图片过大或无法读取，未能预览') };
       this.previews.set(messageId, preview.data_url);
       return { kind: 'image', src: preview.data_url };
     }
@@ -282,12 +284,12 @@ export class DirectChat {
     }
     if (kind === 'other') {
       const plugin = await invoke<{ plugin_id: string; html: string } | null>('v1_plugin_preview', { fileName: name });
-      if (!plugin) return { kind: 'unsupported', reason: '该类型暂不支持内置预览；可用“用默认程序打开”或“打开所在目录”，安装预览插件后也可在此查看。' };
+      if (!plugin) return { kind: 'unsupported', reason: t('该类型暂不支持内置预览；可用“用默认程序打开”或“打开所在目录”，安装预览插件后也可在此查看。') };
       const data = await invoke<string>('v1_attachment_base64', { messageId });
       return { kind: 'plugin', html: plugin.html, bytes: base64ToBytes(data) };
     }
     const preview = await invoke<TextPreview | null>('v1_read_text_attachment', { messageId });
-    if (!preview) return { kind: 'unsupported', reason: '文件过大、不是文本或无法读取，未能预览' };
+    if (!preview) return { kind: 'unsupported', reason: t('文件过大、不是文本或无法读取，未能预览') };
     const textKind = preview.kind === 'markdown' ? 'markdown' : preview.kind === 'html' ? 'html' : 'text';
     return { kind: textKind, text: preview.text };
   }
@@ -302,7 +304,7 @@ export class DirectChat {
   async openSystemById(messageId: string): Promise<void> {
     try { await invoke('v1_open_attachment', { messageId }); }
     catch (error) {
-      const text = typeof error === 'string' ? error : '无法打开文件';
+      const text = trError(error, t('无法打开文件'));
       this.status('#direct-file-status', text);
       workspace.notify(text);
     }
@@ -312,18 +314,58 @@ export class DirectChat {
     return this.openSystemById(message.id);
   }
 
+  /// Text bubble menu: withdraw inside the two-minute window, copy otherwise.
+  private textMenu(event: MouseEvent, message: DirectMessage): void {
+    const items = [];
+    if (this.canRecall(message)) {
+      items.push({ label: t('撤回'), danger: true, run: () => { void this.recall(message); } });
+    }
+    items.push({ label: t('复制文字'), run: () => { void navigator.clipboard?.writeText(message.body).catch(() => {}); } });
+    showContextMenu(event, items);
+  }
+
+  private canRecall(message: DirectMessage): boolean {
+    if (message.sender === this.peer || message.recalled_at) return false;
+    return Date.now() / 1000 - message.created_at <= 120;
+  }
+
+  async recall(message: DirectMessage): Promise<void> {
+    if (!isTauri()) return;
+    try {
+      const result = await invoke<string>('v1_recall_message', { kind: 'direct', id: message.id, groupId: null });
+      if (result === 'recalled') {
+        message.recalled_at = Math.floor(Date.now() / 1000);
+        message.body = ' ';
+        this.paint('auto');
+        this.onChangeConversations();
+      } else if (result === 'too_late') {
+        this.status('#direct-file-status', t('超过 2 分钟，不能再撤回'));
+      } else if (result === 'missing') {
+        this.status('#direct-file-status', t('这条消息已经不存在'));
+      }
+    } catch (error) {
+      this.status('#direct-file-status', trError(error, t('撤回失败')));
+    }
+  }
+
   /// Right-click on a file bubble: open with the default app, reveal it, or preview it.
   private fileMenu(event: MouseEvent, message: DirectMessage): void {
     const name = message.file_name ?? message.body;
     if (message.file_status !== 'completed') {
-      showContextMenu(event, [{ label: '文件尚未接收完成', run: () => {} }]);
+      const items = [];
+      if (message.sender !== this.peer && this.canRecall(message)) {
+        items.push({ label: t('撤回并取消发送'), danger: true, run: () => { void this.recall(message); } });
+      }
+      items.push({ label: t('文件尚未接收完成'), run: () => {} });
+      showContextMenu(event, items);
       return;
     }
     showContextMenu(event, [
-      { label: '用默认程序打开', run: () => { void this.openWithSystem(message); } },
-      { label: '打开所在目录', run: () => { void this.reveal(message.id); } },
-      { label: '预览', run: () => { this.openPreview(message); } },
-      { label: '复制文件名', run: () => { void navigator.clipboard?.writeText(name).catch(() => {}); } },
+      { label: t('用默认程序打开'), run: () => { void this.openWithSystem(message); } },
+      { label: t('打开所在目录'), run: () => { void this.reveal(message.id); } },
+      { label: t('预览'), run: () => { this.openPreview(message); } },
+      { label: t('复制文件名'), run: () => { void navigator.clipboard?.writeText(name).catch(() => {}); } },
+      ...(this.canRecall(message) ? [{ label: t('撤回（已接收的文件保留）'), danger: true, run: () => { void this.recall(message); } }] : []),
     ]);
   }
 
@@ -331,7 +373,7 @@ export class DirectChat {
     if (!isTauri()) return;
     try { await invoke('v1_reveal_attachment', { messageId }); }
     catch (error) {
-      const text = typeof error === 'string' ? error : '无法打开文件所在目录';
+      const text = trError(error, t('无法打开文件所在目录'));
       this.status('#direct-file-status', text);
       workspace.notify(text);
     }
@@ -359,9 +401,9 @@ export class DirectChat {
         const input = this.root.querySelector<HTMLInputElement>('#direct-address');
         if (input && document.activeElement !== input) input.value = this.addressDrafts.get(peer) ?? this.address;
       }
-    } catch { this.status('#direct-address-status', '无法读取联系人地址'); }
+    } catch { this.status('#direct-address-status', t('无法读取联系人地址')); }
     await this.load(false, true);
-    if (!this.address) this.status('#direct-address-status', '尚未记录对方地址：消息会一直显示“待发送”，请填入对方 IP:端口并保存地址。');
+    if (!this.address) this.status('#direct-address-status', t('尚未记录对方地址：消息会一直显示“待发送”，请填入对方 IP:端口并保存地址。'));
     void this.loadOffers();
     this.startPolling();
   }
@@ -401,7 +443,7 @@ export class DirectChat {
       await this.loadBatches();
       if (older || initial) this.hasOlder = batch.length === 200;
       if (changed || older || initial) this.paint(initial ? 'bottom' : older ? 'preserve' : 'auto');
-    } catch { if (generation === this.generation) this.status('#direct-error', '无法读取单聊记录'); }
+    } catch { if (generation === this.generation) this.status('#direct-error', t('无法读取单聊记录')); }
     finally { if (generation === this.generation) this.loading = false; }
   }
 
@@ -415,7 +457,7 @@ export class DirectChat {
       if (!isTauri() || this.messages.length === before) break;
     }
     const node = this.root.querySelector<HTMLElement>(`#direct-messages [data-id="${messageId}"]`);
-    if (!node) { this.status('#direct-error', '该消息暂不在本机记录中'); return; }
+    if (!node) { this.status('#direct-error', t('该消息暂不在本机记录中')); return; }
     node.scrollIntoView({ block: 'center' });
     node.classList.add('jump-target');
     window.setTimeout(() => node.classList.remove('jump-target'), 1600);
@@ -455,12 +497,12 @@ export class DirectChat {
     const holder = this.root.querySelector<HTMLElement>(`[data-preview="${id}"]`);
     if (!url || !holder || holder.firstChild) return;
     const image = document.createElement('img');
-    image.src = url; image.alt = '聊天图片'; image.className = 'message-image';
+    image.src = url; image.alt = t('聊天图片'); image.className = 'message-image';
     image.addEventListener('click', (event) => {
       event.stopPropagation();
       const message = this.messages.find(item => item.id === id);
       if (this.imageOpenMode === 'workspace' && message) { this.openPreview(message); return; }
-      showImage(url, '聊天图片');
+      showImage(url, t('聊天图片'));
     });
     holder.append(image);
   }
@@ -489,20 +531,20 @@ export class DirectChat {
       const text = document.createElement('div'); text.className = 'offer-text';
       const title = document.createElement('div'); title.className = 'file-title'; title.textContent = offer.name;
       const meta = document.createElement('small'); meta.className = 'file-meta';
-      meta.textContent = `${formatSize(offer.total)} · ${new Date(offer.created_at * 1000).toLocaleString()} · 等待确认`;
+      meta.textContent = `${formatSize(offer.total)} · ${new Date(offer.created_at * 1000).toLocaleString()}${t('· 等待确认')}`;
       text.append(title, meta);
       const actions = document.createElement('div'); actions.className = 'file-actions';
       const accept = document.createElement('button');
-      accept.className = 'outline'; accept.textContent = '接收';
+      accept.className = 'outline'; accept.textContent = t('接收');
       accept.dataset.action = 'accept-file-offer'; accept.dataset.id = offer.message_id;
       const remember = document.createElement('button');
-      remember.className = 'outline'; remember.textContent = '接收并不再询问';
+      remember.className = 'outline'; remember.textContent = t('接收并不再询问');
       remember.dataset.action = 'accept-file-offer-remember'; remember.dataset.id = offer.message_id;
       const saveAs = document.createElement('button');
-      saveAs.className = 'outline'; saveAs.textContent = '另存为…';
+      saveAs.className = 'outline'; saveAs.textContent = t('另存为…');
       saveAs.dataset.action = 'saveas-file-offer'; saveAs.dataset.id = offer.message_id;
       const reject = document.createElement('button');
-      reject.className = 'linkish'; reject.textContent = '拒绝';
+      reject.className = 'linkish'; reject.textContent = t('拒绝');
       reject.dataset.action = 'reject-file-offer'; reject.dataset.id = offer.message_id;
       actions.append(accept, remember, saveAs, reject);
       card.append(text, actions);
@@ -520,19 +562,19 @@ export class DirectChat {
       await invoke('v1_resolve_file_offer', { id, accept, dir: options.dir ?? null });
       this.offers = this.offers.filter(offer => offer.message_id !== id);
       this.paintOffers();
-      const saved = options.dir ? '，将保存到你选择的文件夹' : '';
-      this.status('#direct-file-status', accept ? `已接受${saved}，等待对方重新发送` : '已拒绝该文件');
-    } catch (error) { this.status('#direct-error', typeof error === 'string' ? error : '无法更新文件确认状态'); }
+      const saved = options.dir ? t('，将保存到你选择的文件夹') : '';
+      this.status('#direct-file-status', accept ? `${t('已接受')}${saved}${t('，等待对方重新发送')}` : t('已拒绝该文件'));
+    } catch (error) { this.status('#direct-error', trError(error, t('无法更新文件确认状态'))); }
   }
 
   /// Ask for a folder and accept this one file into it.
   async saveOfferAs(id: string): Promise<void> {
     if (!isTauri() || !id) return;
     try {
-      const picked = await open({ directory: true, multiple: false, title: '选择该文件的保存位置' });
+      const picked = await open({ directory: true, multiple: false, title: t('选择该文件的保存位置') });
       if (typeof picked !== 'string') return;
       await this.resolveOffer(id, true, { dir: picked });
-    } catch (error) { this.status('#direct-error', typeof error === 'string' ? error : '无法选择保存位置'); }
+    } catch (error) { this.status('#direct-error', trError(error, t('无法选择保存位置'))); }
   }
 
   private paint(mode: 'bottom' | 'preserve' | 'auto'): void {
@@ -551,6 +593,15 @@ export class DirectChat {
       const incoming = message.sender === this.peer;
       const row = document.createElement('div'); row.className = `message-row${incoming ? ' incoming' : ''}`; row.dataset.id = message.id;
       const column = document.createElement('div'); column.className = 'message-column';
+      if (message.recalled_at) {
+        const note = document.createElement('div');
+        note.className = 'message-bubble recalled';
+        note.textContent = incoming ? `${this.name || t('对方')}${t('撤回了一条消息')}` : t('你撤回了一条消息');
+        column.append(note);
+        row.append(column);
+        list.append(row);
+        continue;
+      }
       const batch = this.batches.get(message.id);
       if (batch) {
         // Only the first child paints the shared bubble; the rest are skipped.
@@ -593,10 +644,10 @@ export class DirectChat {
         if (message.file_status === 'completed') {
           const actions = document.createElement('div'); actions.className = 'file-actions';
           const preview = document.createElement('button');
-          preview.className = 'linkish'; preview.textContent = '预览';
+          preview.className = 'linkish'; preview.textContent = t('预览');
           preview.dataset.action = 'direct-preview'; preview.dataset.id = message.id;
           const reveal = document.createElement('button');
-          reveal.className = 'linkish'; reveal.textContent = '打开所在目录';
+          reveal.className = 'linkish'; reveal.textContent = t('打开所在目录');
           reveal.dataset.action = 'direct-reveal'; reveal.dataset.id = message.id;
           actions.append(preview, reveal);
           bubble.append(actions);
@@ -605,11 +656,12 @@ export class DirectChat {
         this.ensurePreview(message);
       } else {
         const body = document.createElement('div'); body.className = 'message-bubble'; body.append(linkifiedText(message.body));
+        body.addEventListener('contextmenu', (event) => this.textMenu(event, message));
         column.append(body);
       }
       if (!incoming) {
         const status = document.createElement('small'); status.className = 'message-status';
-        status.textContent = message.kind === 'file' ? '' : message.status === 'delivered' ? '已送达' : '待发送';
+        status.textContent = message.kind === 'file' ? '' : message.status === 'delivered' ? t('已送达') : t('待发送');
         if (status.textContent) column.append(status);
       }
       row.append(column); list.append(row);
@@ -637,11 +689,11 @@ export class DirectChat {
 
 function fileStatus(message: DirectMessage): string {
   const status: string = message.file_status ?? 'pending';
-  if (status === 'transferring') return `传输中 ${formatSize(message.file_transferred ?? 0)} / ${formatSize(message.file_size ?? 0)}`;
-  if (status === 'completed') return '已完成';
-  if (status === 'failed') return message.file_error ?? '失败';
-  if (status === 'paused') return message.file_error ?? '已暂停';
-  return '等待对方';
+  if (status === 'transferring') return `${t('传输中')}${formatSize(message.file_transferred ?? 0)} / ${formatSize(message.file_size ?? 0)}`;
+  if (status === 'completed') return t('已完成');
+  if (status === 'failed') return message.file_error ?? t('失败');
+  if (status === 'paused') return message.file_error ?? t('已暂停');
+  return t('等待对方');
 }
 
 function previewKind(name: string): 'image' | 'pdf' | 'html' | 'markdown' | 'text' | 'other' {
@@ -699,7 +751,7 @@ function markdownToHtml(source: string): string {
 }
 
 function formatSize(bytes: number | null): string {
-  if (!bytes || bytes < 0) return '未知大小';
+  if (!bytes || bytes < 0) return t('未知大小');
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
@@ -711,10 +763,10 @@ function fileMeta(message: DirectMessage, incoming: boolean): string {
   const percent = message.file_size ? Math.min(100, Math.round(((message.file_transferred ?? 0) / message.file_size) * 100)) : 0;
   const label = (() => {
     switch (message.file_status) {
-      case 'completed': return incoming ? '已接收' : '已发送';
-      case 'transferring': return `${incoming ? '接收中' : '发送中'} ${percent}%`;
-      case 'failed': return `${incoming ? '接收中断' : '发送失败'}${message.file_error ? `：${message.file_error}` : ' · 重新连接后可续传'}`;
-      default: return incoming ? '等待接收' : '等待对方在线';
+      case 'completed': return incoming ? t('已接收') : t('已发送');
+      case 'transferring': return `${incoming ? t('接收中') : t('发送中')} ${percent}%`;
+      case 'failed': return `${incoming ? t('接收中断') : t('发送失败')}${message.file_error ? `：${message.file_error}` : t(' · 重新连接后可续传')}`;
+      default: return incoming ? t('等待接收') : t('等待对方在线');
     }
   })();
   return `${size} · ${label}`;

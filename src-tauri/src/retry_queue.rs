@@ -51,6 +51,7 @@ impl RetryQueue {
             let mut direct_cursor: Option<String> = None;
             let mut group_cursor: Option<String> = None;
             let mut control_cursor: Option<String> = None;
+            let mut recall_cursor: Option<String> = None;
             let mut backoff: BTreeMap<String, Backoff> = BTreeMap::new();
             loop {
                 if receiver.try_recv().is_ok() { break; }
@@ -113,6 +114,27 @@ impl RetryQueue {
                         let _gate = Gate(Arc::clone(&busy));
                         let success = address::parse_manual_address(&item.address).is_ok_and(|address| {
                             chat_transport::send_control_one(&identity, &store, &item.target, address, &item).is_ok()
+                        });
+                        record(&mut backoff, key, success);
+                        worked = true;
+                    }
+                }
+
+                let recall = match store.lock() {
+                    Ok(store) => match store.next_pending_recall(recall_cursor.as_deref()) {
+                        Ok(Some(item)) => Some(item),
+                        Ok(None) => { recall_cursor = None; None },
+                        Err(_) => None,
+                    },
+                    Err(_) => None,
+                };
+                if let Some(item) = recall {
+                    recall_cursor = Some(item.peer.clone());
+                    let key = format!("recall:{}", item.peer);
+                    if ready(&backoff, &key) && !busy.swap(true, Ordering::AcqRel) {
+                        let _gate = Gate(Arc::clone(&busy));
+                        let success = address::parse_manual_address(&item.address).is_ok_and(|address| {
+                            chat_transport::send_recall_one(&identity, &store, &item.peer, address, &item.id, &item.message_id).is_ok()
                         });
                         record(&mut backoff, key, success);
                         worked = true;

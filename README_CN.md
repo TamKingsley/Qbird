@@ -1,35 +1,34 @@
-# QBird（暂定名称：青鸟）
+# Qbird
 
-**轻巧、本地优先的局域网聊天工具。**
+**面向局域网设备直连的本地优先聊天工具。**
 
-[English](README.md) · [简体中文](README_CN.md)
+[English](README.md) · 简体中文
 
-QBird 是一款开源桌面聊天工具，面向局域网内的直接通信。目标是无需托管中转服务器或账号服务即可开箱运行，并让数据保存在用户自己的设备上。
+Qbird 是一款 Windows 桌面应用，可发现附近的 Qbird 用户并让设备之间直接通信。应用不依赖托管中转服务器或账号服务；聊天记录与身份数据保存在本机。
 
-> **0.1.12-beta · Windows x64 开发预览版。** 项目尚未经过独立安全审计，本地数据库未加密。请勿将此 beta 版用于敏感信息或生产通信。
+> **0.1.13 · Windows x64 预览版。** Qbird 尚未经过独立安全审计。本地 SQLite 数据库未加密，应用锁仅隐藏界面。请勿将此预览版用于敏感信息或生产通信。局域网发现会广播应用中设置的昵称和用户名。
 
 ## 界面预览
 
-![Qbird 局域网发现页面，使用虚构演示数据](docs/assets/qbird-demo.png)
+![Qbird 0.1.13 消息页面](docs/assets/qbird-demo.png)
 
-*画面中的联系人和网络地址均为虚构演示数据。*
-
-## 项目方向
-
-基础架构计划保持轻巧，聚焦身份、局域网发现、聊天与本地数据。可选能力应通过插件增加，而不是不断扩张核心。更丰富的侧边栏文件预览和 AI Bot 接入是路线图示例，**目前尚未交付**。当前应用包含实验性的本地只读预览插件宿主，但还不是稳定通用的插件 API。
+*截图来自当前版本的隔离本机配置，不含个人数据。*
 
 ## 当前功能
 
-- 局域网发现、联系人与身份识别。
-- 自聊、群聊、本地聊天记录及文件/图片传输。
-- 本地导出与备份工具，以及支持格式的标签式预览工作区。
-- 实验性的只读预览插件宿主，见[插件说明](docs/PLUGIN.md)。
+- 局域网发现、联系人申请、身份指纹与单聊；也可在需要时通过已知地址添加对方。
+- 单聊、群聊和自聊，支持本地记录、消息搜索、回复与群组 @ 提及。
+- 本地文件和图片传输、失败重试与续传、可配置接收目录及附件存储配额。
+- 新消息提醒、系统托盘控制，以及最小化到托盘后在后台继续运行。
+- 加密且受密码保护的聊天备份，以及当前会话聊天记录的导入/导出。备份不包含身份私钥和附件文件。
+- 标签式工作区，内置图片、PDF、文本/日志、CSV、JSON、Markdown、禁用脚本的 HTML 和网页链接预览。额外的本地预览插件仍属实验性只读功能，见[插件说明](docs/PLUGIN.md)。
+- 界面框架及部分区域可选简体中文、繁体中文和英文；聊天页面与部分后端提示尚未完全翻译。
 
-Qbird 使用 Tauri、Rust、TypeScript、Vite 和 SQLite 构建。点对点通信不依赖托管中转服务器。Windows 版的局域网发现会广播用户设置的昵称和用户名。
+Qbird 使用 Tauri、Rust、TypeScript、Vite 和 SQLite 构建，点对点通信不经过托管中转服务器。预览插件的权限边界见[插件说明](docs/PLUGIN.md)。
 
 ## 从源码运行
 
-**当前支持平台：** Windows 10/11 x64。需要 Visual Studio 2022 C++ Build Tools（含 Windows SDK）、Rust（`stable-x86_64-pc-windows-msvc`）、Node.js 22 及以上、pnpm 11.22.0 和 WebView2 Runtime。
+**当前支持的构建平台：** Windows 10/11 x64。需要 Visual Studio 2022 C++ Build Tools（含 Windows SDK）、Rust（`stable-x86_64-pc-windows-msvc`）、Node.js 22 及以上、pnpm 11.22.0 和 WebView2 Runtime。
 
 ```bash
 git clone https://github.com/TamKingsley/Qbird.git
@@ -40,7 +39,7 @@ pnpm tauri dev
 
 ## 参与共创
 
-Qbird 欢迎社区审阅与共创。如果你认同这个方向，欢迎给仓库点 **Star**、Fork 试验，或通过 [Issue](https://github.com/TamKingsley/Qbird/issues) 报告问题、提出需求。欢迎提交聚焦的 PR；涉及身份、密码学或通信协议的改动，请先在 Issue 讨论。
+欢迎提交聚焦的 PR 或通过 [Issue](https://github.com/TamKingsley/Qbird/issues) 报告问题。涉及身份、密码学或通信协议的改动，请先在 Issue 中讨论。
 
 ## 许可证
 

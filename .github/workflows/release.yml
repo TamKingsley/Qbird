@@ -1,0 +1,125 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify-ci:
+    name: Require successful main CI
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify version tag
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Expected a version tag like v0.1.13; got $RELEASE_TAG" >&2
+            exit 1
+          fi
+      - name: Wait for CI on the tagged commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          deadline=$((SECONDS + 2400))
+          while (( SECONDS < deadline )); do
+            runs=$(gh run list --repo "$GH_REPO" --workflow ci.yml --commit "$RELEASE_SHA" --json databaseId,event,headBranch,status,conclusion,createdAt --limit 20)
+            state=$(jq -r '[.[] | select(.event == "push" and .headBranch == "main")] | sort_by(.createdAt) | if length == 0 then "missing" else last | if .status == "completed" then (if .conclusion == "success" then "success" else "failed" end) else "running" end end' <<< "$runs")
+            if [[ "$state" == "success" ]]; then
+              echo "Successful main CI confirmed for $RELEASE_SHA"
+              exit 0
+            fi
+            if [[ "$state" == "failed" ]]; then
+              echo "Main CI failed for $RELEASE_SHA; refusing to publish" >&2
+              exit 1
+            fi
+            echo "Waiting for main CI ($state) on $RELEASE_SHA..."
+            sleep 20
+          done
+          echo "Timed out waiting for main CI; refusing to publish" >&2
+          exit 1
+
+  build-and-release:
+    name: Build Windows installer and portable ZIP
+    needs: verify-ci
+    runs-on: windows-latest
+    steps:
+      - name: Resolve release tag
+        id: release
+        shell: pwsh
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          $tag = $env:REF_NAME
+          if ($tag -notmatch '^v\d+\.\d+\.\d+$') { throw "Invalid release tag: $tag" }
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "version=$($tag.Substring(1))" >> $env:GITHUB_OUTPUT
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.release.outputs.tag }}
+      - name: Verify package version matches tag
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          $package = Get-Content 'package.json' -Raw | ConvertFrom-Json
+          if ($package.version -ne $env:RELEASE_VERSION) { throw "Tag version $env:RELEASE_VERSION does not match package version $($package.version)" }
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.22.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Build NSIS installer
+        run: pnpm tauri build --bundles nsis
+      - name: Assemble release assets
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $assets = Join-Path $env:GITHUB_WORKSPACE 'release-assets'
+          $portable = Join-Path $assets 'portable'
+          New-Item -ItemType Directory -Force -Path $portable | Out-Null
+
+          $installer = Get-ChildItem 'src-tauri/target/release/bundle/nsis' -Filter '*.exe' | Select-Object -First 1
+          if (-not $installer) { throw 'NSIS installer was not produced' }
+          Copy-Item $installer.FullName (Join-Path $assets "Qbird-$env:VERSION-windows-x64-setup.exe")
+
+          $app = 'src-tauri/target/release/qbird.exe'
+          if (-not (Test-Path $app)) { throw "Portable application executable not found: $app" }
+          Copy-Item $app (Join-Path $portable 'Qbird.exe')
+          Copy-Item 'LICENSE' (Join-Path $portable 'LICENSE')
+          @('Qbird portable build', '', 'Windows 10/11 x64. The Microsoft WebView2 Runtime must already be installed.', 'This ZIP does not install WebView2 or add Start Menu shortcuts.', 'Qbird stores its profile and chat history locally. The local database is not encrypted.', 'Qbird has not received an independent security audit; do not use this preview for sensitive or production communication.', 'See the repository README for features and limitations.') -join [Environment]::NewLine | Set-Content -Encoding utf8 (Join-Path $portable 'README.txt')
+          Compress-Archive -Path (Join-Path $portable '*') -DestinationPath (Join-Path $assets "Qbird-$env:VERSION-windows-x64-portable.zip") -CompressionLevel Optimal
+          Get-ChildItem $assets -File | Select-Object Name,Length | Format-Table -AutoSize
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release.outputs.tag }}
+          name: Qbird ${{ steps.release.outputs.tag }}
+          prerelease: true
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          overwrite_files: true
+          files: |
+            release-assets/*.exe
+            release-assets/*.zip

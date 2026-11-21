@@ -116,6 +116,35 @@ impl Discovery {
         Ok(())
     }
 
+    /// Withdraws the local service record without stopping discovery.
+    pub fn unadvertise(&mut self) {
+        if let Some(name) = self.registered_name.take() {
+            let _ = self.daemon.unregister(&name);
+        }
+    }
+
+    pub fn is_advertised(&self) -> bool { self.registered_name.is_some() }
+
+    /// Re-publishes on a known port, used when visibility is switched back on.
+    pub fn advertise_port(&mut self, port: u16, random_instance: &str, properties: &[(&str, &str)])
+        -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if self.registered_name.is_some() || port == 0 || random_instance.is_empty() || random_instance.len() > 32
+            || !random_instance.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid service instance").into());
+        }
+        for (key, value) in properties {
+            if key.is_empty() || key.len() > 32 || value.len() > 192 {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid announcement").into());
+            }
+        }
+        let hostname = format!("qbird-{random_instance}.local.");
+        let info = ServiceInfo::new(SERVICE_TYPE, random_instance, &hostname, "", port, properties)?.enable_addr_auto();
+        let fullname = info.get_fullname().to_string();
+        self.daemon.register(info)?;
+        self.registered_name = Some(fullname);
+        Ok(())
+    }
+
     pub fn candidates(&self) -> Result<Vec<Candidate>, &'static str> {
         Ok(self.entries.lock().map_err(|_| "discovery unavailable")?.values().cloned().collect())
     }

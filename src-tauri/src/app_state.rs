@@ -92,6 +92,9 @@ fn notify_contact_async(identity: Arc<Identity>, store: Arc<Mutex<Store>>, peer:
         .map(|profile| crate::probe::ContactAnnounce {
             nickname: profile.nickname,
             username: Some(profile.username).filter(|value| !value.is_empty()),
+            kind: None,
+            address: None,
+            reason: None,
         });
     if let Some(announce) = announce {
         std::thread::spawn(move || { let _ = crate::probe::announce_contact(&identity, parsed, &announce); });
@@ -1922,6 +1925,43 @@ pub fn v1_list_conversations(state: tauri::State<'_, AppState>) -> Result<Vec<cr
     state.store.lock().map_err(|_| "本地存储不可用".to_owned())?.list_conversations(&state.identity.fingerprint()).map_err(|_| "无法读取会话".to_owned())
 }
 
+/// Opens (or focuses) the standalone chat-records window for one conversation.
+#[tauri::command]
+pub fn v1_open_records_window(app: tauri::AppHandle, kind: String, id: String) -> Result<(), String> {
+    use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
+    let label = match kind.as_str() {
+        "self" => "records-self".to_string(),
+        "direct" => format!("records-direct-{}", id),
+        "group" => format!("records-group-{}", id),
+        _ => return Err("会话类型无效".to_owned()),
+    };
+    if let Some(window) = app.get_webview_window(&label) {
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+        return Ok(());
+    }
+    let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/32x32.png"))
+        .map_err(|error| error.to_string())?;
+    WebviewWindowBuilder::new(&app, &label, WebviewUrl::App(format!("records.html?kind={kind}&id={id}").into()))
+        .title("聊天记录").inner_size(880.0, 620.0).min_inner_size(600.0, 420.0)
+        .icon(icon).map_err(|error| error.to_string())?
+        .build().map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+/// Closes the webview window that asked for it (records windows).
+#[tauri::command]
+pub fn v1_close_current_window(window: tauri::Window) -> Result<(), String> {
+    window.close().map_err(|error| error.to_string())
+}
+
+/// Deletes selected local messages of one conversation by id.
+#[tauri::command]
+pub fn v1_delete_messages(state: tauri::State<'_, AppState>, kind: String, id: String, ids: Vec<String>) -> Result<u64, String> {
+    state.store.lock().map_err(|_| "本地存储不可用".to_owned())?
+        .delete_messages(&kind, &id, &ids).map(|count| count as u64).map_err(|_| "无法删除所选消息".to_owned())
+}
+
 #[tauri::command]
 pub fn v1_list_self_messages(state: tauri::State<'_, AppState>, limit: u32, offset: u32) -> Result<Vec<crate::storage::LocalMessage>, String> {
     state.store.lock().map_err(|_| "本地存储不可用".to_owned())?.list_self_messages(limit, offset).map_err(|_| "无法读取自聊记录".to_owned())
@@ -2307,6 +2347,23 @@ pub fn v1_group_attachment_path(state: tauri::State<'_, AppState>, group_id: Str
     progress.target_path.ok_or_else(|| "本地附件路径缺失".to_owned())
 }
 
+/// Reads the current announcement of one group.
+#[tauri::command]
+pub fn v1_group_notice(state: tauri::State<'_, AppState>, group_id: String) -> Result<Option<String>, String> {
+    state.store.lock().map_err(|_| "本地存储不可用".to_owned())?
+        .group_notice(&group_id).map_err(|_| "无法读取群公告".to_owned())
+}
+
+/// Publishes or clears (empty string) the group announcement; owner only.
+#[tauri::command]
+pub fn v1_set_group_notice(state: tauri::State<'_, AppState>, group_id: String, notice: String) -> Result<(), String> {
+    let actor = state.identity.fingerprint();
+    let now = unix_now()?;
+    let updated = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?
+        .set_group_notice(&group_id, &actor, &notice, now).map_err(|_| "无法保存群公告".to_owned())?;
+    if updated { Ok(()) } else { Err("只有群主可以设置群公告".into()) }
+}
+
 #[tauri::command]
 pub fn v1_transfer_group_owner(state: tauri::State<'_, AppState>, group_id: String, member: String) -> Result<(), String> {
     let actor = state.identity.fingerprint();
@@ -2526,6 +2583,198 @@ pub fn v1_leave_group(state: tauri::State<'_, AppState>, group_id: String) -> Re
     let left = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?
         .leave_group(&group_id, &self_id, now).map_err(|_| "无法退出群聊".to_owned())?;
     if left { Ok(()) } else { Err("群主不能退出群聊".into()) }
+}
+
+fn local_contact_address(state: &AppState) -> Option<String> {
+    let port = state.probe_service.lock().ok().and_then(|guard| guard.as_ref().map(|service| service.port()))?;
+    let ip = crate::diagnostics::local_ipv4_addresses().into_iter().next()?;
+    Some(format!("{ip}:{port}"))
+}
+
+fn announce_status(identity: Arc<Identity>, store: Arc<Mutex<Store>>, peer: &str, address: String,
+    kind: &'static str, reason: Option<String>) {
+    let _ = peer;
+    let Some(parsed) = crate::address::parse_manual_address(&address).ok() else { return };
+    let announce = store.lock().ok().and_then(|store| store.get_profile().ok())
+        .map(|profile| crate::probe::ContactAnnounce {
+            nickname: profile.nickname,
+            username: Some(profile.username).filter(|value| !value.is_empty()),
+            kind: Some(kind.to_owned()),
+            address: None,
+            reason,
+        });
+    if let Some(announce) = announce {
+        std::thread::spawn(move || { let _ = crate::probe::announce_contact(&identity, parsed, &announce); });
+    }
+}
+
+/// Files a friend request and sends it; `accepted` means the peer auto-accepted.
+#[tauri::command]
+pub fn v1_request_contact(state: tauri::State<'_, AppState>, peer: String) -> Result<String, String> {
+    let store = Arc::clone(&state.store);
+    let profile = store.lock().map_err(|_| "本地存储不可用".to_owned())?
+        .get_profile().map_err(|_| "无法读取资料".to_owned())?;
+    let now = unix_now()?;
+    let address = store.lock().map_err(|_| "本地存储不可用".to_owned())?
+        .contact_address(&peer).map_err(|_| "无法读取地址".to_owned())?;
+    let Some(address) = address else { return Err("还没有对方地址，请先探测该用户".into()); };
+    {
+        let store = store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+        if store.is_verified(&peer).map_err(|_| "本地存储不可用".to_owned())? {
+            return Ok("verified".into());
+        }
+        store.create_contact_request("out", &peer, &profile.nickname,
+            Some(profile.username.as_str()).filter(|value| !value.is_empty()),
+            Some(address.as_str()), now).map_err(|_| "无法保存申请".to_owned())?;
+    }
+    let local = local_contact_address(&state);
+    let identity = Arc::clone(&state.identity);
+    let target = address.clone();
+    let nickname = profile.nickname.clone();
+    let username = profile.username.clone();
+    let accepted = std::thread::spawn(move || {
+        let announce = crate::probe::ContactAnnounce {
+            nickname,
+            username: Some(username).filter(|value| !value.is_empty()),
+            kind: Some("request".into()),
+            address: local,
+            reason: None,
+        };
+        crate::address::parse_manual_address(&target).ok()
+            .and_then(|parsed| crate::probe::announce_contact(&identity, parsed, &announce).ok())
+            .unwrap_or(false)
+    }).join().unwrap_or(false);
+    if accepted {
+        store.lock().map_err(|_| "本地存储不可用".to_owned())?
+            .resolve_contact_request_by_peer(&peer, "out", true, now).map_err(|_| "无法更新申请".to_owned())?;
+        return Ok("accepted".into());
+    }
+    Ok("pending".into())
+}
+
+#[tauri::command]
+pub fn v1_contact_requests(state: tauri::State<'_, AppState>, direction: String)
+    -> Result<Vec<crate::storage::ContactRequest>, String> {
+    state.store.lock().map_err(|_| "本地存储不可用".to_owned())?
+        .list_contact_requests(&direction).map_err(|_| "无法读取好友申请".to_owned())
+}
+
+#[tauri::command]
+pub fn v1_respond_contact_request(state: tauri::State<'_, AppState>, id: String, accept: bool) -> Result<(), String> {
+    let now = unix_now()?;
+    let request = {
+        let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+        store.resolve_contact_request(&id, accept, now).map_err(|_| "无法处理申请".to_owned())?
+    };
+    if let Some(request) = request {
+        if let Some(address) = request.address.clone() {
+            announce_status(Arc::clone(&state.identity), Arc::clone(&state.store), &request.peer, address,
+                if accept { "accept" } else { "reject" },
+                if accept { None } else { Some("rejected".into()) });
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn v1_withdraw_contact_request(state: tauri::State<'_, AppState>, peer: String) -> Result<bool, String> {
+    state.store.lock().map_err(|_| "本地存储不可用".to_owned())?
+        .withdraw_contact_request(&peer).map_err(|_| "无法撤回申请".to_owned())
+}
+
+#[tauri::command]
+pub fn v1_lan_visibility(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+    state.store.lock().map_err(|_| "本地存储不可用".to_owned())?
+        .lan_visible().map_err(|_| "无法读取可见性".to_owned())
+}
+
+#[tauri::command]
+pub fn v1_set_lan_visibility(state: tauri::State<'_, AppState>, visible: bool) -> Result<bool, String> {
+    state.store.lock().map_err(|_| "本地存储不可用".to_owned())?
+        .set_lan_visible(visible).map_err(|_| "无法保存可见性".to_owned())?;
+    if let Ok(mut guard) = state.probe_service.lock() {
+        if let Some(service) = guard.as_mut() { service.set_visible(visible); }
+    }
+    Ok(visible)
+}
+
+/// Withdraws one message inside the two-minute window.
+#[tauri::command]
+pub fn v1_recall_message(state: tauri::State<'_, AppState>, kind: String, id: String, group_id: Option<String>) -> Result<String, String> {
+    let me = state.identity.fingerprint();
+    let now = unix_now()?;
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    let result = match kind.as_str() {
+        "direct" => store.recall_direct(&me, &id, now),
+        "group" => {
+            let Some(group_id) = group_id else { return Err("缺少群标识".into()); };
+            store.recall_group(&me, &group_id, &id, now)
+        }
+        _ => return Err("未知的消息类型".into()),
+    }.map_err(|_| "无法撤回消息".to_owned())?;
+    Ok(match result {
+        crate::storage::RecallResult::Recalled { .. } => "recalled".into(),
+        crate::storage::RecallResult::TooLate => "too_late".into(),
+        crate::storage::RecallResult::NotYours => "not_yours".into(),
+        crate::storage::RecallResult::Missing => "missing".into(),
+        crate::storage::RecallResult::Already => "already".into(),
+        crate::storage::RecallResult::NotMember => "not_member".into(),
+    })
+}
+
+#[tauri::command]
+pub fn v1_cancel_file_transfer(state: tauri::State<'_, AppState>, message_id: String) -> Result<bool, String> {
+    let now = unix_now()?;
+    state.store.lock().map_err(|_| "本地存储不可用".to_owned())?
+        .cancel_file(&message_id, now).map_err(|_| "无法取消文件".to_owned())
+}
+
+#[tauri::command]
+pub fn v1_list_dissolved_groups(state: tauri::State<'_, AppState>)
+    -> Result<Vec<crate::storage::DissolvedGroup>, String> {
+    let me = state.identity.fingerprint();
+    state.store.lock().map_err(|_| "本地存储不可用".to_owned())?
+        .list_dissolved_groups(&me).map_err(|_| "无法读取无效群".to_owned())
+}
+
+#[tauri::command]
+pub fn v1_delete_group_history(state: tauri::State<'_, AppState>, group_id: String) -> Result<bool, String> {
+    state.store.lock().map_err(|_| "本地存储不可用".to_owned())?
+        .delete_group_history(&group_id).map_err(|_| "无法删除群记录".to_owned())
+}
+
+#[derive(serde::Serialize)]
+pub struct NoticeSettings {
+    pub mode: String,
+    pub raise_window: bool,
+    pub preview: bool,
+}
+
+fn read_notice_settings(store: &crate::storage::Store) -> Result<NoticeSettings, String> {
+    let mode = store.get_setting("notice_mode").map_err(|_| "无法读取提醒设置".to_owned())?
+        .unwrap_or_else(|| "popup".into());
+    let raise_window = store.get_setting("notice_raise_window").map_err(|_| "无法读取提醒设置".to_owned())?
+        .as_deref() == Some("1");
+    let preview = store.get_setting("notice_preview").map_err(|_| "无法读取提醒设置".to_owned())?
+        .as_deref() != Some("0");
+    Ok(NoticeSettings { mode, raise_window, preview })
+}
+
+#[tauri::command]
+pub fn v1_notice_settings(state: tauri::State<'_, AppState>) -> Result<NoticeSettings, String> {
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    read_notice_settings(&store)
+}
+
+#[tauri::command]
+pub fn v1_set_notice_settings(state: tauri::State<'_, AppState>, mode: String, raise_window: bool, preview: bool)
+    -> Result<NoticeSettings, String> {
+    if !matches!(mode.as_str(), "popup" | "tray" | "off") { return Err("未知的提醒方式".into()); }
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    store.set_setting("notice_mode", Some(&mode)).map_err(|_| "无法保存提醒设置".to_owned())?;
+    store.set_setting("notice_raise_window", Some(if raise_window { "1" } else { "0" })).map_err(|_| "无法保存提醒设置".to_owned())?;
+    store.set_setting("notice_preview", Some(if preview { "1" } else { "0" })).map_err(|_| "无法保存提醒设置".to_owned())?;
+    read_notice_settings(&store)
 }
 
 #[cfg(all(test, windows))]

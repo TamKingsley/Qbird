@@ -10,6 +10,7 @@
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import { attachImageViewer } from './image_viewer';
 import { createPluginFrame } from './plugin_view';
+import { t, trError } from './i18n';
 
 export type LoadedTab =
   | { kind: 'image'; src: string }
@@ -186,7 +187,7 @@ class Workspace {
     root.className = 'workspace-panel';
     root.hidden = true;
     root.dataset.focus = 'a';
-    root.setAttribute('aria-label', '右侧工作区');
+    root.setAttribute('aria-label', t('右侧工作区'));
     root.innerHTML = `
       <div class="ws-resizer" data-ws="resizer" aria-hidden="true"></div>
       <header class="ws-header">
@@ -196,8 +197,8 @@ class Workspace {
             <div class="ws-group" data-group="b"><div class="ws-tabs" data-tabs="b" role="tablist"></div></div>
           </div>
           <div class="ws-head-actions">
-            <button type="button" class="outline ws-split" data-ws="split">分屏</button>
-            <button type="button" class="outline ws-close-all" data-ws="close-all">全部关闭</button>
+            <button type="button" class="outline ws-split" data-ws="split">${t('分屏')}</button>
+            <button type="button" class="outline ws-close-all" data-ws="close-all">${t('全部关闭')}</button>
           </div>
         </div>
         <div class="ws-toolbar" id="ws-toolbar"></div>
@@ -352,7 +353,7 @@ class Workspace {
     if (this.tabs().length >= MAX_TABS) {
       const victim = this.tabs().find((tab) => tab.key !== this.focusedTab()?.key) ?? this.tabs()[0];
       if (victim) this.closeTab(victim.key);
-      this.hint = `最多同时打开 ${MAX_TABS} 个标签，已关闭最早的标签`;
+      this.hint = `${t('最多同时打开')}${MAX_TABS}${t('个标签，已关闭最早的标签')}`;
     }
     const pane = document.createElement('div');
     pane.className = 'ws-pane';
@@ -368,7 +369,7 @@ class Workspace {
     const close = document.createElement('button');
     close.type = 'button';
     close.className = 'ws-tab-close';
-    close.setAttribute('aria-label', `关闭 ${title}`);
+    close.setAttribute('aria-label', `${t('关闭')}${title}`);
     close.textContent = '×';
     close.addEventListener('click', (event) => { event.stopPropagation(); this.closeTab(key); });
     button.append(label, close);
@@ -416,7 +417,7 @@ class Workspace {
     }
     const resolver = this.resolver;
     if (!resolver) {
-      this.paintContent(tab, { kind: 'unsupported', reason: '预览模块尚未就绪，请稍后重试' });
+      this.paintContent(tab, { kind: 'unsupported', reason: t('预览模块尚未就绪，请稍后重试') });
       return;
     }
     void resolver(tab.source)
@@ -432,7 +433,7 @@ class Workspace {
       })
       .catch((error: unknown) => {
         if (!this.tabs().includes(tab)) return;
-        this.paintContent(tab, { kind: 'error', message: typeof error === 'string' ? error : '无法读取该文件' });
+        this.paintContent(tab, { kind: 'error', message: trError(error, t('无法读取该文件')) });
       });
   }
 
@@ -501,7 +502,7 @@ class Workspace {
       this.applyLayout();
       return;
     }
-    if (this.splitButton) this.splitButton.textContent = this.split ? '取消分屏' : '分屏';
+    if (this.splitButton) this.splitButton.textContent = this.split ? t('取消分屏') : t('分屏');
     for (const group of ['a', 'b'] as const) {
       const visible = group === 'a' || this.split;
       const strip = this.strips[group];
@@ -534,7 +535,7 @@ class Workspace {
     if (existing) return;
     const placeholder = document.createElement('p');
     placeholder.className = 'ws-empty';
-    placeholder.textContent = group === 'b' ? '拖一个标签到这里，左右并排查看' : '这个分屏组还没有标签，可把标签拖进来';
+    placeholder.textContent = group === 'b' ? t('拖一个标签到这里，左右并排查看') : t('这个分屏组还没有标签，可把标签拖进来');
     body.append(placeholder);
   }
 
@@ -557,11 +558,11 @@ class Workspace {
       actions.append(button);
     };
     if (tab.url) {
-      add('刷新', () => this.reloadWeb(tab));
-      add('在系统浏览器打开', () => this.openExternal(tab.url));
+      add(t('刷新'), () => this.reloadWeb(tab));
+      add(t('在系统浏览器打开'), () => this.openExternal(tab.url));
     }
-    if (tab.actions.systemOpen) add('用默认程序打开', () => tab.actions.systemOpen?.());
-    if (tab.actions.reveal) add('打开所在目录', () => tab.actions.reveal?.());
+    if (tab.actions.systemOpen) add(t('用默认程序打开'), () => tab.actions.systemOpen?.());
+    if (tab.actions.reveal) add(t('打开所在目录'), () => tab.actions.reveal?.());
     this.toolbarEl.append(actions);
   }
 
@@ -590,7 +591,7 @@ class Workspace {
       tab.pane.append(frame);
       const tip = document.createElement('p');
       tip.className = 'ws-note';
-      tip.textContent = 'PDF 由系统 WebView2 内置阅读器渲染；若显示空白，请使用“用默认程序打开”。';
+      tip.textContent = t('PDF 由系统 WebView2 内置阅读器渲染；若显示空白，请使用“用默认程序打开”。');
       tab.pane.append(tip);
     } else if (loaded.kind === 'text') {
       const pre = document.createElement('pre');
@@ -611,13 +612,13 @@ class Workspace {
       tab.pane.append(frame);
       const tip = document.createElement('p');
       tip.className = 'ws-note';
-      tip.textContent = 'HTML 在禁用脚本的沙箱中预览；页面样式可能受应用安全策略限制。';
+      tip.textContent = t('HTML 在禁用脚本的沙箱中预览；页面样式可能受应用安全策略限制。');
       tab.pane.append(tip);
     } else if (loaded.kind === 'plugin') {
       tab.pane.append(createPluginFrame(loaded.html, loaded.bytes, tab.title));
       const tip = document.createElement('p');
       tip.className = 'ws-note';
-      tip.textContent = '插件在沙箱中运行，只能读取这个文件的字节；第一版为只读预览。';
+      tip.textContent = t('插件在沙箱中运行，只能读取这个文件的字节；第一版为只读预览。');
       tab.pane.append(tip);
     } else if (loaded.kind === 'unsupported') {
       tab.pane.append(note(loaded.reason));
@@ -639,7 +640,7 @@ class Workspace {
     frame.setAttribute('referrerpolicy', 'no-referrer');
     frame.src = url;
     frame.title = tab.title;
-    const warning = note('页面仍在加载；若长时间空白，说明站点可能禁止嵌入，或当前网络不可达。');
+    const warning = note(t('页面仍在加载；若长时间空白，说明站点可能禁止嵌入，或当前网络不可达。'));
     warning.hidden = true;
     let loaded = false;
     const timer = window.setTimeout(() => { if (!loaded) warning.hidden = false; }, WEB_LOAD_TIMEOUT);

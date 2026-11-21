@@ -46,6 +46,8 @@ pub enum Payload {
     GroupTransfer { id: String, group_id: String, name: String, owner: String, members: Vec<String> },
     /// The owner dissolved the group; members keep local history but leave the roster.
     GroupDissolve { id: String, group_id: String },
+    /// The owner's group announcement; receivers accept it only from the current owner.
+    GroupNotice { id: String, group_id: String, notice: String },
     /// Invite or member-list update; carries the same owner-controlled snapshot.
     GroupUpdate { id: String, group_id: String, name: String, owner: String, members: Vec<String> },
     /// The owner removed the receiver from the group.
@@ -64,6 +66,10 @@ pub enum Payload {
     GroupAvatarRequest { id: String, group_id: String },
     /// Base64 PNG chosen by the owner; an empty string means the group has no avatar.
     GroupAvatar { id: String, group_id: String, png: String },
+    /// Withdraw a direct message inside the recall window; the receiver keeps a placeholder.
+    RecallDirect { id: String, message_id: String },
+    /// Withdraw a group message; the receiver checks membership and authorship itself.
+    RecallGroup { id: String, group_id: String, message_id: String },
 }
 
 /// Decoded avatar budget shared by the wire, storage and UI (96 KiB).
@@ -172,10 +178,16 @@ fn validate(payload: &Payload) -> io::Result<()> {
             if valid_id(id) && valid_group_id(group_id) && !name.is_empty() && name.len() <= 128
                 && valid_members(owner, members) => Ok(()),
         Payload::GroupDissolve { id, group_id } if valid_id(id) && valid_group_id(group_id) => Ok(()),
+        Payload::GroupNotice { id, group_id, notice }
+            if valid_id(id) && valid_group_id(group_id) && notice.chars().count() <= 2048
+                && !notice.chars().any(|c| c.is_control() && c != '\n' && c != '\t') => Ok(()),
         Payload::GroupUpdate { id, group_id, name, owner, members }
             if valid_id(id) && valid_group_id(group_id) && !name.is_empty() && name.len() <= 128
                 && valid_members(owner, members) => Ok(()),
         Payload::GroupRemove { id, group_id } if valid_id(id) && valid_group_id(group_id) => Ok(()),
+        Payload::RecallDirect { id, message_id } if valid_id(id) && valid_id(message_id) => Ok(()),
+        Payload::RecallGroup { id, group_id, message_id }
+            if valid_id(id) && valid_group_id(group_id) && valid_id(message_id) => Ok(()),
         Payload::GroupLeave { id, group_id, member }
             if valid_id(id) && valid_group_id(group_id)
                 && member.len() == 64 && member.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) => Ok(()),

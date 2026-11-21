@@ -2,6 +2,7 @@ import './style.css';
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import { open as openFileDialog, save as saveFileDialog } from '@tauri-apps/plugin-dialog';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 import { listen } from '@tauri-apps/api/event';
 import { version as appVersion } from '../package.json';
 import { DirectChat } from './direct_chat';
@@ -11,6 +12,8 @@ import { showClosePrompt } from './close_prompt';
 import { cropAvatarInteractively } from './avatar_crop';
 import { workspace } from './workspace';
 import { linkifiedText } from './linkify';
+import { showContextMenu, type ContextItem } from './context_menu';
+import { t, trError, getLang, setLang, syncLangToBackend, LANG_LABEL, type Lang } from './i18n';
 
 type Page = 'messages' | 'contacts' | 'discover' | 'settings' | 'about' | 'profile';
 const root = document.querySelector<HTMLDivElement>('#app');
@@ -18,7 +21,7 @@ if (!root) throw new Error('Application root is missing');
 const app = root;
 let page: Page = 'messages';
 let menuOpen = false;
-let fingerprint = isTauri() ? '正在读取…' : '仅桌面应用可读取';
+let fingerprint = isTauri() ? t('正在读取…') : t('仅桌面应用可读取');
 type Candidate = { service_name: string; addresses: string[]; nickname: string | null; username: string | null };
 let candidates: Candidate[] = [];
 type LanPerson = {
@@ -27,12 +30,12 @@ type LanPerson = {
 };
 let lanPeople: LanPerson[] = [];
 let lanQuery = '';
-let lanStatus = isTauri() ? '正在识别同网段用户…' : '仅桌面应用支持局域网发现';
+let lanStatus = isTauri() ? t('正在识别同网段用户…') : t('仅桌面应用支持局域网发现');
 let lanLoading = false;
 let lanAddBusy = '';
 let lanNotice = '';
 let lanRefreshedAt = 0;
-let discoveryStatus = isTauri() ? '正在查找…' : '仅桌面应用支持局域网发现';
+let discoveryStatus = isTauri() ? t('正在查找…') : t('仅桌面应用支持局域网发现');
 let discoveryLoading = false;
 type ProbeRequest = { fingerprint: string; remote_ip: string };
 type ProbeStatus = { running: boolean; port: number | null; requests: ProbeRequest[] };
@@ -42,10 +45,10 @@ type NetworkSettings = { default_port: number };
 let networkSettings: NetworkSettings = { default_port: 42853 };
 let networkNotice = '';
 type CloseAction = 'ask' | 'tray' | 'quit';
-const CLOSE_ACTION_LABEL: Record<CloseAction, string> = {
-  ask: '每次关闭时询问',
-  tray: '最小化到托盘',
-  quit: '直接退出 Qbird',
+const CLOSE_ACTION_LABEL: Record<CloseAction, () => string> = {
+  ask: () => t('close.optAsk'),
+  tray: () => t('close.optTray'),
+  quit: () => t('close.optQuit'),
 };
 let windowSettings: { close_action: CloseAction } = { close_action: 'ask' };
 let closeActionNotice = '';
@@ -58,7 +61,7 @@ let scanBlacklist: string[] = [];
 let scanBlacklistDraft = '';
 let scanBlacklistNotice = '';
 let manualAddress = '';
-let probeNotice = isTauri() ? '探测服务未启动' : '仅桌面应用支持身份探测';
+let probeNotice = isTauri() ? t('探测服务未启动') : t('仅桌面应用支持身份探测');
 let probeMessage = '';
 let remoteFingerprint = '';
 let observedAddress = '';
@@ -86,6 +89,18 @@ type GroupSearchHit = { group_id: string; name: string; owner: string; member_co
 type GroupInvitation = { id: string; group_id: string; name: string; owner: string; owner_name: string | null; member_count: number; created_at: number };
 let groupInvites: GroupInvitation[] = [];
 let leftGroups: Group[] = [];
+type ContactRequest = { id: string; direction: 'in' | 'out'; peer: string; nickname: string; username: string | null; address: string | null; created_at: number; status: string };
+type DissolvedGroup = { id: string; name: string; owner: string; dissolved_at: number | null; last_body: string; last_logical: number };
+let incomingRequests: ContactRequest[] = [];
+let outgoingRequests: ContactRequest[] = [];
+let dissolvedGroups: DissolvedGroup[] = [];
+let requestNotice = '';
+let lanVisible = true;
+let contactRequestMode: 'ask' | 'auto' = 'ask';
+let privacyNotice = '';
+type NoticeMode = 'popup' | 'tray' | 'off';
+let noticeSettings: { mode: NoticeMode; raise_window: boolean; preview: boolean } = { mode: 'popup', raise_window: false, preview: true };
+let noticeNotice = '';
 let invitesNotice = '';
 let autoJoinGroups = false;
 let autoAcceptContacts = true;
@@ -100,10 +115,10 @@ type FileAcceptSettings = { mode: 'always' | 'remember' | 'auto'; remembered: st
 let fileAccept: FileAcceptSettings = { mode: 'always', remembered: [] };
 type FileRecvSettings = { direct: string; group: string; direct_custom: boolean; group_custom: boolean };
 let fileRecv: FileRecvSettings = { direct: '', group: '', direct_custom: false, group_custom: false };
-const ACCEPT_MODE_LABEL: Record<FileAcceptSettings['mode'], string> = {
-  always: '每次都询问（默认）',
-  remember: '只询问未记住的来源',
-  auto: '全部自动接收',
+const ACCEPT_MODE_LABEL: Record<FileAcceptSettings['mode'], () => string> = {
+  always: () => t('pr.acceptAlways'),
+  remember: () => t('pr.acceptRemember'),
+  auto: () => t('pr.acceptAuto'),
 };
 let fileAcceptNotice = '';
 let team = { name: '', has_logo: false };
@@ -139,9 +154,22 @@ let qbirdId = '';
 let contactNotice = '';
 /// Browser-only visual check of the first-run flow (`?demo=1`); desktop builds ignore it.
 const demoMode = !isTauri() && new URLSearchParams(location.search).get('demo') === '1';
-type Conversation = { id: string; last_body: string; last_logical: number; kind: string; unread: number };
+type Conversation = { id: string; last_body: string; last_logical: number; kind: string; unread: number; muted: boolean };
 type Group = { id: string; name: string; owner: string; member_count: number; hidden: boolean; is_owner: boolean; last_body: string; last_logical: number };
 let groups: Group[] = [];
+/// Fixtures so the message list can be reviewed in a browser without the desktop shell.
+const demoContacts: Contact[] = [
+  { fingerprint: 'a'.repeat(64), display_name: t('林小满'), trust_state: 'verified', username: 'xiaoman', remark: null, category: null },
+  { fingerprint: 'c'.repeat(64), display_name: t('周隐'), trust_state: 'verified', username: 'zhouyin', remark: null, category: null },
+];
+const demoGroupList: Group[] = [
+  { id: 'd'.repeat(32), name: t('项目组'), owner: 'a'.repeat(64), member_count: 4, hidden: false, is_owner: false, last_body: t('周隐：明天十点评审'), last_logical: 30 },
+];
+const demoConversationList: Conversation[] = [
+  { id: 'self', last_body: t('记一下：周三交周报'), last_logical: 40, kind: 'self', unread: 0, muted: true },
+  { id: 'a'.repeat(64), last_body: t('晚点把接口文档发你'), last_logical: 35, kind: 'direct', unread: 3, muted: false },
+  { id: 'd'.repeat(32), last_body: t('周隐：明天十点评审'), last_logical: 30, kind: 'group', unread: 12, muted: true },
+];
 type LocalMessage = { id: string; body: string; logical: number; created_at: number };
 let selfOpen = false;
 let selfMessages: LocalMessage[] = [];
@@ -201,7 +229,7 @@ const groupChat = new GroupChat(app, () => { direct.clear(); selfOpen = false; p
 // preview content, so the same path works for live opens and restored tabs.
 workspace.setResolver(async (source) => {
   if (source.kind === 'web') {
-    return { title: source.url, loaded: { kind: 'error', message: '网页由 iframe 直接加载' } };
+    return { title: source.url, loaded: { kind: 'error', message: t('网页由 iframe 直接加载') } };
   }
   if (source.kind === 'group-file') {
     return {
@@ -245,7 +273,7 @@ async function openSelf(): Promise<void> {
     selfOpen = true; page = 'messages'; menuOpen = false; selfMessages = []; selfHasOlder = false;
     render();
     await loadSelfMessages(false);
-  } catch { const status = app.querySelector<HTMLElement>('#contacts-status'); if (status) status.textContent = '无法打开自聊'; }
+  } catch { const status = app.querySelector<HTMLElement>('#contacts-status'); if (status) status.textContent = t('无法打开自聊'); }
 }
 
 async function hideSelf(): Promise<void> {
@@ -253,7 +281,7 @@ async function hideSelf(): Promise<void> {
   try {
     await invoke('v1_hide_self');
     selfOpen = false; render();
-  } catch { const error = app.querySelector<HTMLElement>('#self-error'); if (error) error.textContent = '无法隐藏会话'; }
+  } catch { const error = app.querySelector<HTMLElement>('#self-error'); if (error) error.textContent = t('无法隐藏会话'); }
 }
 
 async function sendSelf(): Promise<void> {
@@ -262,7 +290,7 @@ async function sendSelf(): Promise<void> {
   const button = app.querySelector<HTMLButtonElement>('button[data-action="self-send"]');
   if (!isTauri() || !input || !error || selfBusy) return;
   const body = input.value;
-  if (!body.trim()) { error.textContent = '请输入消息'; return; }
+  if (!body.trim()) { error.textContent = t('请输入消息'); return; }
   selfBusy = true; if (button) button.disabled = true; error.textContent = '';
   try {
     const message = await invoke<LocalMessage>('v1_send_self', { body });
@@ -275,8 +303,17 @@ async function sendSelf(): Promise<void> {
   finally { selfBusy = false; if (button?.isConnected) button.disabled = false; }
 }
 
-function appendUnread(button: HTMLButtonElement, count: number): void {
+function appendUnread(button: HTMLButtonElement, count: number, muted = false): void {
   if (count <= 0) return;
+  if (muted) {
+    // A muted conversation still counts, it just refuses to shout a number.
+    const dot = document.createElement('span');
+    dot.className = 'unread-dot';
+    dot.title = `${count} 条未读（消息免打扰）`;
+    dot.setAttribute('aria-label', `${count} 条未读消息，已开启免打扰`);
+    button.append(dot);
+    return;
+  }
   const badge = document.createElement('span');
   badge.className = 'unread-badge';
   badge.textContent = count > 99 ? '99+' : String(count);
@@ -284,20 +321,116 @@ function appendUnread(button: HTMLButtonElement, count: number): void {
   button.append(badge);
 }
 
+/// Small bell with a slash, used only as a hint that a row will not raise a badge.
+function muteMark(): HTMLElement {
+  const mark = document.createElement('span');
+  mark.className = 'mute-mark';
+  mark.title = t('消息免打扰');
+  mark.setAttribute('aria-label', t('消息免打扰'));
+  mark.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M18.1 14.6a5.6 5.6 0 0 1-1.2-3.4v-1.4a4.9 4.9 0 0 0-3.5-4.7V4.4a1.4 1.4 0 0 0-2.8 0v.7a4.9 4.9 0 0 0-3.5 4.7v1.4c0 1.4-.4 2.4-1.2 3.4-.3.4 0 .9.5.9h3.7m3.2 0h4.3c.5 0 .8-.5.5-.9z"/><path d="M10.3 19.2a1.9 1.9 0 0 0 3.4 0M3.8 3.8l16.4 16.4"/></svg>';
+  return mark;
+}
+
+/// Right-click menu for one row of the message list; only local state changes here.
+function conversationMenu(event: MouseEvent, conversation: Conversation, label: string): void {
+  event.preventDefault();
+  const items: ContextItem[] = [];
+  if (conversation.kind !== 'self') {
+    items.push({ label: conversation.unread > 0 ? t('标为已读') : t('标为未读'), run: () => { void setConversationUnread(conversation); } });
+  }
+  items.push({
+    label: conversation.muted ? t('开启消息提醒') : t('消息免打扰'),
+    run: () => { void setConversationMuted(conversation); },
+  });
+  if (conversation.kind !== 'self') {
+    items.push({ label: t('查看聊天记录'), run: () => { void openRecordsWindow(conversation.kind as 'direct' | 'group', conversation.id); } });
+  }
+  items.push({ label: t('不显示该会话'), danger: true, run: () => { void hideConversation(conversation, label); } });
+  showContextMenu(event, items);
+}
+
+async function setConversationMuted(conversation: Conversation): Promise<void> {
+  if (!isTauri()) return;
+  try {
+    await invoke('v1_set_conversation_muted', { kind: conversation.kind, id: conversation.id, muted: !conversation.muted });
+    await refreshConversations();
+  } catch (error) { workspace.notify(displayError(error)); }
+}
+
+async function setConversationUnread(conversation: Conversation): Promise<void> {
+  if (!isTauri()) return;
+  try {
+    if (conversation.unread > 0) {
+      // Re-opening is the existing way to clear the counter without inventing state.
+      if (conversation.kind === 'direct') await invoke('v1_open_direct', { peer: conversation.id });
+      else await invoke('v1_open_group', { groupId: conversation.id });
+    } else {
+      await invoke('v1_mark_conversation_unread', { kind: conversation.kind, id: conversation.id });
+    }
+    await refreshConversations();
+  } catch (error) { workspace.notify(displayError(error)); }
+}
+
+async function hideConversation(conversation: Conversation, label: string): Promise<void> {
+  if (!isTauri()) return;
+  try {
+    if (conversation.kind === 'self') {
+      await invoke('v1_hide_self');
+      if (selfOpen) { selfOpen = false; selfMessages = []; }
+    } else if (conversation.kind === 'direct') {
+      await invoke('v1_hide_direct', { peer: conversation.id });
+      if (direct.peer === conversation.id) direct.clear();
+    } else {
+      await invoke('v1_hide_group', { groupId: conversation.id });
+      if (groupChat.groupId === conversation.id) groupChat.clear();
+    }
+    // render() repaints the list and the open pane in one pass.
+    render();
+    workspace.notify(`已隐藏「${label}」；收到新消息时会重新出现。`);
+  } catch (error) { workspace.notify(displayError(error)); }
+}
+
+/// WeChat-style "⋯" menu for the open conversation: chat records, export and hide.
+function openChatMenu(button: HTMLElement, event: MouseEvent): void {
+  const kind = button.dataset.kind as 'self' | 'direct' | 'group';
+  const items: ContextItem[] = [
+    { label: t('聊天记录'), run: () => { void openRecordsWindow(kind); } },
+    ...(kind === 'group' ? [{ label: t('群公告'), run: () => { groupChat.toggleNoticeEditor(); } }] : []),
+    { label: t('导出文本'), run: () => { void exportChat(kind); } },
+    { label: t('不显示此会话'), danger: true, run: () => {
+      if (kind === 'direct') void direct.hide();
+      else if (kind === 'group') void groupChat.hide();
+      else void hideSelf();
+    } },
+  ];
+  showContextMenu(event, items);
+}
+
+/// Opens (or focuses) the standalone chat-records window for the open conversation.
+async function openRecordsWindow(kind: 'self' | 'direct' | 'group', conversationId?: string): Promise<void> {
+  const id = conversationId ?? (kind === 'self' ? '' : kind === 'direct' ? direct.peer : groupChat.groupId);
+  if (kind !== 'self' && !id) return;
+  if (!isTauri()) { workspace.notify(t('聊天记录窗口需要在桌面应用中打开。')); return; }
+  try { await invoke('v1_open_records_window', { kind, id }); }
+  catch (error) { workspace.notify(displayError(error)); }
+}
+
 async function refreshConversations(): Promise<void> {
   const list = app.querySelector<HTMLElement>('#conversation-list');
   if (!list) return;
-  if (!isTauri()) { list.textContent = '请在桌面应用中查看会话'; return; }
+  if (!isTauri() && !demoMode) { list.textContent = t('请在桌面应用中查看会话'); return; }
   try {
-    const [conversations, contacts, groupList] = await Promise.all([
-      invoke<Conversation[]>('v1_list_conversations'),
-      invoke<Contact[]>('v1_list_contacts'),
-      invoke<Group[]>('v1_list_groups'),
-    ]);
+    const [conversations, contacts, groupList] = demoMode
+      ? [demoConversationList, demoContacts, demoGroupList]
+      : await Promise.all([
+        invoke<Conversation[]>('v1_list_conversations'),
+        invoke<Contact[]>('v1_list_contacts'),
+        invoke<Group[]>('v1_list_groups'),
+      ]);
     groups = groupList;
     if (!list.isConnected) return;
     list.replaceChildren();
-    if (!conversations.length) { list.textContent = '暂无会话'; return; }
+    if (!conversations.length) { list.textContent = t('暂无会话'); return; }
     // Whatever is on screen counts as read; the backend counter is the source of truth.
     if (direct.peer) {
       const active = conversations.find((item) => item.kind === 'direct' && item.id === direct.peer);
@@ -316,7 +449,12 @@ async function refreshConversations(): Promise<void> {
         button.dataset.action = 'open-group'; button.dataset.group = group.id; button.dataset.name = group.name;
         const name = document.createElement('strong'); name.textContent = group.name;
         const preview = document.createElement('span'); preview.textContent = conversation.last_body || `${group.member_count} 位成员`;
-        button.append(name, preview); appendUnread(button, conversation.unread); list.append(button);
+        if (conversation.muted) button.classList.add('muted');
+        button.append(name, preview);
+        if (conversation.muted) preview.prepend(muteMark());
+        appendUnread(button, conversation.unread, conversation.muted);
+        button.addEventListener('contextmenu', (event) => conversationMenu(event, conversation, group.name));
+        list.append(button);
         continue;
       }
       const contact = contacts.find(item => item.fingerprint === conversation.id && item.trust_state === 'verified');
@@ -324,13 +462,18 @@ async function refreshConversations(): Promise<void> {
       const button = document.createElement('button');
       button.className = `conversation-row${conversation.id === 'self' ? (selfOpen ? ' selected' : '') : (direct.peer === conversation.id ? ' selected' : '')}`;
       button.dataset.action = conversation.id === 'self' ? 'open-self' : 'open-direct';
-      appendUnread(button, conversation.unread);
+      if (conversation.muted) button.classList.add('muted');
       if (contact) { button.dataset.peer = contact.fingerprint; button.dataset.name = contact.display_name; }
-      const name = document.createElement('strong'); name.textContent = contact?.display_name ?? '自己';
+      const name = document.createElement('strong'); name.textContent = contact?.display_name ?? t('自己');
       const preview = document.createElement('span'); preview.textContent = conversation.last_body;
-      button.append(name, preview); list.append(button);
+      button.append(name, preview);
+      if (conversation.muted) preview.prepend(muteMark());
+      appendUnread(button, conversation.unread, conversation.muted);
+      const label = contact?.display_name ?? t('自己');
+      button.addEventListener('contextmenu', (event) => conversationMenu(event, conversation, label));
+      list.append(button);
     }
-  } catch { if (list.isConnected) list.textContent = '无法读取会话'; }
+  } catch { if (list.isConnected) list.textContent = t('无法读取会话'); }
 }
 
 function paintSelfMessages(scroll: 'bottom' | 'preserve'): void {
@@ -357,30 +500,30 @@ async function loadSelfMessages(older: boolean): Promise<void> {
     selfMessages = older ? [...batch.reverse(), ...selfMessages] : batch.reverse();
     selfHasOlder = batch.length === 200;
     paintSelfMessages(older ? 'preserve' : 'bottom');
-  } catch { const error = app.querySelector<HTMLElement>('#self-error'); if (error) error.textContent = '无法读取自聊记录'; }
+  } catch { const error = app.querySelector<HTMLElement>('#self-error'); if (error) error.textContent = t('无法读取自聊记录'); }
   finally { selfBusy = false; }
 }
 
 function selfChatView(): string {
-  return `<section class="self-chat" aria-label="自聊">
-    <header class="chat-header"><div><strong>自己</strong><small>仅保存在本机</small></div><div class="group-actions"><button class="outline" data-action="export-text" data-kind="self">导出文本</button><button class="outline" data-action="hide-self">不显示此会话</button></div></header>
-    <div class="chat-history" id="self-history" aria-label="自聊记录"><button class="load-older" data-action="self-older" hidden>加载更早消息</button><div id="self-messages"></div></div>
-    <div class="chat-compose"><label for="self-input">消息</label><textarea id="self-input" rows="3" maxlength="32768" placeholder="写点什么…"></textarea>${composerTools('self', 'Enter 发送 · Shift+Enter 换行', false)}<p id="self-error" role="status"></p></div>
+  return `<section class="self-chat" aria-label="${escapeText(t('自聊'))}">
+    <header class="chat-header"><div><strong>自己</strong><small>仅保存在本机</small></div><div class="group-actions"><button class="outline chat-more" data-action="chat-menu" data-kind="self" aria-label="${escapeText(t('会话菜单'))}" title="${escapeText(t('会话菜单'))}">⋯</button></div></header>
+    <div class="chat-history" id="self-history" aria-label="${escapeText(t('自聊记录'))}"><button class="load-older" data-action="self-older" hidden>加载更早消息</button><div id="self-messages"></div></div>
+    <div class="chat-compose"><label for="self-input">消息</label><textarea id="self-input" rows="3" maxlength="32768" placeholder="${escapeText(t('写点什么…'))}"></textarea>${composerTools('self', 'Enter 发送 · Shift+Enter 换行', false)}<p id="self-error" role="status"></p></div>
   </section>`;
 }
 
 type PlaceholderPage = 'messages' | 'contacts' | 'discover' | 'settings' | 'about' | 'profile';
-const pages: Record<PlaceholderPage, { title: string; eyebrow: string; heading: string; copy: string }> = {
-  messages: { title: '消息', eyebrow: 'MESSAGES', heading: '还没有会话', copy: '从联系人打开自聊或已确认的单聊。' },
-  contacts: { title: '联系人', eyebrow: 'CONTACTS', heading: '联系人', copy: '可搜索联系人、编辑本机备注与分组。' },
-  discover: { title: '局域网用户', eyebrow: 'DISCOVERY', heading: '局域网用户', copy: '同一网段的 Qbird 用户会自动出现，点「添加」即可加入联系人。' },
-  settings: { title: '设置', eyebrow: 'PREFERENCES', heading: '设置', copy: '存储配额、备份恢复与应用锁已开放；插件与更多设置将在后续阶段提供。' },
-  about: { title: '关于', eyebrow: 'ABOUT', heading: 'Qbird 青鸟', copy: '本地优先的局域网聊天工具。' },
-  profile: { title: '我的资料', eyebrow: 'PROFILE', heading: '个人资料', copy: '昵称与邮箱仅保存在本机。' }
+const pages: Record<PlaceholderPage, { title: () => string; eyebrow: string; heading: () => string; copy: () => string }> = {
+  messages: { title: () => t('page.messages.title'), eyebrow: 'MESSAGES', heading: () => t('page.messages.heading'), copy: () => t('page.messages.copy') },
+  contacts: { title: () => t('page.contacts.title'), eyebrow: 'CONTACTS', heading: () => t('page.contacts.title'), copy: () => t('page.contacts.copy') },
+  discover: { title: () => t('page.discover.title'), eyebrow: 'DISCOVERY', heading: () => t('page.discover.title'), copy: () => t('page.discover.copy') },
+  settings: { title: () => t('page.settings.title'), eyebrow: 'PREFERENCES', heading: () => t('page.settings.title'), copy: () => t('page.settings.copy') },
+  about: { title: () => t('page.about.title'), eyebrow: 'ABOUT', heading: () => t('page.about.heading'), copy: () => t('page.about.copy') },
+  profile: { title: () => t('page.profile.title'), eyebrow: 'PROFILE', heading: () => t('page.profile.heading'), copy: () => t('page.profile.copy') }
 };
 
 function formatBytes(bytes: number): string {
-  if (!Number.isFinite(bytes) || bytes < 0) return '未知';
+  if (!Number.isFinite(bytes) || bytes < 0) return t('未知');
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
@@ -395,7 +538,7 @@ function profileView(): string {
     <div class="avatar-row">
       <div class="avatar-preview">${avatarMarkup()}</div>
       <div class="avatar-actions">
-        <button class="outline" data-action="choose-avatar" ${avatarBusy ? 'disabled' : ''}>${avatarUrl ? '更换头像…' : '选择头像…'}</button>
+        <button class="outline" data-action="choose-avatar" ${avatarBusy ? 'disabled' : ''}>${avatarUrl ? t('更换头像…') : t('选择头像…')}</button>
         <button class="outline" data-action="clear-avatar" ${avatarUrl && !avatarBusy ? '' : 'disabled'}>移除头像</button>
         <small>选择图片后可预览、拖动与缩放，确认后保存为正方形（最大 512 像素）；头像只保存在本机，尚未随消息发送。</small>
       </div>
@@ -410,12 +553,12 @@ function profileView(): string {
     <div class="probe-row"><button class="outline" data-action="save-profile">保存资料</button></div>
     <p id="profile-notice" role="status">${profileNotice}</p>
     <div class="probe-box"><h3>联系人添加</h3>
-      <p>同一局域网的同事添加你时，本机默认也把对方加入联系人，双方一次添加即可互相聊天。</p>
+      <p>同一局域网的同事添加你时，会生成一条好友申请；你可以接受或拒绝，接受后双方才能互发消息。</p>
       <p><label><input id="auto-accept-contacts" type="checkbox" ${autoAcceptContacts ? 'checked' : ''}> 自动接受对方添加（关闭后只在本机提示，不自动加入）</label></p>
       <p id="contact-sync-notice" class="hint" role="status">${contactSyncNotice}</p>
     </div>
     <div class="probe-box"><h3>联系人悬浮信息</h3>
-      <p>悬停联系人时显示：${hover.show_ip ? 'IP 地址' : '不显示 IP'}${hover.show_mac ? '、MAC 地址' : '、不显示 MAC'}。</p>
+      <p>悬停联系人时显示：${hover.show_ip ? 'IP 地址' : t('不显示 IP')}${hover.show_mac ? '、MAC 地址' : '、不显示 MAC'}。</p>
       <p><label><input id="hover-show-ip" type="checkbox" ${hover.show_ip ? 'checked' : ''}> 显示 IP 地址（来自本机保存的联系人地址）</label></p>
       <p><label><input id="hover-show-mac" type="checkbox" ${hover.show_mac ? 'checked' : ''}> 显示 MAC 地址（读取本机 ARP 表，取不到时显示“未获取”）</label></p>
       <div class="probe-row"><button class="outline" data-action="save-hover-settings">保存悬浮设置</button></div>
@@ -447,7 +590,7 @@ async function refreshProfile(): Promise<void> {
     if (nickname) nickname.value = profile.nickname;
     if (username) username.value = profile.username;
     if (email) email.value = profile.email;
-  } catch { profileNotice = '无法读取个人资料'; }
+  } catch { profileNotice = t('无法读取个人资料'); }
 }
 
 async function saveProfile(): Promise<void> {
@@ -473,9 +616,9 @@ async function saveProfile(): Promise<void> {
     // Rebuild the mDNS announcement so peers see the new nickname right away.
     const broadcast = await invoke('v1_refresh_listener').then(() => true).catch(() => false);
     profileNotice = broadcast
-      ? '资料已保存，并已重新广播给同一网段的同事。'
-      : '资料已保存在本机；当前未监听，下次启动应用时会使用新资料广播。';
-  } catch (error) { profileNotice = typeof error === 'string' ? error : '无法保存资料'; }
+      ? t('资料已保存，并已重新广播给同一网段的同事。')
+      : t('资料已保存在本机；当前未监听，下次启动应用时会使用新资料广播。');
+  } catch (error) { profileNotice = trError(error, t('无法保存资料')); }
   if (notice) notice.textContent = profileNotice;
 }
 
@@ -483,12 +626,12 @@ async function saveProfile(): Promise<void> {
 /// nickname (Chinese character or Latin initial), never a fixed brand glyph.
 function avatarInitial(name: string): string {
   const first = Array.from(name.trim())[0] ?? '';
-  if (!first) return '青';
+  if (!first) return t('青');
   return /^[a-z]$/i.test(first) ? first.toUpperCase() : first;
 }
 
 function avatarMarkup(nickname: string = myNickname): string {
-  return avatarUrl ? `<img src="${avatarUrl}" alt="我的头像">` : escapeText(avatarInitial(nickname));
+  return avatarUrl ? `<img src="${escapeText(avatarUrl)}" alt="${escapeText(t('我的头像'))}">` : escapeText(avatarInitial(nickname));
 }
 
 /// The rail avatar lives outside the profile card, so update it in place
@@ -534,26 +677,26 @@ async function cropSquare(source: Uint8Array, edge: number): Promise<Uint8Array>
   const canvas = document.createElement('canvas');
   canvas.width = edge; canvas.height = edge;
   const context = canvas.getContext('2d');
-  if (!context) throw new Error('无法创建画布');
+  if (!context) throw new Error(t('无法创建画布'));
   context.drawImage(bitmap, (bitmap.width - side) / 2, (bitmap.height - side) / 2, side, side, 0, 0, edge, edge);
   const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, 'image/png'));
-  if (!blob) throw new Error('无法生成头像');
+  if (!blob) throw new Error(t('无法生成头像'));
   return new Uint8Array(await blob.arrayBuffer());
 }
 
 async function chooseAvatar(): Promise<void> {
   if (!isTauri() || avatarBusy) return;
   try {
-    const picked = await openFileDialog({ multiple: false, filters: [{ name: '图片', extensions: ['png', 'jpg', 'jpeg'] }] });
+    const picked = await openFileDialog({ multiple: false, filters: [{ name: t('图片'), extensions: ['png', 'jpg', 'jpeg'] }] });
     if (!picked || typeof picked !== 'string') return;
-    avatarBusy = true; avatarNotice = '正在读取图片…'; if (page === 'profile') render();
+    avatarBusy = true; avatarNotice = t('正在读取图片…'); if (page === 'profile') render();
     const source = new Uint8Array(await invoke<number[]>('v1_read_image_file', { path: picked }));
     // Nothing is written until the user confirms the crop.
-    const cropped = await cropAvatarInteractively(source, { title: '调整头像' });
-    if (!cropped) { avatarNotice = '已取消，头像未修改。'; return; }
+    const cropped = await cropAvatarInteractively(source, { title: t('调整头像') });
+    if (!cropped) { avatarNotice = t('已取消，头像未修改。'); return; }
     await invoke('v1_set_avatar', { bytes: Array.from(cropped) });
     setAvatarImage(cropped);
-    avatarNotice = '头像已保存，仅本机可见。';
+    avatarNotice = t('头像已保存，仅本机可见。');
   } catch (error) { avatarNotice = displayError(error); }
   finally { avatarBusy = false; if (page === 'profile') render(); }
 }
@@ -564,7 +707,7 @@ async function clearAvatar(): Promise<void> {
   try {
     await invoke('v1_clear_avatar');
     setAvatarImage(null);
-    avatarNotice = '头像已移除。';
+    avatarNotice = t('头像已移除。');
   } catch (error) { avatarNotice = displayError(error); }
   finally { avatarBusy = false; if (page === 'profile') render(); }
 }
@@ -572,7 +715,7 @@ async function clearAvatar(): Promise<void> {
 function emojiPanelHtml(): string {
   const grid = COMMON_EMOJIS.map((emoji) => `<button type="button" data-action="pick-emoji" data-emoji="${emoji}">${emoji}</button>`).join('');
   return `<div class="emoji-grid">${grid}</div>
-    <div class="sticker-head"><strong>我的表情</strong><button type="button" class="outline" data-action="add-sticker">添加…</button><button type="button" class="outline" data-action="toggle-sticker-manage">${stickerManage ? '完成' : '管理'}</button></div>
+    <div class="sticker-head"><strong>我的表情</strong><button type="button" class="outline" data-action="add-sticker">添加…</button><button type="button" class="outline" data-action="toggle-sticker-manage">${stickerManage ? t('完成') : t('管理')}</button></div>
     <div class="sticker-list"></div>
     <p class="emoji-notice" role="status">${emojiNotice}</p>`;
 }
@@ -599,7 +742,7 @@ async function loadStickers(panel: HTMLElement): Promise<void> {
       const bytes = new Uint8Array(await invoke<number[]>('v1_sticker_bytes', { name }));
       stickerUrls.set(name, URL.createObjectURL(new Blob([toArrayBuffer(bytes)])));
     }
-  } catch { emojiNotice = '无法读取表情收藏'; }
+  } catch { emojiNotice = t('无法读取表情收藏'); }
   paintStickers(panel);
 }
 
@@ -608,8 +751,8 @@ function paintStickers(panel: HTMLElement): void {
   const notice = panel.querySelector<HTMLElement>('.emoji-notice');
   if (notice) notice.textContent = emojiNotice;
   if (!list) return;
-  if (!stickers.length) { list.textContent = '还没有收藏的表情，点击“添加…”选择 PNG、GIF、JPEG 或 WebP（≤512 KiB）。'; return; }
-  list.innerHTML = stickers.map((name) => `<div class="sticker"><button type="button" data-action="use-sticker" data-name="${name}" title="发送此表情"><img src="${stickerUrls.get(name) ?? ''}" alt=""></button>${stickerManage ? `<button type="button" class="sticker-remove" data-action="remove-sticker" data-name="${name}" aria-label="移除表情">×</button>` : ''}</div>`).join('');
+  if (!stickers.length) { list.textContent = t('还没有收藏的表情，点击“添加…”选择 PNG、GIF、JPEG 或 WebP（≤512 KiB）。'); return; }
+  list.innerHTML = stickers.map((name) => `<div class="sticker"><button type="button" data-action="use-sticker" data-name="${escapeText(name)}" title="${escapeText(t('发送此表情'))}"><img src="${stickerUrls.get(name) ?? ''}" alt=""></button>${stickerManage ? `<button type="button" class="sticker-remove" data-action="remove-sticker" data-name="${escapeText(name)}" aria-label="${escapeText(t('移除表情'))}">×</button>` : ''}</div>`).join('');
 }
 
 function insertAtCursor(input: HTMLTextAreaElement, text: string): void {
@@ -622,24 +765,24 @@ function insertAtCursor(input: HTMLTextAreaElement, text: string): void {
 
 async function sendSticker(name: string): Promise<void> {
   if (!isTauri()) return;
-  if (!direct.peer) { emojiNotice = '请先打开一个单聊，再发送表情。'; paintEmojiNotices(); return; }
+  if (!direct.peer) { emojiNotice = t('请先打开一个单聊，再发送表情。'); paintEmojiNotices(); return; }
   try {
     const path = await invoke<string>('v1_sticker_path', { name });
     await direct.queuePaths([path]);
-    emojiNotice = '表情已加入待发送队列。';
+    emojiNotice = t('表情已加入待发送队列。');
   } catch (error) { emojiNotice = displayError(error); }
   paintEmojiNotices();
 }
 
 async function addSticker(): Promise<void> {
   if (!isTauri()) return;
-  const picked = await openFileDialog({ multiple: false, filters: [{ name: '表情图片', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp'] }] });
+  const picked = await openFileDialog({ multiple: false, filters: [{ name: t('表情图片'), extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp'] }] });
   if (!picked || typeof picked !== 'string') return;
   try {
     const name = await invoke<string>('v1_add_sticker', { path: picked });
     stickersLoaded = true;
     if (!stickers.includes(name)) stickers = [...stickers, name].sort();
-    emojiNotice = '已加入我的表情。';
+    emojiNotice = t('已加入我的表情。');
   } catch (error) { emojiNotice = displayError(error); }
   const panel = app.querySelector<HTMLElement>('.emoji-panel');
   if (panel) void loadStickers(panel);
@@ -652,7 +795,7 @@ async function removeSticker(name: string): Promise<void> {
     stickers = stickers.filter((item) => item !== name);
     const url = stickerUrls.get(name);
     if (url) { URL.revokeObjectURL(url); stickerUrls.delete(name); }
-    emojiNotice = '表情已移除。';
+    emojiNotice = t('表情已移除。');
   } catch (error) { emojiNotice = displayError(error); }
   const panel = app.querySelector<HTMLElement>('.emoji-panel');
   if (panel) paintStickers(panel);
@@ -686,7 +829,7 @@ async function refreshScanState(): Promise<void> {
   try {
     scanBlacklist = await invoke<string[]>('v1_scan_blacklist');
     scanBlacklistDraft = scanBlacklist.join(', ');
-  } catch { scanBlacklistNotice = '无法读取扫描黑名单'; }
+  } catch { scanBlacklistNotice = t('无法读取扫描黑名单'); }
 }
 
 async function startScan(): Promise<void> {
@@ -695,12 +838,12 @@ async function startScan(): Promise<void> {
   const cidr = (input?.value ?? scanCidr).trim();
   scanCidr = cidr;
   const port = Number(probePort);
-  if (!Number.isInteger(port) || port < 1 || port > 65535) { scanNotice = '请先在发现页设置 1–65535 的监听端口'; render(); return; }
-  scanBusy = true; scanNotice = '正在扫描…'; scanHits = [];
+  if (!Number.isInteger(port) || port < 1 || port > 65535) { scanNotice = t('请先在发现页设置 1–65535 的监听端口'); render(); return; }
+  scanBusy = true; scanNotice = t('正在扫描…'); scanHits = [];
   render();
   try {
     scanHits = await invoke<ScanHit[]>('v1_scan_range', { cidr, port });
-    scanNotice = scanHits.length ? `发现 ${scanHits.length} 个候选，请用独立渠道核对完整指纹。` : '本次未发现候选；端口未开放或对方未启动服务。';
+    scanNotice = scanHits.length ? `发现 ${scanHits.length} 个候选，请用独立渠道核对完整指纹。` : t('本次未发现候选；端口未开放或对方未启动服务。');
   } catch (error) { scanNotice = displayError(error); }
   finally { scanBusy = false; if (page === 'discover') render(); }
 }
@@ -712,7 +855,7 @@ async function saveScanBlacklist(): Promise<void> {
   try {
     scanBlacklist = await invoke<string[]>('v1_set_scan_blacklist', { entries });
     scanBlacklistDraft = scanBlacklist.join(', ');
-    scanBlacklistNotice = '黑名单已保存。';
+    scanBlacklistNotice = t('黑名单已保存。');
   } catch (error) { scanBlacklistNotice = displayError(error); }
   if (page === 'discover') render();
 }
@@ -722,14 +865,14 @@ async function refreshOnboarding(): Promise<void> {
     onboardingLoaded = true;
     if (demoMode) {
       qbirdId = 'QB-2F91-8C3D';
-      onboarding = { done: false, profile: { nickname: 'Tam', email: '', username: 'tam' }, qbird_id: qbirdId };
-      onboardingDraft = { nickname: 'Tam', username: 'tam', email: '', recvDir: '' };
+      onboarding = { done: false, profile: { nickname: 'Alex', email: '', username: 'alex_demo' }, qbird_id: qbirdId };
+      onboardingDraft = { nickname: 'Alex', username: 'alex_demo', email: '', recvDir: '' };
       lanPeople = [
-        { service_name: 'a', address: '192.168.1.23:42853', fingerprint: 'a'.repeat(64), qbird_id: 'QB-AAAA-1111', nickname: '林小满', username: 'xiaoman', known: true, verified: true },
-        { service_name: 'b', address: '192.168.1.41:42853', fingerprint: 'b'.repeat(64), qbird_id: 'QB-BBBB-2222', nickname: '周隐', username: 'zhouyin', known: false, verified: false },
-        { service_name: 'c', address: '192.168.1.77:42853', fingerprint: 'c'.repeat(64), qbird_id: 'QB-CCCC-3333', nickname: '陈默', username: 'chenmo', known: false, verified: false },
+        { service_name: 'a', address: '192.168.1.23:42853', fingerprint: 'a'.repeat(64), qbird_id: 'QB-AAAA-1111', nickname: t('林小满'), username: 'xiaoman', known: true, verified: true },
+        { service_name: 'b', address: '192.168.1.41:42853', fingerprint: 'b'.repeat(64), qbird_id: 'QB-BBBB-2222', nickname: t('周隐'), username: 'zhouyin', known: false, verified: false },
+        { service_name: 'c', address: '192.168.1.77:42853', fingerprint: 'c'.repeat(64), qbird_id: 'QB-CCCC-3333', nickname: t('陈默'), username: 'chenmo', known: false, verified: false },
       ];
-      lanStatus = '发现 3 位用户';
+      lanStatus = t('发现 3 位用户');
       lanRefreshedAt = Date.now();
       page = 'discover';
     }
@@ -757,17 +900,17 @@ async function refreshNetwork(): Promise<void> {
   try {
     networkSettings = await invoke<NetworkSettings>('v1_network_settings');
     probePort = String(networkSettings.default_port);
-  } catch { networkNotice = '无法读取网络设置'; }
+  } catch { networkNotice = t('status.portReadErr'); }
 }
 
 async function saveListenPort(): Promise<void> {
   if (!isTauri()) return;
   const port = Number(app.querySelector<HTMLInputElement>('#listen-port')?.value ?? '0');
-  if (!Number.isInteger(port) || port < 1024 || port > 65535) { networkNotice = '监听端口需为 1024–65535'; if (page === 'settings') render(); return; }
+  if (!Number.isInteger(port) || port < 1024 || port > 65535) { networkNotice = t('status.portRange'); if (page === 'settings') render(); return; }
   try {
     networkSettings = await invoke<NetworkSettings>('v1_set_network_settings', { port });
     probePort = String(networkSettings.default_port);
-    networkNotice = '默认端口已保存；下次启动聊天服务时生效。';
+    networkNotice = t('status.portSavedMsg');
   } catch (error) { networkNotice = displayError(error); }
   if (page === 'settings') render();
 }
@@ -775,7 +918,7 @@ async function saveListenPort(): Promise<void> {
 async function refreshWindowSettings(): Promise<void> {
   if (!isTauri()) return;
   try { windowSettings = await invoke<{ close_action: CloseAction }>('v1_window_settings'); }
-  catch { closeActionNotice = '无法读取关闭行为'; }
+  catch { closeActionNotice = t('status.closeReadErr2'); }
 }
 
 async function saveCloseAction(): Promise<void> {
@@ -784,7 +927,7 @@ async function saveCloseAction(): Promise<void> {
   if (value !== 'ask' && value !== 'tray' && value !== 'quit') return;
   try {
     windowSettings = await invoke<{ close_action: CloseAction }>('v1_set_window_settings', { closeAction: value });
-    closeActionNotice = '关闭行为已保存。';
+    closeActionNotice = t('status.closeSaved');
   } catch (error) { closeActionNotice = displayError(error); }
   if (page === 'settings') render();
 }
@@ -792,186 +935,220 @@ async function saveCloseAction(): Promise<void> {
 async function refreshComposer(): Promise<void> {
   if (!isTauri()) return;
   try { composer = await invoke<ComposerSettings>('v1_composer_settings'); }
-  catch { composerNotice = '无法读取输入设置'; }
+  catch { composerNotice = t('status.composerReadErr'); }
 }
 
 async function saveComposer(): Promise<void> {
   if (!isTauri()) return;
   const sendShortcut = app.querySelector<HTMLSelectElement>('#send-shortcut')?.value ?? 'enter';
   const rows = Number(app.querySelector<HTMLInputElement>('#composer-rows')?.value ?? '3');
-  if (!Number.isInteger(rows) || rows < 2 || rows > 12) { composerNotice = '输入区高度需为 2–12 行'; if (page === 'settings') render(); return; }
+  if (!Number.isInteger(rows) || rows < 2 || rows > 12) { composerNotice = t('status.rowsRange'); if (page === 'settings') render(); return; }
   try {
     composer = await invoke<ComposerSettings>('v1_set_composer_settings', { sendShortcut, rows });
-    composerNotice = '输入设置已保存。';
+    composerNotice = t('status.composerSaved');
   } catch (error) { composerNotice = displayError(error); }
   if (page === 'settings') render();
 }
 
 type SettingsTab = 'general' | 'privacy' | 'workspace' | 'experimental' | 'debug';
 let settingsTab: SettingsTab = 'general';
-const SETTINGS_TABS: { id: SettingsTab; label: string }[] = [
-  { id: 'general', label: '常规与网络' },
-  { id: 'privacy', label: '隐私与安全' },
-  { id: 'workspace', label: '工作区' },
-  { id: 'experimental', label: '实验功能' },
-  { id: 'debug', label: '调试模式' },
+const SETTINGS_TABS: { id: SettingsTab; label: () => string }[] = [
+  { id: 'general', label: () => t('tab.general') },
+  { id: 'privacy', label: () => t('tab.privacy') },
+  { id: 'workspace', label: () => t('tab.workspace') },
+  { id: 'experimental', label: () => t('tab.experimental') },
+  { id: 'debug', label: () => t('tab.debug') },
 ];
 
 function settingsView(): string {
   const tab = SETTINGS_TABS.find((item) => item.id === settingsTab) ?? SETTINGS_TABS[0];
   return `<section class="card settings-card">
-    <span class="eyebrow">SETTINGS / 设置</span><h2>${tab.label}</h2>
+    <span class="eyebrow">${t('settings.eyebrow')}</span><h2>${tab.label()}</h2>
     ${settingsTab === 'privacy' ? privacySettingsHtml() : settingsTab === 'workspace' ? workspaceSettingsHtml() : settingsTab === 'experimental' ? experimentalSettingsHtml() : settingsTab === 'debug' ? debugSettingsHtml() : generalSettingsHtml()}
   </section>`;
 }
 
 function generalSettingsHtml(): string {
-  const used = storageInfo ? formatBytes(storageInfo.used) : '读取中…';
-  const quota = storageInfo ? formatBytes(storageInfo.quota) : '读取中…';
+  const used = storageInfo ? formatBytes(storageInfo.used) : t('读取中…');
+  const quota = storageInfo ? formatBytes(storageInfo.quota) : t('读取中…');
   const quotaMib = storageInfo ? Math.round(storageInfo.quota / (1024 * 1024)) : '';
-  return `<p>消息列表、联系人、发现与聊天功能已开放；插件与部分设置仍在后续阶段。</p>
-    <div class="probe-box"><h3>存储配额</h3>
-      <p>已接收附件占用 <strong id="storage-used">${used}</strong>，上限 <strong id="storage-quota">${quota}</strong>。</p>
-      <label for="storage-quota-mib">配额上限（MiB，256–65536）</label>
-      <div class="probe-row"><input id="storage-quota-mib" type="number" min="256" max="65536" value="${quotaMib}" ${storageBusy ? 'disabled' : ''}><button class="outline" data-action="save-storage-quota" ${storageBusy ? 'disabled' : ''}>保存配额</button></div>
-      <p id="storage-notice" role="status">${storageNotice}</p>
-      <small>配额只限制本机接收的附件；未完成的分片也计入占用。超过上限的新文件会被拒绝，已保存的记录不受影响。</small>
+  const langs = (Object.keys(LANG_LABEL) as Lang[]).map((id) => `<option value="${id}" ${getLang() === id ? 'selected' : ''}>${LANG_LABEL[id]}</option>`).join('');
+  return `<p>${t('general.open')}</p>
+    <div class="probe-box"><h3>${t('settings.language')}</h3>
+      <label for="app-language">${t('settings.language')}</label>
+      <div class="probe-row"><select id="app-language">${langs}</select></div>
+      <small>${t('settings.languageHint')}</small>
     </div>
-    <div class="probe-box"><h3>监听端口</h3>
-      <p>默认端口 <strong>${networkSettings.default_port}</strong>，应用启动时自动用它开始监听；正在运行的服务不受保存影响。</p>
-      <label for="listen-port">默认端口（1024–65535）</label>
-      <div class="probe-row"><input id="listen-port" type="number" min="1024" max="65535" value="${networkSettings.default_port}"><button class="outline" data-action="save-listen-port">保存端口</button></div>
+    <div class="probe-box"><h3>${t('general.storage')}</h3>
+      <p>${t('general.storageUsed')} <strong id="storage-used">${used}</strong>，${t('general.quotaLimit')} <strong id="storage-quota">${quota}</strong>。</p>
+      <label for="storage-quota-mib">${t('general.quotaLabel')}</label>
+      <div class="probe-row"><input id="storage-quota-mib" type="number" min="256" max="65536" value="${quotaMib}" ${storageBusy ? 'disabled' : ''}><button class="outline" data-action="save-storage-quota" ${storageBusy ? 'disabled' : ''}>${t('general.saveQuota')}</button></div>
+      <p id="storage-notice" role="status">${storageNotice}</p>
+      <small>${t('general.storageHint')}</small>
+    </div>
+    <div class="probe-box"><h3>${t('general.port')}</h3>
+      <p>${t('general.portCurrent')} <strong>${networkSettings.default_port}</strong>，${t('general.portDesc')}</p>
+      <label for="listen-port">${t('general.portLabel')}</label>
+      <div class="probe-row"><input id="listen-port" type="number" min="1024" max="65535" value="${networkSettings.default_port}"><button class="outline" data-action="save-listen-port">${t('general.savePort')}</button></div>
       <p id="network-notice" role="status">${networkNotice}</p>
-      <small>应用每次启动都会自动监听：端口被占用时自动重试，仍失败则改用空闲端口（mDNS 会广播实际端口）；监听意外停止会在 15 秒内自动恢复。手动停止后本次运行不再自动重启，修改端口在下次启动应用时生效。</small>
+      <small>${t('general.portHint')}</small>
+    </div>
+    <div class="probe-box"><h3>${t('general.notice')}</h3>
+      <p>${t('general.noticeCurrent')}：<strong>${noticeSettings.mode === 'popup' ? t('general.noticePopup') : noticeSettings.mode === 'tray' ? t('general.noticeTray') : t('general.noticeOff')}</strong></p>
+      <label for="notice-mode">${t('general.noticeWhen')}</label>
+      <select id="notice-mode">
+        <option value="popup" ${noticeSettings.mode === 'popup' ? 'selected' : ''}>${t('general.noticePopup')}</option>
+        <option value="tray" ${noticeSettings.mode === 'tray' ? 'selected' : ''}>${t('general.noticeTray')}</option>
+        <option value="off" ${noticeSettings.mode === 'off' ? 'selected' : ''}>${t('general.noticeOff')}</option>
+      </select>
+      <p><label><input id="notice-raise" type="checkbox" ${noticeSettings.raise_window ? 'checked' : ''}> ${t('general.noticeRaise')}</label></p>
+      <p><label><input id="notice-preview" type="checkbox" ${noticeSettings.preview ? 'checked' : ''}> ${t('general.noticePreview')}</label></p>
+      <div class="probe-row"><button class="outline" data-action="save-notice-settings">${t('general.saveNotice')}</button></div>
+      <p id="notice-settings-status" role="status">${noticeNotice}</p>
+      <small>浮窗只在本机显示，不上传任何内容；应用锁生效时浮窗不显示消息摘要。</small>
     </div>
     <p>本机身份指纹（SHA-256）：<br><code class="fingerprint">${fingerprint}</code></p>
-    <div class="probe-box"><h3>关闭窗口时</h3>
-      <p>当前行为：<strong>${CLOSE_ACTION_LABEL[windowSettings.close_action]}</strong></p>
-      <label for="close-action">点击窗口右上角关闭按钮时</label>
+    <div class="probe-box"><h3>${t('close.section')}</h3>
+      <p>${t('close.current')}：<strong>${CLOSE_ACTION_LABEL[windowSettings.close_action]()}</strong></p>
+      <label for="close-action">${t('close.whenClick')}</label>
       <select id="close-action">
-        <option value="ask" ${windowSettings.close_action === 'ask' ? 'selected' : ''}>每次询问（最小化到托盘 / 退出）</option>
-        <option value="tray" ${windowSettings.close_action === 'tray' ? 'selected' : ''}>最小化到托盘</option>
-        <option value="quit" ${windowSettings.close_action === 'quit' ? 'selected' : ''}>直接退出 Qbird</option>
+        <option value="ask" ${windowSettings.close_action === 'ask' ? 'selected' : ''}>${t('close.optAsk')}</option>
+        <option value="tray" ${windowSettings.close_action === 'tray' ? 'selected' : ''}>${t('close.optTray')}</option>
+        <option value="quit" ${windowSettings.close_action === 'quit' ? 'selected' : ''}>${t('close.optQuit')}</option>
       </select>
-      <div class="probe-row"><button class="outline" data-action="save-close-action">保存关闭行为</button></div>
+      <div class="probe-row"><button class="outline" data-action="save-close-action">${t('close.save')}</button></div>
       <p id="close-action-notice" role="status">${closeActionNotice}</p>
-      <small>最小化到托盘时 Qbird 继续在后台运行并接收消息，可从系统托盘图标或托盘菜单重新打开；托盘菜单也提供“退出 Qbird”。</small>
+      <small>${t('close.hint')}</small>
     </div>
-    <button data-page="about" class="outline">关于 Qbird</button>`;
+    <button data-page="about" class="outline">${t('about.aboutQbird')}</button>`;
 }
 
 function privacySettingsHtml(): string {
-  return `<div class="probe-box"><h3>应用锁</h3>
-      <p>当前状态：${lockState.has_password ? '已设置密码' : '未设置密码（锁定只隐藏界面，任何人都能直接解锁）'}；空闲自动锁定：${lockState.idle_minutes ? `${lockState.idle_minutes} 分钟（按系统无键鼠输入计算）` : '关闭'}。</p>
-      <label for="lock-current">当前应用锁密码${lockState.has_password ? '' : '（尚未设置，可留空）'}</label>
-      <input id="lock-current" type="password" maxlength="128" autocomplete="current-password">
-      <label for="lock-new">新密码（6–128 字符；留空并保存可移除密码）</label>
-      <input id="lock-new" type="password" maxlength="128" autocomplete="new-password">
-      <div class="probe-row"><button class="outline" data-action="save-lock-password" ${lockBusy ? 'disabled' : ''}>保存应用锁密码</button></div>
-      <label for="lock-idle">空闲自动锁定（分钟，0 表示关闭，最大 240）</label>
-      <div class="probe-row"><input id="lock-idle" type="number" min="0" max="240" value="${lockState.idle_minutes}" ${lockBusy ? 'disabled' : ''}><button class="outline" data-action="save-lock-idle" ${lockBusy ? 'disabled' : ''}>保存空闲设置</button></div>
-      <p id="lock-notice" role="status">${lockNotice}</p>
-      <small>应用锁只隐藏界面，不加密本地 SQLite 数据库；备份密码与应用锁密码相互独立。忘记应用锁密码时目前只能在本机设置中移除后重设；Windows 身份验证重置尚未实现。</small>
-    </div>
-    <div class="probe-box"><h3>文件接收</h3>
-      <p>当前策略：<strong>${ACCEPT_MODE_LABEL[fileAccept.mode]}</strong>；${fileAccept.remembered.length ? `已记住 ${fileAccept.remembered.length} 个来源` : '尚未记住任何来源'}。</p>
-      <label for="file-accept-mode">接收文件时的处理方式</label>
-      <select id="file-accept-mode">
-        <option value="always" ${fileAccept.mode === 'always' ? 'selected' : ''}>每次都询问（默认）</option>
-        <option value="remember" ${fileAccept.mode === 'remember' ? 'selected' : ''}>只询问未记住的来源</option>
-        <option value="auto" ${fileAccept.mode === 'auto' ? 'selected' : ''}>全部自动接收</option>
+  const idle = lockState.idle_minutes ? t('pr.idleMinutes', { n: lockState.idle_minutes }) : t('pr.off');
+  const remembered = fileAccept.remembered.length ? t('pr.remembered', { n: fileAccept.remembered.length }) : t('pr.noneRemembered');
+  const backupSummary = backupInfo ? t('pr.verifiedBackup', { n: backupInfo.message_count, time: new Date(backupInfo.created_at * 1000).toLocaleString(), chat: backupInfo.include_chat ? t('pr.withChat') : t('pr.noChat') }) : t('pr.noBackupYet');
+  return `<div class="probe-box"><h3>${t('pr.requests')}</h3>
+      <p>${t('pr.currentPolicy')}：<strong>${contactRequestMode === 'auto' ? t('pr.autoAccept') : t('pr.needConfirm')}</strong>；${t('pr.lanVisibility')}：<strong>${lanVisible ? t('pr.visible') : t('pr.hidden')}</strong>。</p>
+      <select id="contact-request-mode">
+        <option value="ask" ${contactRequestMode === 'ask' ? 'selected' : ''}>${t('pr.optAsk')}</option>
+        <option value="auto" ${contactRequestMode === 'auto' ? 'selected' : ''}>${t('pr.optAuto')}</option>
       </select>
-      <div class="probe-row"><button class="outline" data-action="save-file-accept">保存接收策略</button><button class="outline" data-action="forget-file-sources" ${fileAccept.remembered.length ? '' : 'disabled'}>清除已记住的来源</button></div>
-      <label>单聊接收目录</label>
-      <p><code class="recv-dir">${escapeText(fileRecv.direct || '读取中…')}</code>${fileRecv.direct_custom ? '（自定义）' : '（默认）'}</p>
-      <div class="probe-row"><button class="outline" data-action="choose-recv-direct">更改单聊目录…</button><button class="outline" data-action="reset-recv-direct" ${fileRecv.direct_custom ? '' : 'disabled'}>恢复默认</button></div>
-      <label>群聊接收目录</label>
-      <p><code class="recv-dir">${escapeText(fileRecv.group || '读取中…')}</code>${fileRecv.group_custom ? '（自定义）' : '（默认）'}</p>
-      <div class="probe-row"><button class="outline" data-action="choose-recv-group">更改群聊目录…</button><button class="outline" data-action="reset-recv-group" ${fileRecv.group_custom ? '' : 'disabled'}>恢复默认</button></div>
+      <p><label><input id="lan-visible" type="checkbox" ${lanVisible ? 'checked' : ''}> ${t('pr.lanVisible')}</label></p>
+      <div class="probe-row"><button class="outline" data-action="save-contact-privacy">${t('pr.save')}</button></div>
+      <p id="contact-privacy-status" role="status">${privacyNotice}</p>
+      <small>${t('pr.hint')}</small>
+    </div>
+    <div class="probe-box"><h3>${t('pr.appLock')}</h3>
+      <p>${t('pr.appLockState')}：<strong>${lockState.has_password ? t('pr.hasPassword') : t('pr.noPassword')}</strong>；${t('pr.idleAuto')}：${idle}。</p>
+      <label for="lock-current">${t('pr.currentPassword')}${lockState.has_password ? '' : t('pr.noPasswordYet')}</label>
+      <input id="lock-current" type="password" maxlength="128" autocomplete="current-password">
+      <label for="lock-new">${t('pr.newPassword')}</label>
+      <input id="lock-new" type="password" maxlength="128" autocomplete="new-password">
+      <div class="probe-row"><button class="outline" data-action="save-lock-password" ${lockBusy ? 'disabled' : ''}>${t('pr.saveLockPassword')}</button></div>
+      <label for="lock-idle">${t('pr.idleLabel')}</label>
+      <div class="probe-row"><input id="lock-idle" type="number" min="0" max="240" value="${lockState.idle_minutes}" ${lockBusy ? 'disabled' : ''}><button class="outline" data-action="save-lock-idle" ${lockBusy ? 'disabled' : ''}>${t('pr.saveIdle')}</button></div>
+      <p id="lock-notice" role="status">${lockNotice}</p>
+      <small>${t('pr.lockHint')}</small>
+    </div>
+    <div class="probe-box"><h3>${t('pr.fileRecv')}</h3>
+      <p>${t('pr.currentPolicy')}：<strong>${ACCEPT_MODE_LABEL[fileAccept.mode]()}</strong>；${remembered}。</p>
+      <label for="file-accept-mode">${t('pr.acceptModeLabel')}</label>
+      <select id="file-accept-mode">
+        <option value="always" ${fileAccept.mode === 'always' ? 'selected' : ''}>${t('pr.acceptAlways')}</option>
+        <option value="remember" ${fileAccept.mode === 'remember' ? 'selected' : ''}>${t('pr.acceptRemember')}</option>
+        <option value="auto" ${fileAccept.mode === 'auto' ? 'selected' : ''}>${t('pr.acceptAuto')}</option>
+      </select>
+      <div class="probe-row"><button class="outline" data-action="save-file-accept">${t('pr.saveAccept')}</button><button class="outline" data-action="forget-file-sources" ${fileAccept.remembered.length ? '' : 'disabled'}>${t('pr.forget')}</button></div>
+      <label>${t('pr.directDir')}</label>
+      <p><code class="recv-dir">${escapeText(fileRecv.direct || t('side.reading'))}</code>${fileRecv.direct_custom ? t('pr.custom') : t('pr.default')}</p>
+      <div class="probe-row"><button class="outline" data-action="choose-recv-direct">${t('pr.changeDirect')}</button><button class="outline" data-action="reset-recv-direct" ${fileRecv.direct_custom ? '' : 'disabled'}>${t('ob.resetDefault')}</button></div>
+      <label>${t('pr.groupDir')}</label>
+      <p><code class="recv-dir">${escapeText(fileRecv.group || t('side.reading'))}</code>${fileRecv.group_custom ? t('pr.custom') : t('pr.default')}</p>
+      <div class="probe-row"><button class="outline" data-action="choose-recv-group">${t('pr.changeGroup')}</button><button class="outline" data-action="reset-recv-group" ${fileRecv.group_custom ? '' : 'disabled'}>${t('ob.resetDefault')}</button></div>
       <p id="file-accept-notice" role="status">${fileAcceptNotice}</p>
-      <small>路径变更只影响之后接收的文件，进行中的传输和已有附件保持原路径。自定义到应用数据目录之外的文件夹不占用应用存储配额，请自行管理磁盘空间；网络盘或移动盘断线会导致传输失败，恢复后继续续传。</small>
+      <small>${t('pr.recvHint')}</small>
     </div>
-    <div class="probe-box"><h3>聊天备份与恢复</h3>
-      <p>备份使用密码加密并校验完整性；${backupInfo ? `已校验备份：${backupInfo.message_count} 条消息 · ${new Date(backupInfo.created_at * 1000).toLocaleString()}${backupInfo.include_chat ? ' · 含聊天记录' : ' · 不含聊天记录'}` : '尚未校验备份文件'}</p>
-      <label for="backup-password">备份密码（8–256 字符）</label>
+    <div class="probe-box"><h3>${t('pr.backup')}</h3>
+      <p>${t('pr.backupIntro')}${backupSummary}</p>
+      <label for="backup-password">${t('pr.backupPassword')}</label>
       <input id="backup-password" type="password" maxlength="256" autocomplete="new-password" value="${backupPassword.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;')}">
-      <p><label><input id="backup-include-chat" type="checkbox" checked> 导出时包含聊天记录（取消后仅含联系人与群组）</label></p>
-      <div class="probe-row"><button class="outline" data-action="backup-export" ${backupBusy ? 'disabled' : ''}>导出备份…</button><button class="outline" data-action="backup-choose" ${backupBusy ? 'disabled' : ''}>选择备份文件…</button><button class="outline" data-action="backup-inspect" ${backupBusy || !backupPath ? 'disabled' : ''}>校验备份</button></div>
-      <p id="backup-path">${backupPath ? `当前文件：${backupPath}` : '合并恢复会跳过相同 ID 且内容一致的消息；覆盖恢复会先在本机保存一份恢复前快照。'}</p>
-      <div class="probe-row"><button class="outline" data-action="backup-restore-merge" ${backupBusy || !backupPath ? 'disabled' : ''}>合并恢复</button><button class="outline danger" data-action="backup-restore-overwrite" ${backupBusy || !backupPath ? 'disabled' : ''}>覆盖恢复</button></div>
+      <p><label><input id="backup-include-chat" type="checkbox" checked> ${t('pr.includeChat')}</label></p>
+      <div class="probe-row"><button class="outline" data-action="backup-export" ${backupBusy ? 'disabled' : ''}>${t('pr.exportBackup')}</button><button class="outline" data-action="backup-choose" ${backupBusy ? 'disabled' : ''}>${t('pr.chooseBackup')}</button><button class="outline" data-action="backup-inspect" ${backupBusy || !backupPath ? 'disabled' : ''}>${t('pr.inspect')}</button></div>
+      <p id="backup-path">${backupPath ? t('pr.currentFile', { path: backupPath }) : t('pr.mergeNote')}</p>
+      <div class="probe-row"><button class="outline" data-action="backup-restore-merge" ${backupBusy || !backupPath ? 'disabled' : ''}>${t('pr.merge')}</button><button class="outline danger" data-action="backup-restore-overwrite" ${backupBusy || !backupPath ? 'disabled' : ''}>${t('pr.overwrite')}</button></div>
       <p id="backup-notice" role="status">${backupNotice}</p>
-      <small>备份不包含身份私钥与附件文件；在新设备恢复会使用新身份，附件需另行拷贝。恢复不会改动本机存储配额。密码丢失后备份无法解密。</small>
+      <small>${t('pr.backupHint')}</small>
     </div>
-    <div class="probe-box"><h3>聊天记录导入导出</h3>
-      <p>加密导出当前打开会话（单聊、群聊或自聊）的纯文字记录；附件文件不包含在内。</p>
-      <label for="chat-archive-password">聊天记录密码（8–256 字符）</label>
+    <div class="probe-box"><h3>${t('pr.archive')}</h3>
+      <p>${t('pr.archiveIntro')}</p>
+      <label for="chat-archive-password">${t('pr.archivePassword')}</label>
       <input id="chat-archive-password" type="password" maxlength="256" autocomplete="new-password">
-      <div class="probe-row"><button class="outline" data-action="export-chat-archive" ${chatArchiveBusy ? 'disabled' : ''}>导出当前会话…</button><button class="outline" data-action="import-chat-archive" ${chatArchiveBusy ? 'disabled' : ''}>导入聊天记录…</button></div>
+      <div class="probe-row"><button class="outline" data-action="export-chat-archive" ${chatArchiveBusy ? 'disabled' : ''}>${t('pr.exportArchive')}</button><button class="outline" data-action="import-chat-archive" ${chatArchiveBusy ? 'disabled' : ''}>${t('pr.importArchive')}</button></div>
       <p id="chat-archive-notice" role="status">${chatArchiveNotice}</p>
-      <small>导入只合并文字消息：相同 ID 且内容一致会跳过，内容不同的记录不会被覆盖；单聊需对方已确认，群聊需你仍是成员。密码丢失后文件无法解密。</small>
+      <small>${t('pr.archiveHint')}</small>
     </div>`;
 }
 
 function workspaceSettingsHtml(): string {
-  return `<div class="probe-box"><h3>输入与快捷键</h3>
-      <label for="send-shortcut">发送方式</label>
+  return `<div class="probe-box"><h3>${t('ws.input')}</h3>
+      <label for="send-shortcut">${t('ws.sendMethod')}</label>
       <select id="send-shortcut">
-        <option value="enter" ${composer.send_shortcut === 'enter' ? 'selected' : ''}>Enter 发送，Shift+Enter 换行</option>
-        <option value="ctrl+enter" ${composer.send_shortcut === 'ctrl+enter' ? 'selected' : ''}>Ctrl+Enter 发送，Enter 换行</option>
+        <option value="enter" ${composer.send_shortcut === 'enter' ? 'selected' : ''}>${t('ws.enterSend')}</option>
+        <option value="ctrl+enter" ${composer.send_shortcut === 'ctrl+enter' ? 'selected' : ''}>${t('ws.ctrlEnterSend')}</option>
       </select>
-      <label for="composer-rows">输入区高度（行，2–12）</label>
-      <div class="probe-row"><input id="composer-rows" type="number" min="2" max="12" value="${composer.rows}"><button class="outline" data-action="save-composer">保存输入设置</button></div>
+      <label for="composer-rows">${t('ws.rowsLabel')}</label>
+      <div class="probe-row"><input id="composer-rows" type="number" min="2" max="12" value="${composer.rows}"><button class="outline" data-action="save-composer">${t('ws.saveComposer')}</button></div>
       <p id="composer-notice" role="status">${composerNotice}</p>
-      <small>发送方式对单聊、群聊和自聊一致生效；输入区高度只影响本机界面，不随消息发送。</small>
+      <small>${t('ws.inputHint')}</small>
     </div>
-    <div class="probe-box"><h3>团队与品牌</h3>
-      <p>团队名称 ${team.name ? `<strong>${escapeText(team.name)}</strong>` : '未设置（显示 Qbird 青鸟）'}；团队 Logo：${team.has_logo ? '已设置' : '未设置'}。</p>
-      <label for="team-name">团队名称（1–64 字符，留空恢复产品名）</label>
-      <div class="probe-row"><input id="team-name" type="text" maxlength="64" value="${escapeText(team.name)}"><button class="outline" data-action="save-team-name">保存名称</button></div>
-      <div class="probe-row"><button class="outline" data-action="choose-team-logo">选择 Logo…</button><button class="outline" data-action="clear-team-logo" ${team.has_logo ? '' : 'disabled'}>移除 Logo</button></div>
+    <div class="probe-box"><h3>${t('ws.team')}</h3>
+      <p>${t('ws.teamName')} ${team.name ? `<strong>${escapeText(team.name)}</strong>` : t('ws.unset')}；${t('ws.teamLogo')}：${team.has_logo ? t('ws.set') : t('ws.unsetShort')}。</p>
+      <label for="team-name">${t('ws.teamNameLabel')}</label>
+      <div class="probe-row"><input id="team-name" type="text" maxlength="64" value="${escapeText(team.name)}"><button class="outline" data-action="save-team-name">${t('ws.saveName')}</button></div>
+      <div class="probe-row"><button class="outline" data-action="choose-team-logo">${t('ws.chooseLogo')}</button><button class="outline" data-action="clear-team-logo" ${team.has_logo ? '' : 'disabled'}>${t('ws.removeLogo')}</button></div>
       <p id="team-notice" role="status">${teamNotice}</p>
-      <small>团队名称与 Logo 只保存在本机侧栏与设置页，不随消息或群组发送。</small>
+      <small>${t('ws.teamHint')}</small>
     </div>
-    <div class="probe-box"><h3>右侧工作区</h3>
-      <p>图片打开方式：${imageOpenMode === 'workspace' ? '在右侧工作区预览' : '在灯箱中放大'}；附件打开方式：${fileOpenMode === 'system' ? '用默认程序打开' : '在右侧工作区预览'}。</p>
-      <label for="image-open-mode">点击聊天图片时</label>
+    <div class="probe-box"><h3>${t('ws.rightPanel')}</h3>
+      <p>${t('ws.imageMode')}：${imageOpenMode === 'workspace' ? t('ws.inWorkspace') : t('ws.inLightbox')}；${t('ws.fileMode')}：${fileOpenMode === 'system' ? t('ws.withSystem') : t('ws.inWorkspace')}。</p>
+      <label for="image-open-mode">${t('ws.whenImage')}</label>
       <select id="image-open-mode">
-        <option value="lightbox" ${imageOpenMode === 'lightbox' ? 'selected' : ''}>灯箱查看（可缩放、旋转、拖拽）</option>
-        <option value="workspace" ${imageOpenMode === 'workspace' ? 'selected' : ''}>右侧工作区打开</option>
+        <option value="lightbox" ${imageOpenMode === 'lightbox' ? 'selected' : ''}>${t('ws.lightboxOpt')}</option>
+        <option value="workspace" ${imageOpenMode === 'workspace' ? 'selected' : ''}>${t('ws.workspaceOpt')}</option>
       </select>
-      <div class="probe-row"><button class="outline" data-action="save-image-open-mode">保存图片打开方式</button></div>
+      <div class="probe-row"><button class="outline" data-action="save-image-open-mode">${t('ws.saveImageMode')}</button></div>
       <p id="image-open-notice" role="status">${imageOpenNotice}</p>
-      <label for="file-open-mode">点击聊天文件时</label>
+      <label for="file-open-mode">${t('ws.whenFile')}</label>
       <select id="file-open-mode">
-        <option value="workspace" ${fileOpenMode === 'workspace' ? 'selected' : ''}>在右侧工作区预览</option>
-        <option value="system" ${fileOpenMode === 'system' ? 'selected' : ''}>用默认程序打开</option>
+        <option value="workspace" ${fileOpenMode === 'workspace' ? 'selected' : ''}>${t('ws.inWorkspace')}</option>
+        <option value="system" ${fileOpenMode === 'system' ? 'selected' : ''}>${t('ws.withSystem')}</option>
       </select>
-      <div class="probe-row"><button class="outline" data-action="save-file-open-mode">保存附件打开方式</button></div>
+      <div class="probe-row"><button class="outline" data-action="save-file-open-mode">${t('ws.saveFileMode')}</button></div>
       <p id="file-open-notice" role="status">${fileOpenNotice}</p>
-      <p>右侧工作区为全局标签页，切换会话不关闭；支持图片、PDF、TXT/日志/CSV/JSON、Markdown、禁用脚本的 HTML 与网页链接。</p>
-      <small>预览只读取已完成的本地附件，不会上传内容；PDF 依赖 Windows WebView2 内置阅读器，docx/xlsx/pptx 暂无内置预览，可用默认程序打开或安装预览插件。</small>
+      <p>${t('ws.panelDesc')}</p>
+      <small>${t('ws.panelHint')}</small>
     </div>
-    <div class="probe-box"><h3>表情</h3>
-      <p>常用表情和本地表情收藏在聊天输入区的“表情”按钮中管理；收藏的表情按图片文件发送给已确认联系人。</p>
-      <small>本地收藏最多 64 个，单个不超过 512 KiB，支持 PNG、JPEG、GIF 与 WebP。</small>
+    <div class="probe-box"><h3>${t('ws.emoji')}</h3>
+      <p>${t('ws.emojiDesc')}</p>
+      <small>${t('ws.emojiHint')}</small>
     </div>
 `;
 }
 
 function experimentalSettingsHtml(): string {
-  return `<div class="probe-box"><h3>实验功能</h3>
-      <p><label><input id="experiment-group-file-quote" type="checkbox" ${experiments.group_file_quote ? 'checked' : ''}> 允许引用群文件消息（实验）</label></p>
-      <p>开启后，群聊里可以引用文件消息并在气泡中显示文件名；关闭时文件消息不能引用。默认关闭，不影响普通成员 @。</p>
-      <div class="probe-row"><button class="outline" data-action="save-experiment">保存实验设置</button></div>
+  return `<div class="probe-box"><h3>${t('exp.title')}</h3>
+      <p><label><input id="experiment-group-file-quote" type="checkbox" ${experiments.group_file_quote ? 'checked' : ''}> ${t('exp.groupQuote')}</label></p>
+      <p>${t('exp.groupQuoteDesc')}</p>
+      <div class="probe-row"><button class="outline" data-action="save-experiment">${t('exp.save')}</button></div>
       <p id="experiment-notice" role="status">${experimentNotice}</p>
-      <small>Agent 联系人等能力仍未实现，不会显示为可操作开关。</small>
+      <small>${t('exp.agentNote')}</small>
     </div>
-    <div class="probe-box"><h3>预览插件（只读）</h3>
-      <p>插件以本地文件夹安装，页面在沙箱 iframe 中运行：没有同源权限和网络访问，只能拿到被预览文件的字节，看不到聊天数据、身份或本机路径。</p>
-      <ul id="plugin-list" class="discovery-results">${plugins.map(plugin => `<li><span class="contact-title">${escapeText(plugin.name)} ${escapeText(plugin.version)} · ${escapeText(plugin.extensions.join(' / ')) || '无扩展名'}</span><div class="contact-actions"><label><input type="checkbox" data-plugin-toggle="${escapeText(plugin.id)}" ${plugin.enabled ? 'checked' : ''}> 启用</label><button class="linkish" data-action="remove-plugin" data-id="${escapeText(plugin.id)}">${pluginRemovePending === plugin.id ? '确认移除' : '移除'}</button></div></li>`).join('') || '<li>尚未安装插件</li>'}</ul>
-      <div class="probe-row"><button class="outline" data-action="install-plugin">从文件夹安装…</button></div>
+    <div class="probe-box"><h3>${t('exp.plugins')}</h3>
+      <p>${t('exp.pluginIntro')}</p>
+      <ul id="plugin-list" class="discovery-results">${plugins.map(plugin => `<li><span class="contact-title">${escapeText(plugin.name)} ${escapeText(plugin.version)} · ${escapeText(plugin.extensions.join(' / ')) || t('exp.noExt')}</span><div class="contact-actions"><label><input type="checkbox" data-plugin-toggle="${escapeText(plugin.id)}" ${plugin.enabled ? 'checked' : ''}> ${t('exp.enable')}</label><button class="linkish" data-action="remove-plugin" data-id="${escapeText(plugin.id)}">${pluginRemovePending === plugin.id ? t('exp.confirmRemove') : t('exp.remove')}</button></div></li>`).join('') || `<li>${t('exp.noPlugins')}</li>`}</ul>
+      <div class="probe-row"><button class="outline" data-action="install-plugin">${t('exp.install')}</button></div>
       <p id="plugin-notice" role="status">${pluginNotice}</p>
-      <small>第一版只读：docx、pptx、pdf、xlsx 等由插件自带查看器渲染；编辑写回不在本版。插件目录位于本机应用数据目录的 plugins/ 下。</small>
+      <small>${t('exp.pluginHint')}</small>
     </div>`;
 }
 
@@ -980,73 +1157,73 @@ function diagLine(label: string, value: string, tone: 'ok' | 'warn' | 'muted' = 
 }
 
 function diskText(disk: DiskSpace): string {
-  if (disk.free_bytes === null || disk.total_bytes === null) return `未获取${disk.error ? `：${disk.error}` : ''}`;
-  return `可用 ${formatBytes(disk.free_bytes)} / 共 ${formatBytes(disk.total_bytes)}`;
+  if (disk.free_bytes === null || disk.total_bytes === null) return `${t('未获取')}${disk.error ? `${t('：')}${disk.error}` : ''}`;
+  return `${t('可用')} ${formatBytes(disk.free_bytes)} / ${t('共')} ${formatBytes(disk.total_bytes)}`;
 }
 
 function networkReportHtml(): string {
-  if (!networkReport) return '<p class="hint">尚未检测。点击“重新检测”读取本机网络状态。</p>';
+  if (!networkReport) return `<p class="hint">${t('尚未检测。点击“重新检测”读取本机网络状态。')}</p>`;
   const report = networkReport;
-  const service = report.service_running ? `运行中 · 端口 ${report.service_port ?? '未知'}` : '未启动';
+  const service = report.service_running ? `${t('运行中 · 端口')} ${report.service_port ?? t('未知')}` : t('未启动');
   const chat = report.service_running
-    ? (report.chat_enabled ? '已启用（可接收消息和文件）' : '未启用（仅身份探测）')
-    : '不可用（服务未启动）';
+    ? (report.chat_enabled ? t('已启用（可接收消息和文件）') : t('未启用（仅身份探测）'))
+    : t('不可用（服务未启动）');
   const portOk = report.default_port_available || (report.service_running && report.service_port === report.default_port);
-  const port = `${report.default_port} · ${report.default_port_available ? '空闲' : (portOk ? '由本机监听占用' : '被其他程序占用')}`;
-  const discovery = report.discovery_started ? `已启动 · 候选 ${report.lan_candidates} 个` : '未启动';
+  const port = `${report.default_port} · ${report.default_port_available ? t('空闲') : (portOk ? t('由本机监听占用') : t('被其他程序占用'))}`;
+  const discovery = report.discovery_started ? `${t('已启动 · 候选')} ${report.lan_candidates} ${t('个')}` : t('未启动');
   return `<div class="diag-grid">
-      ${diagLine('平台 / 主机', `${report.platform} · ${report.hostname}`)}
-      ${diagLine('本机 IPv4', report.local_ipv4.length ? report.local_ipv4.join('、') : '未获取', report.local_ipv4.length ? 'ok' : 'warn')}
-      ${diagLine('监听服务', service, report.service_running ? 'ok' : 'warn')}
-      ${diagLine('聊天接收', chat, report.chat_enabled ? 'ok' : 'warn')}
-      ${diagLine('默认端口', port, portOk ? 'ok' : 'warn')}
-      ${diagLine('局域网发现', discovery, report.lan_candidates > 0 ? 'ok' : 'muted')}
-      ${diagLine('已确认联系人', String(report.contacts))}
+      ${diagLine(t('平台 / 主机'), `${report.platform} · ${report.hostname}`)}
+      ${diagLine(t('本机 IPv4'), report.local_ipv4.length ? report.local_ipv4.join('、') : t('未获取'), report.local_ipv4.length ? 'ok' : 'warn')}
+      ${diagLine(t('监听服务'), service, report.service_running ? 'ok' : 'warn')}
+      ${diagLine(t('聊天接收'), chat, report.chat_enabled ? 'ok' : 'warn')}
+      ${diagLine(t('默认端口'), port, portOk ? 'ok' : 'warn')}
+      ${diagLine(t('局域网发现'), discovery, report.lan_candidates > 0 ? 'ok' : 'muted')}
+      ${diagLine(t('已确认联系人'), String(report.contacts))}
     </div>
-    ${report.notes.length ? `<ul class="diag-notes">${report.notes.map((note) => `<li>${escapeText(note)}</li>`).join('')}</ul>` : '<p class="diag-ok">未发现明显网络异常。</p>'}`;
+    ${report.notes.length ? `<ul class="diag-notes">${report.notes.map((note) => `<li>${escapeText(note)}</li>`).join('')}</ul>` : `<p class="diag-ok">${t('未发现明显网络异常。')}</p>`}`;
 }
 
 function recvDirLine(label: string, dir: RecvDirReport): string {
-  const suffix = dir.custom ? '（自定义）' : '（默认）';
-  const usage = dir.exists ? formatBytes(dir.usage.bytes) : '目录不存在';
+  const suffix = dir.custom ? t('（自定义）') : t('（默认）');
+  const usage = dir.exists ? formatBytes(dir.usage.bytes) : t('目录不存在');
   return diagLine(label, `${dir.path}${suffix} · ${usage} · ${diskText(dir.disk)}`, dir.exists ? 'muted' : 'warn');
 }
 
 function spaceReportHtml(): string {
-  if (!spaceReport) return '<p class="hint">尚未检测。点击“重新检测空间”读取本地占用与磁盘余量。</p>';
+  if (!spaceReport) return `<p class="hint">${t('尚未检测。点击“重新检测空间”读取本地占用与磁盘余量。')}</p>`;
   const report = spaceReport;
   const percent = report.attachments_quota > 0
     ? Math.min(100, Math.round((report.attachments_bytes / report.attachments_quota) * 100))
     : 0;
   return `<div class="diag-grid">
-      ${diagLine('应用数据目录', `${report.data_dir}（${formatBytes(report.data_dir_usage.bytes)}）`)}
-      ${diagLine('数据目录磁盘', diskText(report.data_dir_disk))}
-      ${diagLine('数据库文件', formatBytes(report.database_bytes))}
-      ${diagLine('附件占用', `${formatBytes(report.attachments_bytes)} / ${formatBytes(report.attachments_quota)}（${percent}%）`)}
+      ${diagLine(t('应用数据目录'), `${report.data_dir}（${formatBytes(report.data_dir_usage.bytes)}）`)}
+      ${diagLine(t('数据目录磁盘'), diskText(report.data_dir_disk))}
+      ${diagLine(t('数据库文件'), formatBytes(report.database_bytes))}
+      ${diagLine(t('附件占用'), `${formatBytes(report.attachments_bytes)} / ${formatBytes(report.attachments_quota)}（${percent}%）`)}
       <progress max="100" value="${percent}"></progress>
-      ${recvDirLine('单聊接收目录', report.direct)}
-      ${recvDirLine('群聊接收目录', report.group)}
+      ${recvDirLine(t('单聊接收目录'), report.direct)}
+      ${recvDirLine(t('群聊接收目录'), report.group)}
     </div>
-    ${report.notes.length ? `<ul class="diag-notes">${report.notes.map((note) => `<li>${escapeText(note)}</li>`).join('')}</ul>` : '<p class="diag-ok">空间状态正常。</p>'}`;
+    ${report.notes.length ? `<ul class="diag-notes">${report.notes.map((note) => `<li>${escapeText(note)}</li>`).join('')}</ul>` : `<p class="diag-ok">${t('空间状态正常。')}</p>`}`;
 }
 
 function debugSettingsHtml(): string {
-  return `<p>用于排查“看不到同事、收不到消息或文件”的本机自检。检测只读取本机状态，不上传任何内容。</p>
-    <div class="probe-box"><h3>网络检测与修复</h3>
+  return `<p>${t('用于排查“看不到同事、收不到消息或文件”的本机自检。检测只读取本机状态，不上传任何内容。')}</p>
+    <div class="probe-box"><h3>${t('网络检测与修复')}</h3>
       <div class="probe-row">
-        <button class="outline" data-action="debug-scan" ${diagnosticsLoading ? 'disabled' : ''}>重新检测</button>
-        <button class="outline" data-action="debug-repair" data-mode="restart" ${repairBusy ? 'disabled' : ''}>重启聊天服务</button>
-        <button class="outline" data-action="debug-repair" data-mode="rediscover" ${repairBusy ? 'disabled' : ''}>重建局域网发现</button>
-        <button class="outline" data-action="debug-repair" data-mode="all" ${repairBusy ? 'disabled' : ''}>一键修复</button>
+        <button class="outline" data-action="debug-scan" ${diagnosticsLoading ? 'disabled' : ''}>${t('重新检测')}</button>
+        <button class="outline" data-action="debug-repair" data-mode="restart" ${repairBusy ? 'disabled' : ''}>${t('重启聊天服务')}</button>
+        <button class="outline" data-action="debug-repair" data-mode="rediscover" ${repairBusy ? 'disabled' : ''}>${t('重建局域网发现')}</button>
+        <button class="outline" data-action="debug-repair" data-mode="all" ${repairBusy ? 'disabled' : ''}>${t('一键修复')}</button>
       </div>
       <p id="debug-network-notice" role="status">${escapeText(diagnosticsNotice)}</p>
       <div id="debug-network-report">${networkReportHtml()}</div>
-      <small>“重启聊天服务”会短暂断开监听后按原端口恢复，原端口不可用时改用默认端口；“重建局域网发现”只刷新广播浏览。两者都不会改动身份、联系人和聊天记录。</small>
+      <small>${t('“重启聊天服务”会短暂断开监听后按原端口恢复，原端口不可用时改用默认端口；“重建局域网发现”只刷新广播浏览。两者都不会改动身份、联系人和聊天记录。')}</small>
     </div>
-    <div class="probe-box"><h3>空间检测</h3>
-      <div class="probe-row"><button class="outline" data-action="debug-space" ${diagnosticsLoading ? 'disabled' : ''}>重新检测空间</button></div>
+    <div class="probe-box"><h3>${t('空间检测')}</h3>
+      <div class="probe-row"><button class="outline" data-action="debug-space" ${diagnosticsLoading ? 'disabled' : ''}>${t('重新检测空间')}</button></div>
       <div id="debug-space-report">${spaceReportHtml()}</div>
-      <small>统计为本地文件实际占用。自定义接收目录位于应用数据目录之外时不受存储配额限制，但同样受磁盘容量限制；空间不足通常是“对方发送失败”或“接收失败”的原因之一。</small>
+      <small>${t('统计为本地文件实际占用。自定义接收目录位于应用数据目录之外时不受存储配额限制，但同样受磁盘容量限制；空间不足通常是“对方发送失败”或“接收失败”的原因之一。')}</small>
     </div>`;
 }
 
@@ -1087,16 +1264,16 @@ function paintDebugReports(): void {
 async function runNetworkRepair(mode: 'restart' | 'rediscover' | 'all'): Promise<void> {
   if (!isTauri() || repairBusy) return;
   repairBusy = true;
-  diagnosticsNotice = '正在执行修复…';
+  diagnosticsNotice = t('正在执行修复…');
   paintDebugReports();
   try {
     const report = await invoke<RepairReport>('v1_network_repair', { action: mode });
-    const summary = report.steps.map((step) => `${step.ok ? '✓' : '✗'} ${step.step}：${step.detail}`).join('；');
-    diagnosticsNotice = `修复完成：${summary}`;
+    const summary = report.steps.map((step) => `${step.ok ? '✓' : '✗'} ${step.step}${t('：')}${step.detail}`).join(t('；'));
+    diagnosticsNotice = `${t('修复完成：')}${summary}`;
     try { await loadDebugData(); }
-    catch { diagnosticsNotice += '；修复后重新检测失败，请手动重新检测。'; }
+    catch { diagnosticsNotice += t('；修复后重新检测失败，请手动重新检测。'); }
   } catch (error) {
-    diagnosticsNotice = `修复失败：${displayError(error)}`;
+    diagnosticsNotice = `${t('修复失败：')}${displayError(error)}`;
   } finally {
     repairBusy = false;
     paintDebugReports();
@@ -1105,7 +1282,7 @@ async function runNetworkRepair(mode: 'restart' | 'rediscover' | 'all'): Promise
 
 async function takeScreenshot(): Promise<void> {
   if (!isTauri()) return;
-  if (!direct.peer && !groupChat.groupId) { groupChat.notify('请先打开一个单聊或群聊再截图。'); return; }
+  if (!direct.peer && !groupChat.groupId) { groupChat.notify(t('请先打开一个单聊或群聊再截图。')); return; }
   try { await invoke('v1_begin_capture'); }
   catch (error) { groupChat.notify(displayError(error)); }
 }
@@ -1123,10 +1300,10 @@ async function handleImagePaste(event: ClipboardEvent): Promise<void> {
   if (!file) return;
   event.preventDefault();
   const extension = file.type === 'image/bmp' ? 'bmp' : file.type === 'image/png' ? 'png' : '';
-  if (!extension) { groupChat.notify('仅支持粘贴 PNG/BMP 图片；JPG 请先另存为文件再拖入。'); return; }
+  if (!extension) { groupChat.notify(t('仅支持粘贴 PNG/BMP 图片；JPG 请先另存为文件再拖入。')); return; }
   try {
     const bytes = Array.from(new Uint8Array(await file.arrayBuffer()));
-    if (!bytes.length || bytes.length > 16 * 1024 * 1024) { groupChat.notify('粘贴的图片过大（上限 16 MiB）'); return; }
+    if (!bytes.length || bytes.length > 16 * 1024 * 1024) { groupChat.notify(t('粘贴的图片过大（上限 16 MiB）')); return; }
     const path = await invoke<string>('v1_save_temp_image', { bytes, extension });
     if (direct.peer) await direct.stagePaths([path]);
     else if (groupChat.groupId) await groupChat.stagePaths([path]);
@@ -1136,9 +1313,9 @@ async function handleImagePaste(event: ClipboardEvent): Promise<void> {
 async function refreshFileAccept(): Promise<void> {
   if (!isTauri()) return;
   try { fileAccept = await invoke<FileAcceptSettings>('v1_file_accept_settings'); }
-  catch { fileAcceptNotice = '无法读取接收设置'; }
+  catch { fileAcceptNotice = t('status.fileAcceptReadErr'); }
   try { fileRecv = await invoke<FileRecvSettings>('v1_file_recv_settings'); }
-  catch { fileAcceptNotice = '无法读取接收目录'; }
+  catch { fileAcceptNotice = t('status.recvDirReadErr'); }
 }
 
 async function saveFileAccept(): Promise<void> {
@@ -1146,7 +1323,7 @@ async function saveFileAccept(): Promise<void> {
   const mode = app.querySelector<HTMLSelectElement>('#file-accept-mode')?.value ?? 'always';
   try {
     fileAccept = await invoke<FileAcceptSettings>('v1_set_file_accept_policy', { mode });
-    fileAcceptNotice = `已保存：${ACCEPT_MODE_LABEL[fileAccept.mode]}。`;
+    fileAcceptNotice = `${t('pr.acceptSaved')}${ACCEPT_MODE_LABEL[fileAccept.mode]()}。`;
   } catch (error) { fileAcceptNotice = displayError(error); }
   if (page === 'settings') render();
 }
@@ -1155,7 +1332,7 @@ async function forgetFileSources(): Promise<void> {
   if (!isTauri()) return;
   try {
     fileAccept = await invoke<FileAcceptSettings>('v1_forget_file_sources');
-    fileAcceptNotice = '已清除记住的来源，之后会重新询问。';
+    fileAcceptNotice = t('status.forgotSources');
   } catch (error) { fileAcceptNotice = displayError(error); }
   if (page === 'settings') render();
 }
@@ -1163,10 +1340,10 @@ async function forgetFileSources(): Promise<void> {
 async function chooseRecvDir(kind: 'direct' | 'group'): Promise<void> {
   if (!isTauri()) return;
   try {
-    const picked = await openFileDialog({ directory: true, multiple: false, title: kind === 'direct' ? '选择单聊文件接收目录' : '选择群聊文件接收目录' });
+    const picked = await openFileDialog({ directory: true, multiple: false, title: kind === 'direct' ? t('选择单聊文件接收目录') : t('选择群聊文件接收目录') });
     if (typeof picked !== 'string') return;
     fileRecv = await invoke<FileRecvSettings>('v1_set_file_recv_dir', { kind, path: picked });
-    fileAcceptNotice = `已更新${kind === 'direct' ? '单聊' : '群聊'}接收目录。`;
+    fileAcceptNotice = t('status.recvDirUpdated', { kind: kind === 'direct' ? t('status.kindDirect') : t('status.kindGroup') });
   } catch (error) { fileAcceptNotice = displayError(error); }
   if (page === 'settings') render();
 }
@@ -1175,7 +1352,7 @@ async function resetRecvDir(kind: 'direct' | 'group'): Promise<void> {
   if (!isTauri()) return;
   try {
     fileRecv = await invoke<FileRecvSettings>('v1_set_file_recv_dir', { kind, path: null });
-    fileAcceptNotice = `已恢复${kind === 'direct' ? '单聊' : '群聊'}默认接收目录。`;
+    fileAcceptNotice = t('status.recvDirReset', { kind: kind === 'direct' ? t('status.kindDirect') : t('status.kindGroup') });
   } catch (error) { fileAcceptNotice = displayError(error); }
   if (page === 'settings') render();
 }
@@ -1183,7 +1360,7 @@ async function resetRecvDir(kind: 'direct' | 'group'): Promise<void> {
 async function refreshExperiments(): Promise<void> {
   if (!isTauri()) return;
   try { experiments = await invoke<ExperimentSettings>('v1_experiment_settings'); }
-  catch { experimentNotice = '无法读取实验设置'; }
+  catch { experimentNotice = t('status.expReadErr'); }
 }
 
 async function saveExperiments(): Promise<void> {
@@ -1191,7 +1368,7 @@ async function saveExperiments(): Promise<void> {
   const enabled = app.querySelector<HTMLInputElement>('#experiment-group-file-quote')?.checked ?? false;
   try {
     experiments = await invoke<ExperimentSettings>('v1_set_experiment_settings', { groupFileQuote: enabled });
-    experimentNotice = enabled ? '群文件引用已开启。' : '群文件引用已关闭。';
+    experimentNotice = enabled ? t('status.quoteOn') : t('status.quoteOff');
   } catch (error) { experimentNotice = displayError(error); }
   if (page === 'settings') render();
 }
@@ -1210,7 +1387,7 @@ async function refreshStorage(): Promise<void> {
       if (quota) quota.textContent = formatBytes(usage.quota);
       if (input && document.activeElement !== input) input.value = String(Math.round(usage.quota / (1024 * 1024)));
     }
-  } catch { if (page === 'settings') storageNotice = '无法读取存储占用'; }
+  } catch { if (page === 'settings') storageNotice = t('status.storageReadErr'); }
 }
 
 async function saveQuota(): Promise<void> {
@@ -1218,12 +1395,12 @@ async function saveQuota(): Promise<void> {
   const notice = app.querySelector<HTMLElement>('#storage-notice');
   if (!isTauri() || !input || storageBusy) return;
   const mib = Number(input.value);
-  if (!Number.isInteger(mib) || mib < 256 || mib > 65536) { if (notice) notice.textContent = '请输入 256–65536 之间的整数（MiB）'; return; }
-  storageBusy = true; if (notice) notice.textContent = '正在保存…';
+  if (!Number.isInteger(mib) || mib < 256 || mib > 65536) { if (notice) notice.textContent = t('请输入 256–65536 之间的整数（MiB）'); return; }
+  storageBusy = true; if (notice) notice.textContent = t('正在保存…');
   try {
     storageInfo = await invoke<StorageUsage>('v1_set_storage_quota', { bytes: mib * 1024 * 1024 });
-    storageNotice = '配额已保存；超过上限的新文件将被拒绝接收。';
-  } catch (error) { storageNotice = typeof error === 'string' ? error : '无法保存配额'; }
+    storageNotice = t('status.quotaSavedMsg');
+  } catch (error) { storageNotice = trError(error, t('无法保存配额')); }
   finally {
     storageBusy = false;
     if (page === 'settings') { render(); }
@@ -1231,27 +1408,27 @@ async function saveQuota(): Promise<void> {
 }
 
 function currentConversation(): { kind: 'direct' | 'group' | 'self'; target: string; name: string } | null {
-  if (groupChat.groupId) return { kind: 'group', target: groupChat.groupId, name: '群聊' };
-  if (direct.peer) return { kind: 'direct', target: direct.peer, name: '单聊' };
-  if (selfOpen) return { kind: 'self', target: 'self', name: '自己' };
+  if (groupChat.groupId) return { kind: 'group', target: groupChat.groupId, name: t('群聊') };
+  if (direct.peer) return { kind: 'direct', target: direct.peer, name: t('单聊') };
+  if (selfOpen) return { kind: 'self', target: 'self', name: t('自己') };
   return null;
 }
 
 async function exportChatArchive(): Promise<void> {
   if (!isTauri() || chatArchiveBusy) return;
   const password = app.querySelector<HTMLInputElement>('#chat-archive-password')?.value ?? '';
-  if (password.length < 8) { chatArchiveNotice = '聊天记录密码至少 8 个字符'; render(); return; }
+  if (password.length < 8) { chatArchiveNotice = t('聊天记录密码至少 8 个字符'); render(); return; }
   const conversation = currentConversation();
-  if (!conversation) { chatArchiveNotice = '请先打开一个单聊、群聊或自聊'; render(); return; }
+  if (!conversation) { chatArchiveNotice = t('请先打开一个单聊、群聊或自聊'); render(); return; }
   const date = new Date();
   const stamp = `${date.getFullYear()}${String(date.getMonth() + 1).padStart(2, '0')}${String(date.getDate()).padStart(2, '0')}`;
   const target = await saveFileDialog({
-    title: '导出加密聊天记录',
+    title: t('导出加密聊天记录'),
     defaultPath: `qbird-chat-${stamp}.qchat`,
     filters: [{ name: 'Qbird 聊天记录', extensions: ['qchat'] }],
   }).catch(() => null);
   if (!target) return;
-  chatArchiveBusy = true; chatArchiveNotice = '正在导出…'; render();
+  chatArchiveBusy = true; chatArchiveNotice = t('正在导出…'); render();
   try {
     const info = await invoke<{ kind: string; name: string; message_count: number }>('v1_export_chat_archive',
       { kind: conversation.kind, target: conversation.target, password, path: target });
@@ -1263,10 +1440,10 @@ async function exportChatArchive(): Promise<void> {
 async function importChatArchive(): Promise<void> {
   if (!isTauri() || chatArchiveBusy) return;
   const password = app.querySelector<HTMLInputElement>('#chat-archive-password')?.value ?? '';
-  if (password.length < 8) { chatArchiveNotice = '请输入导出时使用的密码'; render(); return; }
+  if (password.length < 8) { chatArchiveNotice = t('请输入导出时使用的密码'); render(); return; }
   const picked = await openFileDialog({ multiple: false, filters: [{ name: 'Qbird 聊天记录', extensions: ['qchat'] }] }).catch(() => null);
   if (!picked || typeof picked !== 'string') return;
-  chatArchiveBusy = true; chatArchiveNotice = '正在导入…'; render();
+  chatArchiveBusy = true; chatArchiveNotice = t('正在导入…'); render();
   try {
     const report = await invoke<{ kind: string; name: string; inserted: number; skipped: number; conflicts: number }>('v1_import_chat_archive',
       { password, path: picked });
@@ -1279,59 +1456,59 @@ async function importChatArchive(): Promise<void> {
 
 async function exportBackup(): Promise<void> {
   if (!isTauri() || backupBusy) return;
-  if (backupPassword.length < 8) { backupNotice = '备份密码至少 8 个字符'; if (page === 'settings') render(); return; }
+  if (backupPassword.length < 8) { backupNotice = t('status.backupPwShort'); if (page === 'settings') render(); return; }
   const includeChat = app.querySelector<HTMLInputElement>('#backup-include-chat')?.checked ?? true;
   const date = new Date();
   const stamp = `${date.getFullYear()}${String(date.getMonth() + 1).padStart(2, '0')}${String(date.getDate()).padStart(2, '0')}`;
   const target = await saveFileDialog({
-    title: '导出 Qbird 备份',
+    title: t('导出 Qbird 备份'),
     defaultPath: `qbird-backup-${stamp}.qbird`,
     filters: [{ name: 'Qbird 备份', extensions: ['qbird'] }],
   }).catch(() => null);
   if (!target) return;
-  backupBusy = true; backupNotice = '正在生成备份…';
+  backupBusy = true; backupNotice = t('status.backupGenerating');
   try {
     const info = await invoke<BackupInfo>('v1_create_backup', { password: backupPassword, path: target, includeChat });
     backupInfo = info; backupPath = target;
-    backupNotice = `备份已生成：${info.message_count} 条消息。请妥善保管密码。`;
-  } catch (error) { backupNotice = typeof error === 'string' ? error : '导出备份失败'; }
+    backupNotice = t('status.backupGenerated', { n: info.message_count });
+  } catch (error) { backupNotice = trError(error, t('status.backupExportErr')); }
   finally { backupBusy = false; if (page === 'settings') render(); }
 }
 
 async function chooseBackup(): Promise<void> {
   if (!isTauri() || backupBusy) return;
   const selected = await openFileDialog({
-    title: '选择 Qbird 备份',
+    title: t('选择 Qbird 备份'),
     multiple: false,
     filters: [{ name: 'Qbird 备份', extensions: ['qbird'] }],
   }).catch(() => null);
   if (!selected || Array.isArray(selected)) return;
   backupPath = selected; backupInfo = null;
-  backupNotice = '已选择备份文件；输入密码后可校验或恢复。';
+  backupNotice = t('已选择备份文件；输入密码后可校验或恢复。');
   if (page === 'settings') render();
 }
 
 async function inspectBackup(): Promise<void> {
   if (!isTauri() || backupBusy || !backupPath) return;
-  backupBusy = true; backupNotice = '正在校验…';
+  backupBusy = true; backupNotice = t('正在校验…');
   try {
     backupInfo = await invoke<BackupInfo>('v1_inspect_backup', { password: backupPassword, path: backupPath });
-    backupNotice = '密码正确，备份完整性校验通过。';
-  } catch (error) { backupInfo = null; backupNotice = typeof error === 'string' ? error : '校验失败'; }
+    backupNotice = t('密码正确，备份完整性校验通过。');
+  } catch (error) { backupInfo = null; backupNotice = trError(error, t('校验失败')); }
   finally { backupBusy = false; if (page === 'settings') render(); }
 }
 
 async function restoreBackup(overwrite: boolean): Promise<void> {
   if (!isTauri() || backupBusy || !backupPath) return;
-  if (overwrite && !window.confirm('覆盖恢复会先保存一份恢复前快照，然后用备份替换联系人与聊天数据。确认继续？')) return;
-  backupBusy = true; backupNotice = overwrite ? '正在覆盖恢复…' : '正在合并恢复…';
+  if (overwrite && !window.confirm(t('覆盖恢复会先保存一份恢复前快照，然后用备份替换联系人与聊天数据。确认继续？'))) return;
+  backupBusy = true; backupNotice = overwrite ? t('正在覆盖恢复…') : t('正在合并恢复…');
   try {
     const report = await invoke<RestoreReport>('v1_restore_backup', { password: backupPassword, path: backupPath, overwrite });
     backupNotice = report.conflicts > 0
       ? `发现 ${report.conflicts} 条相同 ID 但内容不同的消息，已中止恢复，未修改任何数据。`
-      : `恢复完成：${report.mode === 'overwrite' ? '覆盖' : '合并'}，新增 ${report.inserted} 条消息${report.skipped ? `，跳过 ${report.skipped} 条已有消息` : ''}。${report.snapshot_path ? '恢复前快照已保存在本机数据目录。' : ''}`;
+      : `恢复完成：${report.mode === 'overwrite' ? t('覆盖') : t('合并')}，新增 ${report.inserted} 条消息${report.skipped ? `，跳过 ${report.skipped} 条已有消息` : ''}。${report.snapshot_path ? t('恢复前快照已保存在本机数据目录。') : ''}`;
     await refreshConversations();
-  } catch (error) { backupNotice = typeof error === 'string' ? error : '恢复失败，现有数据未被修改'; }
+  } catch (error) { backupNotice = trError(error, t('恢复失败，现有数据未被修改')); }
   finally { backupBusy = false; if (page === 'settings') render(); }
 }
 
@@ -1344,7 +1521,7 @@ const USERNAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]{1,19}$/;
 const USERNAME_HINT = '2–20 位英文字母、数字或下划线，不能以数字开头';
 
 /// A random, rule-compliant suggestion. The nickname is deliberately not used
-/// here: two colleagues called "Tam" would otherwise end up with the same
+  /// here: two colleagues called "Alex" would otherwise end up with the same
 /// searchable username on one LAN.
 function suggestUsername(): string {
   const alphabet = 'abcdefghijklmnopqrstuvwxyz0123456789';
@@ -1358,9 +1535,9 @@ function suggestUsername(): string {
 
 function onboardingSteps(): string {
   const steps = [
-    [1, '你的资料', '同事如何认出你'],
-    [2, '文件位置', '接收的文件存到哪'],
-    [3, '找到同事', '同一网络里的人'],
+    [1, t('ob.step'), t('ob.stepSub1')],
+    [2, t('ob.step2'), t('ob.stepSub2')],
+    [3, t('ob.step3'), t('ob.stepSub3')],
   ] as const;
   return steps.map(([step, title, sub]) => `
     <li class="${onboardingStep === step ? 'current' : ''} ${onboardingStep > step ? 'done' : ''}">
@@ -1370,13 +1547,13 @@ function onboardingSteps(): string {
 
 function onboardingBrand(): string {
   return `<aside class="ob-brand">
-    <div class="ob-brand-top"><span class="ob-logo">Q</span><div><strong>Qbird 青鸟</strong><small>局域网聊天与文件</small></div></div>
+    <div class="ob-brand-top"><span class="ob-logo">Q</span><div><strong>${t('page.about.heading')}</strong><small>${t('ob.brandSub')}</small></div></div>
     <div class="ob-brand-copy">
-      <p class="ob-quote">同一张网，<br>说一句话就到。</p>
-      <p class="ob-desc">不需要服务器，不经过云端。设备与设备直接通信，聊天记录只留在你自己的电脑上。</p>
+      <p class="ob-quote">${t('ob.quote1')}<br>${t('ob.quote2')}</p>
+      <p class="ob-desc">${t('ob.desc')}</p>
     </div>
     <ol class="ob-steps">${onboardingSteps()}</ol>
-    <p class="ob-brand-foot">设置之后都可以在「设置」里修改</p>
+    <p class="ob-brand-foot">${t('ob.foot')}</p>
   </aside>`;
 }
 
@@ -1390,44 +1567,44 @@ function onboardingView(): string {
       ${step === 1 ? `
       <div class="ob-page">
         <p class="eyebrow">STEP 1 / 3</p>
-        <h1>先认识一下你</h1>
-        <p class="lede">这些信息只保存在本机，用来让同一局域网里的同事认出你。</p>
+        <h1>${t('ob.s1.h1')}</h1>
+        <p class="lede">${t('ob.s1.lede')}</p>
         <div class="ob-avatar-row">
           <div class="ob-avatar">${avatarMarkup(draft.nickname || onboarding?.profile.nickname || myNickname)}</div>
-          <div><strong class="ob-avatar-name">${escapeText(draft.nickname || '你的头像')}</strong><p class="hint">头像可在「设置 → 个人资料」中上传，本轮先跳过。</p></div>
+          <div><strong class="ob-avatar-name">${escapeText(draft.nickname || t('ob.s1.avatar'))}</strong><p class="hint">${t('ob.s1.avatarHint')}</p></div>
           <span class="ob-id">${qbirdId || 'QB-…'}</span>
         </div>
-        <div class="field"><label for="ob-nickname">昵称 <span class="req">必填</span></label>
-          <input id="ob-nickname" type="text" maxlength="24" autocomplete="off" value="${escapeText(draft.nickname)}" placeholder="例如：Tam">
-          <p class="hint">同事在联系人列表里看到的名字，随时可改。</p></div>
-        <div class="field"><label for="ob-username">用户名 <span class="req">必填</span></label>
+        <div class="field"><label for="ob-nickname">${t('ob.nickname')} <span class="req">${t('ob.required')}</span></label>
+          <input id="ob-nickname" type="text" maxlength="24" autocomplete="off" value="${escapeText(draft.nickname)}" placeholder="${escapeText(t('例如：Alex'))}">
+          <p class="hint">${t('ob.nicknameHint')}</p></div>
+        <div class="field"><label for="ob-username">${t('ob.username')} <span class="req">${t('ob.required')}</span></label>
           <div class="input-prefix"><span>@</span><input id="ob-username" type="text" maxlength="20" autocomplete="off" spellcheck="false" value="${escapeText(draft.username)}"></div>
-          <p class="hint">局域网内用来搜索你：${USERNAME_HINT}，不能以数字开头。 <span id="ob-username-state" class="${USERNAME_PATTERN.test(draft.username) ? 'ok' : 'warn'}">${USERNAME_PATTERN.test(draft.username) ? '可用' : '待填写'}</span></p></div>
-        <div class="field"><label for="ob-email">邮箱 <span class="opt">可选</span></label>
-          <input id="ob-email" type="email" maxlength="128" autocomplete="off" value="${escapeText(draft.email)}" placeholder="仅保存在本机"></div>
-        <div class="ob-actions"><span class="hint">昵称和用户名之后都可以修改</span>
-          <button class="ob-primary" data-action="ob-next" data-step="2">下一步</button></div>
+          <p class="hint">局域网内用来搜索你：${USERNAME_HINT}，不能以数字开头。 <span id="ob-username-state" class="${USERNAME_PATTERN.test(draft.username) ? 'ok' : 'warn'}">${USERNAME_PATTERN.test(draft.username) ? t('可用') : t('待填写')}</span></p></div>
+        <div class="field"><label for="ob-email">${t('ob.email')} <span class="opt">${t('ob.optional')}</span></label>
+          <input id="ob-email" type="email" maxlength="128" autocomplete="off" value="${escapeText(draft.email)}" placeholder="${t('ob.emailPlaceholder')}"></div>
+        <div class="ob-actions"><span class="hint">${t('ob.s1.actionsHint')}</span>
+          <button class="ob-primary" data-action="ob-next" data-step="2">${t('ob.next')}</button></div>
       </div>` : step === 2 ? `
       <div class="ob-page">
         <p class="eyebrow">STEP 2 / 3</p>
-        <h1>接收的文件放哪里</h1>
-        <p class="lede">同事发来的图片和文件会保存到这里。身份和聊天记录仍然保存在应用的 <code>data</code> 目录。</p>
-        <div class="field"><label for="ob-path">保存位置</label>
-          <div class="ob-path-row"><input id="ob-path" type="text" readonly value="${escapeText(dir || '读取中…')}"><button class="ob-ghost" data-action="ob-pick-dir">更改…</button><button class="ob-text" data-action="ob-reset-dir">恢复默认</button></div>
-          <p class="hint">${draft.recvDir ? '已选择自定义目录 · ' : ''}目录须存在或可创建，并且当前用户可写。</p></div>
-        <div class="ob-callout"><strong>建议不要选这些位置</strong><p>C:\\Program Files、Windows、磁盘根目录。卸载或覆盖安装不会删除已经接收的文件，但受保护目录里的文件可能写入失败。</p></div>
-        <div class="ob-actions"><button class="ob-text" data-action="ob-back">返回</button><button class="ob-primary" data-action="ob-next" data-step="3">下一步</button></div>
+        <h1>${t('ob.s2.h1')}</h1>
+        <p class="lede">${t('ob.s2.lede')} <code>data</code>${t('ob.s2.ledeTail')}</p>
+        <div class="field"><label for="ob-path">${t('ob.s2.pathLabel')}</label>
+          <div class="ob-path-row"><input id="ob-path" type="text" readonly value="${escapeText(dir || t('读取中…'))}"><button class="ob-ghost" data-action="ob-pick-dir">${t('ob.change')}</button><button class="ob-text" data-action="ob-reset-dir">${t('ob.resetDefault')}</button></div>
+          <p class="hint">${draft.recvDir ? t('ob.s2.customPrefix') : ''}${t('ob.s2.pathHint')}</p></div>
+        <div class="ob-callout"><strong>${t('ob.s2.callout')}</strong><p>${t('ob.s2.calloutBody')}</p></div>
+        <div class="ob-actions"><button class="ob-text" data-action="ob-back">${t('ob.back')}</button><button class="ob-primary" data-action="ob-next" data-step="3">${t('ob.next')}</button></div>
       </div>` : `
       <div class="ob-page">
         <p class="eyebrow">STEP 3 / 3</p>
-        <h1>同一网络里的同事</h1>
-        <p class="lede">Qbird 会自动发现同一网段使用它的用户。添加后会出现在你的联系人里，可以直接开始聊天。</p>
-        <div class="ob-scan"><span class="pulse"></span><span id="ob-lan-status">${escapeText(lanStatus)}</span><span class="demo-tag">未验证的局域网信息</span></div>
-        <ul class="people" id="ob-people">${lanPeople.length ? '' : `<li class="people-empty">${lanLoading ? '正在扫描同网段…' : '暂未发现其他用户。可以稍后在「局域网用户」页手动添加地址。'}</li>`}</ul>
-        <p class="hint">没看到想找的人？可以稍后在「局域网用户 → 其他网段与手动地址」中填写对方 IP。</p>
+        <h1>${t('ob.s3.h1')}</h1>
+        <p class="lede">${t('ob.s3.lede')}</p>
+        <div class="ob-scan"><span class="pulse"></span><span id="ob-lan-status">${escapeText(lanStatus)}</span><span class="demo-tag">${t('ob.s3.unverified')}</span></div>
+        <ul class="people" id="ob-people">${lanPeople.length ? '' : `<li class="people-empty">${lanLoading ? t('ob.s3.scanning') : t('ob.s3.none')}</li>`}</ul>
+        <p class="hint">${t('ob.s3.hint')}</p>
         <p class="ob-notice" role="status">${escapeText(onboardingNotice)}</p>
-        <div class="ob-actions"><button class="ob-text" data-action="ob-finish">稍后再说</button>
-          <button class="ob-primary" data-action="ob-finish" ${onboardingBusy ? 'disabled' : ''}>${onboardingBusy ? '正在完成…' : '完成，进入 Qbird'}</button></div>
+        <div class="ob-actions"><button class="ob-text" data-action="ob-finish">${t('ob.later')}</button>
+          <button class="ob-primary" data-action="ob-finish" ${onboardingBusy ? 'disabled' : ''}>${onboardingBusy ? t('ob.finishing') : t('ob.finish')}</button></div>
       </div>`}
     </div>
   </div>`;
@@ -1461,7 +1638,7 @@ function paintUsernameState(): void {
   if (!input || !state) return;
   const value = input.value.trim();
   const valid = USERNAME_PATTERN.test(value);
-  state.textContent = valid ? '可用' : value ? `格式不正确：${USERNAME_HINT}` : '待填写';
+  state.textContent = valid ? t('可用') : value ? `格式不正确：${USERNAME_HINT}` : t('待填写');
   state.className = valid ? 'ok' : 'warn';
 }
 
@@ -1470,7 +1647,7 @@ async function submitOnboarding(): Promise<void> {
   const draft = onboardingDraft;
   const nickname = draft.nickname.trim();
   const username = draft.username.trim();
-  if (!nickname) { onboardingNotice = '请先填写昵称'; paintOnboarding(); return; }
+  if (!nickname) { onboardingNotice = t('请先填写昵称'); paintOnboarding(); return; }
   if (!USERNAME_PATTERN.test(username)) { onboardingNotice = `用户名须为${USERNAME_HINT}`; paintOnboarding(); return; }
   onboardingBusy = true;
   onboardingNotice = '';
@@ -1487,9 +1664,9 @@ async function submitOnboarding(): Promise<void> {
       // is broadcast instead of the empty one from startup.
       try { await invoke('v1_refresh_listener'); }
       catch { await invoke('v1_start_chat_service', { port: networkSettings.default_port }); }
-      listenNotice = '已开始监听局域网，同事可以发现你。';
+      listenNotice = t('已开始监听局域网，同事可以发现你。');
     } catch {
-      listenNotice = '监听未启动：端口可能被占用，可在局域网用户页重试。';
+      listenNotice = t('监听未启动：端口可能被占用，可在局域网用户页重试。');
     }
     onboardingBusy = false;
     page = 'contacts';
@@ -1510,7 +1687,7 @@ function lanPersonRow(person: LanPerson, allowOpen = true): string {
   const name = person.nickname || person.username || `Qbird 用户 ${person.qbird_id.slice(-4)}`;
   const initial = escapeText(name.slice(0, 1).toUpperCase());
   const handle = person.username ? `<span class="p-user">@${escapeText(person.username)}</span>` : `<span class="p-user">${person.qbird_id}</span>`;
-  const meta = `<span>${escapeText(person.address)}</span><span class="sep">·</span><span>${person.verified ? '已核对指纹' : '身份未核对'}</span>`;
+  const meta = `<span>${escapeText(person.address)}</span><span class="sep">·</span><span>${person.verified ? t('已核对指纹') : t('身份未核对')}</span>`;
   return `<li data-fingerprint="${person.fingerprint}" class="${person.known ? 'is-added' : ''}">
     <span class="av av-40">${initial}</span>
     <div class="p-body"><div class="p-name"><strong>${escapeText(name)}</strong>${handle}</div><div class="p-meta">${meta}</div></div>
@@ -1518,7 +1695,7 @@ function lanPersonRow(person: LanPerson, allowOpen = true): string {
       ? (allowOpen
         ? `<button class="btn-add is-added" data-action="open-direct" data-peer="${person.fingerprint}" data-name="${escapeText(person.nickname || name)}">发消息</button>`
         : '<span class="btn-add is-added" role="status">已添加</span>')
-      : `<button class="btn-add" data-action="lan-add" data-address="${person.address}" data-fingerprint="${person.fingerprint}" data-name="${escapeText(name)}" data-username="${person.username ? escapeText(person.username) : ''}" ${lanAddBusy === person.fingerprint ? 'disabled' : ''}>${lanAddBusy === person.fingerprint ? '添加中…' : '添加'}</button>`}
+      : `<button class="btn-add" data-action="lan-add" data-address="${person.address}" data-fingerprint="${person.fingerprint}" data-name="${escapeText(name)}" data-username="${person.username ? escapeText(person.username) : ''}" ${lanAddBusy === person.fingerprint ? 'disabled' : ''}>${lanAddBusy === person.fingerprint ? t('添加中…') : t('添加')}</button>`}
   </li>`;
 }
 
@@ -1531,22 +1708,22 @@ function paintLanPeopleList(list: HTMLUListElement | null, allowOpen = true): vo
     || person.qbird_id.toLowerCase().includes(query));
   list.innerHTML = rows.length
     ? rows.map((person) => lanPersonRow(person, allowOpen)).join('')
-    : `<li class="people-empty">${lanLoading ? '正在识别同网段用户…' : lanPeople.length ? '没有匹配的用户' : '暂未发现其他用户。请确认对方已启动 Qbird，且与本机在同一网段。'}</li>`;
+    : `<li class="people-empty">${lanLoading ? t('正在识别同网段用户…') : lanPeople.length ? t('没有匹配的用户') : t('暂未发现其他用户。请确认对方已启动 Qbird，且与本机在同一网段。')}</li>`;
 }
 
 function discoveryView(): string {
-  const since = lanRefreshedAt ? `${Math.max(1, Math.round((Date.now() - lanRefreshedAt) / 1000))} 秒前刷新` : '尚未刷新';
-  const subnet = lanPeople[0]?.address.replace(/\.\d+:\d+$/, '.0/24') || '同网段';
+  const since = lanRefreshedAt ? `${Math.max(1, Math.round((Date.now() - lanRefreshedAt) / 1000))} 秒前刷新` : t('尚未刷新');
+  const subnet = lanPeople[0]?.address.replace(/\.\d+:\d+$/, '.0/24') || t('同网段');
   return `<section class="lan-page">
     <header class="lan-head">
       <div><span class="eyebrow">DISCOVERY / 局域网</span><h2>局域网用户</h2>
         <p>他们正在使用 Qbird，并且和你在同一个网络。</p></div>
-      <span class="pill ${probeStatus.running ? 'pill-live' : ''}">${probeStatus.running ? `<span class="pulse"></span>监听中 · ${probeStatus.port}` : '未监听'}</span>
+      <span class="pill ${probeStatus.running ? 'pill-live' : ''}">${probeStatus.running ? `<span class="pulse"></span>监听中 · ${probeStatus.port}` : t('未监听')}</span>
     </header>
     <div class="lan-bar">
       <span class="lan-net">网段 <code>${escapeText(subnet)}</code></span>
-      <input id="lan-search" type="search" maxlength="64" placeholder="搜索昵称或用户名" aria-label="搜索局域网用户" value="${escapeText(lanQuery)}">
-      <button class="outline" data-action="lan-refresh" ${lanLoading ? 'disabled' : ''}>${lanLoading ? '刷新中…' : '立即刷新'}</button>
+      <input id="lan-search" type="search" maxlength="64" placeholder="${escapeText(t('搜索昵称或用户名'))}" aria-label="${escapeText(t('搜索局域网用户'))}" value="${escapeText(lanQuery)}">
+      <button class="outline" data-action="lan-refresh" ${lanLoading ? 'disabled' : ''}>${lanLoading ? t('刷新中…') : t('立即刷新')}</button>
       ${probeStatus.running
         ? '<button class="outline" data-action="lan-stop">停止监听</button>'
         : '<button class="outline" data-action="lan-start">开始监听</button>'}
@@ -1558,10 +1735,10 @@ function discoveryView(): string {
       <summary>其他网段与手动地址</summary>
       <div class="lan-advanced-body">
         <div class="field"><label for="lan-manual">手动添加地址</label>
-          <div class="probe-row"><input id="lan-manual" type="text" placeholder="192.168.2.8:42853"><input id="lan-manual-name" type="text" maxlength="24" placeholder="对方昵称（可选）"><button class="outline" data-action="lan-manual-add">探测并添加</button></div>
+          <div class="probe-row"><input id="lan-manual" type="text" placeholder="192.168.2.8:42853"><input id="lan-manual-name" type="text" maxlength="24" placeholder="${escapeText(t('对方昵称（可选）'))}"><button class="outline" data-action="lan-manual-add">探测并添加</button></div>
           <p class="hint">适用于跨 VLAN、VPN 或已知 IP 的同事。添加前会探测地址，确认对方身份与列表一致。</p></div>
         <div class="field"><label for="scan-cidr">扫描指定网段</label>
-          <div class="probe-row"><input id="scan-cidr" type="text" maxlength="24" spellcheck="false" placeholder="192.168.2.0/24" value="${escapeText(scanCidr)}"><button class="outline" data-action="scan-start" ${scanBusy ? 'disabled' : ''}>${scanBusy ? '扫描中…' : '开始扫描'}</button></div>
+          <div class="probe-row"><input id="scan-cidr" type="text" maxlength="24" spellcheck="false" placeholder="192.168.2.0/24" value="${escapeText(scanCidr)}"><button class="outline" data-action="scan-start" ${scanBusy ? 'disabled' : ''}>${scanBusy ? t('扫描中…') : t('开始扫描')}</button></div>
           <p class="hint">限速扫描（4 并发、单地址 400 毫秒），只用于发现候选。结果仍需点「添加」并探测确认。</p>
           <p id="scan-status" class="hint" role="status">${escapeText(scanNotice)}</p>
           <ul class="people">${scanHits.map((hit) => `<li><span class="av av-40">?</span><div class="p-body"><div class="p-name"><strong>${escapeText(hit.address)}</strong></div><div class="p-meta"><span>扫描候选 · ${escapeText(hit.fingerprint.slice(0, 8))}…</span></div></div><button class="btn-add" data-action="lan-add" data-address="${escapeText(hit.address)}" data-fingerprint="${hit.fingerprint}" data-name="Qbird 用户 ${escapeText(hit.fingerprint.slice(0, 4))}">添加</button></li>`).join('')}</ul>
@@ -1584,7 +1761,7 @@ function paintLan(): void {
   paintLanPeopleList(app.querySelector<HTMLUListElement>('#lan-list'));
   const status = app.querySelector<HTMLElement>('#lan-status');
   if (status) {
-    const since = lanRefreshedAt ? `${Math.max(1, Math.round((Date.now() - lanRefreshedAt) / 1000))} 秒前刷新` : '尚未刷新';
+    const since = lanRefreshedAt ? `${Math.max(1, Math.round((Date.now() - lanRefreshedAt) / 1000))} 秒前刷新` : t('尚未刷新');
     status.textContent = `${lanStatus} · ${since}`;
   }
 }
@@ -1593,16 +1770,16 @@ async function refreshLanPeople(force = false): Promise<void> {
   if (!isTauri() || lanLoading) return;
   if (!force && lanRefreshedAt && Date.now() - lanRefreshedAt < 25_000) return;
   lanLoading = true;
-  lanStatus = '正在识别同网段用户…';
+  lanStatus = t('正在识别同网段用户…');
   if (page === 'discover') paintLan();
   if (!onboarding?.done && onboardingStep === 3) paintOnboarding();
   try {
     lanPeople = await invoke<LanPerson[]>('v1_lan_people');
     lanRefreshedAt = Date.now();
-    lanStatus = lanPeople.length ? `发现 ${lanPeople.length} 位用户` : '暂未发现其他用户';
+    lanStatus = lanPeople.length ? `发现 ${lanPeople.length} 位用户` : t('暂未发现其他用户');
   } catch {
     lanPeople = [];
-    lanStatus = '局域网发现不可用，请检查网络和防火墙';
+    lanStatus = t('局域网发现不可用，请检查网络和防火墙');
   } finally {
     lanLoading = false;
     if (page === 'discover') paintLan();
@@ -1619,10 +1796,13 @@ async function addLanPerson(button: HTMLButtonElement): Promise<void> {
   paintLan();
   paintOnboarding();
   try {
-    await invoke('v1_add_contact', { address, fingerprint, displayName: name || 'Qbird 用户', username: username || null });
+    await invoke('v1_set_contact_address', { peer: fingerprint, address });
+    const status = await invoke<string>('v1_request_contact', { peer: fingerprint });
     const person = lanPeople.find((item) => item.fingerprint === fingerprint);
-    if (person) { person.known = true; person.verified = true; }
-    lanNotice = `已添加「${name || 'Qbird 用户'}」到联系人。对方也需要添加你才能互发消息。`;
+    if (person) { person.known = true; person.verified = status === 'accepted' || status === 'verified'; }
+    lanNotice = status === 'accepted' || status === 'verified'
+      ? `已添加「${name || 'Qbird 用户'}」，现在可以互发消息。`
+      : `已向「${name || 'Qbird 用户'}」发送好友申请，等待对方同意。`;
   } catch (error) {
     lanNotice = displayError(error);
   } finally {
@@ -1636,7 +1816,7 @@ async function addLanPerson(button: HTMLButtonElement): Promise<void> {
 
 async function pickOnboardingDir(): Promise<void> {
   if (!isTauri()) return;
-  const picked = await openFileDialog({ directory: true, multiple: false, title: '选择接收文件保存位置' }).catch(() => null);
+  const picked = await openFileDialog({ directory: true, multiple: false, title: t('选择接收文件保存位置') }).catch(() => null);
   if (!picked || typeof picked !== 'string') return;
   onboardingDraft.recvDir = picked;
   paintOnboarding();
@@ -1644,13 +1824,13 @@ async function pickOnboardingDir(): Promise<void> {
 
 async function toggleLanListener(start: boolean): Promise<void> {
   if (!isTauri()) return;
-  lanNotice = start ? '正在启动监听…' : '正在停止监听…';
+  lanNotice = start ? t('正在启动监听…') : t('正在停止监听…');
   paintLan();
   try {
     if (start) await invoke('v1_start_chat_service', { port: networkSettings.default_port });
     else await invoke('v1_stop_probe_service');
     await refreshProbeStatus();
-    lanNotice = start ? '已开始监听，同事可以发现你。' : '已停止监听，本次运行不再自动重启；待发消息仍保存在本机。';
+    lanNotice = start ? t('已开始监听，同事可以发现你。') : t('已停止监听，本次运行不再自动重启；待发消息仍保存在本机。');
   } catch (error) {
     lanNotice = displayError(error);
   }
@@ -1660,13 +1840,16 @@ async function toggleLanListener(start: boolean): Promise<void> {
 async function addManualLan(): Promise<void> {
   const address = app.querySelector<HTMLInputElement>('#lan-manual')?.value.trim() || '';
   const name = app.querySelector<HTMLInputElement>('#lan-manual-name')?.value.trim() || '';
-  if (!address) { lanNotice = '请输入对方的 IP 和端口，例如 192.168.2.8:42853'; paintLan(); return; }
-  lanNotice = '正在探测该地址…';
+  if (!address) { lanNotice = t('请输入对方的 IP 和端口，例如 192.168.2.8:42853'); paintLan(); return; }
+  lanNotice = t('正在探测该地址…');
   paintLan();
   try {
     const fingerprint = await invoke<string>('v1_probe_peer', { address });
-    await invoke('v1_add_contact', { address, fingerprint, displayName: name || address, username: null });
-    lanNotice = `已添加 ${name || address} 到联系人。`;
+    await invoke('v1_set_contact_address', { peer: fingerprint, address });
+    const status = await invoke<string>('v1_request_contact', { peer: fingerprint });
+    lanNotice = status === 'accepted' || status === 'verified'
+      ? `已添加 ${name || address} 到联系人。`
+      : `已向 ${name || address} 发送好友申请，等待对方同意。`;
     await refreshLanPeople(true);
   } catch (error) {
     lanNotice = displayError(error);
@@ -1692,14 +1875,14 @@ async function confirmContact(): Promise<void> {
   const independent = app.querySelector<HTMLInputElement>('#checked-independent')?.checked;
   if (!message || !isTauri()) return;
   if (!selectedFingerprint || checked !== selectedFingerprint || !independent || !name) {
-    message.textContent = '请选择探测结果，填写名称和独立渠道取得的完整匹配指纹，并勾选确认。'; return;
+    message.textContent = t('请选择探测结果，填写名称和独立渠道取得的完整匹配指纹，并勾选确认。'); return;
   }
   const button = app.querySelector<HTMLButtonElement>('button[data-action="confirm-contact"]');
   if (button?.disabled) return;
   if (button) button.disabled = true;
   try {
     await invoke('v1_confirm_contact', { fingerprint: selectedFingerprint, checkedFingerprint: checked, displayName: name });
-    message.textContent = '联系人已在本机确认；对方仍须单独确认你的指纹。';
+    message.textContent = t('联系人已在本机确认；对方仍须单独确认你的指纹。');
   } catch (error) { message.textContent = displayError(error); }
   finally { if (button) button.disabled = false; }
 }
@@ -1711,9 +1894,9 @@ async function saveContactProfile(peer: string): Promise<void> {
   if (!isTauri()) return;
   try {
     await invoke('v1_set_contact_profile', { peer, remark, category });
-    if (status) status.textContent = '备注与分组已保存（仅本机可见，不影响信任）。';
+    if (status) status.textContent = t('备注与分组已保存（仅本机可见，不影响信任）。');
     await refreshContacts();
-  } catch (error) { if (status) status.textContent = typeof error === 'string' ? error : '无法保存备注或分组'; }
+  } catch (error) { if (status) status.textContent = trError(error, t('无法保存备注或分组')); }
 }
 
 async function loadGroupAvatarIcon(groupId: string, icon: HTMLImageElement): Promise<void> {
@@ -1727,17 +1910,17 @@ async function loadGroupAvatarIcon(groupId: string, icon: HTMLImageElement): Pro
 async function refreshPlugins(): Promise<void> {
   if (!isTauri()) return;
   try { plugins = await invoke<PluginView[]>('v1_list_plugins'); }
-  catch { pluginNotice = '无法读取插件列表'; }
+  catch { pluginNotice = t('无法读取插件列表'); }
 }
 
 async function installPlugin(): Promise<void> {
   if (!isTauri()) return;
-  const picked = await openFileDialog({ directory: true, multiple: false, title: '选择包含 plugin.json 的插件文件夹' }).catch(() => null);
+  const picked = await openFileDialog({ directory: true, multiple: false, title: t('选择包含 plugin.json 的插件文件夹') }).catch(() => null);
   if (!picked || typeof picked !== 'string') return;
-  pluginNotice = '正在安装…';
+  pluginNotice = t('正在安装…');
   try {
     const view = await invoke<PluginView>('v1_install_plugin', { path: picked });
-    pluginNotice = `已安装「${view.name}」，可预览：${view.extensions.join('、') || '无'}`;
+    pluginNotice = `已安装「${view.name}」，可预览：${view.extensions.join('、') || t('无')}`;
   } catch (error) { pluginNotice = displayError(error); }
   await refreshPlugins();
   render();
@@ -1747,7 +1930,7 @@ async function togglePlugin(id: string, enabled: boolean): Promise<void> {
   if (!isTauri()) return;
   try {
     await invoke('v1_set_plugin_enabled', { id, enabled });
-    pluginNotice = enabled ? '插件已启用。' : '插件已停用。';
+    pluginNotice = enabled ? t('插件已启用。') : t('插件已停用。');
   } catch (error) { pluginNotice = displayError(error); }
   await refreshPlugins();
   render();
@@ -1758,14 +1941,14 @@ async function removePlugin(id: string): Promise<void> {
   if (!isTauri()) return;
   if (pluginRemovePending !== id) {
     pluginRemovePending = id;
-    pluginNotice = '再次点击“确认移除”会删除该插件目录。';
+    pluginNotice = t('再次点击“确认移除”会删除该插件目录。');
     render();
     return;
   }
   pluginRemovePending = '';
   try {
     await invoke('v1_remove_plugin', { id });
-    pluginNotice = '插件已移除。';
+    pluginNotice = t('插件已移除。');
   } catch (error) { pluginNotice = displayError(error); }
   await refreshPlugins();
   render();
@@ -1774,7 +1957,7 @@ async function removePlugin(id: string): Promise<void> {
 async function refreshHover(): Promise<void> {
   if (!isTauri()) return;
   try { hover = await invoke<{ show_ip: boolean; show_mac: boolean }>('v1_hover_settings'); }
-  catch { hoverNotice = '无法读取悬浮信息设置'; }
+  catch { hoverNotice = t('status.hoverReadErr'); }
 }
 
 async function saveHover(): Promise<void> {
@@ -1783,7 +1966,7 @@ async function saveHover(): Promise<void> {
   const showMac = app.querySelector<HTMLInputElement>('#hover-show-mac')?.checked ?? false;
   try {
     hover = await invoke<{ show_ip: boolean; show_mac: boolean }>('v1_set_hover_settings', { showIp, showMac });
-    hoverNotice = '悬浮信息设置已保存。';
+    hoverNotice = t('status.hoverSaved');
   } catch (error) { hoverNotice = displayError(error); }
   render();
 }
@@ -1793,7 +1976,7 @@ async function refreshImageOpenMode(): Promise<void> {
   try {
     const mode = await invoke<'lightbox' | 'workspace'>('v1_image_open_mode');
     applyImageOpenMode(mode);
-  } catch { imageOpenNotice = '无法读取图片打开方式'; }
+  } catch { imageOpenNotice = t('status.imageModeReadErr'); }
 }
 
 function applyImageOpenMode(mode: 'lightbox' | 'workspace'): void {
@@ -1807,7 +1990,7 @@ async function saveImageOpenMode(): Promise<void> {
   const mode = app.querySelector<HTMLSelectElement>('#image-open-mode')?.value === 'workspace' ? 'workspace' : 'lightbox';
   try {
     applyImageOpenMode(await invoke<'lightbox' | 'workspace'>('v1_set_image_open_mode', { mode }));
-    imageOpenNotice = mode === 'workspace' ? '已改为在右侧工作区打开图片。' : '已改为灯箱查看图片。';
+    imageOpenNotice = mode === 'workspace' ? t('已改为在右侧工作区打开图片。') : t('已改为灯箱查看图片。');
   } catch (error) { imageOpenNotice = displayError(error); }
   render();
 }
@@ -1816,7 +1999,7 @@ async function refreshFileOpenMode(): Promise<void> {
   if (!isTauri()) return;
   try {
     applyFileOpenMode(await invoke<'workspace' | 'system'>('v1_file_open_mode'));
-  } catch { fileOpenNotice = '无法读取附件打开方式'; }
+  } catch { fileOpenNotice = t('status.fileModeReadErr'); }
 }
 
 function applyFileOpenMode(mode: 'workspace' | 'system'): void {
@@ -1830,7 +2013,7 @@ async function saveFileOpenMode(): Promise<void> {
   const mode = app.querySelector<HTMLSelectElement>('#file-open-mode')?.value === 'system' ? 'system' : 'workspace';
   try {
     applyFileOpenMode(await invoke<'workspace' | 'system'>('v1_set_file_open_mode', { mode }));
-    fileOpenNotice = mode === 'system' ? '已改为用默认程序打开附件。' : '已改为在右侧工作区预览附件。';
+    fileOpenNotice = mode === 'system' ? t('已改为用默认程序打开附件。') : t('已改为在右侧工作区预览附件。');
   } catch (error) { fileOpenNotice = displayError(error); }
   render();
 }
@@ -1848,7 +2031,7 @@ async function restoreWorkspace(): Promise<void> {
 async function refreshTeam(): Promise<void> {
   if (!isTauri()) return;
   try { team = await invoke<{ name: string; has_logo: boolean }>('v1_team_profile'); }
-  catch { teamNotice = '无法读取团队设置'; return; }
+  catch { teamNotice = t('status.teamReadErr'); return; }
   try {
     const bytes = await invoke<number[] | null>('v1_team_logo');
     setTeamLogo(bytes && bytes.length ? new Uint8Array(bytes) : null);
@@ -1865,7 +2048,7 @@ async function saveTeamName(): Promise<void> {
   const name = app.querySelector<HTMLInputElement>('#team-name')?.value ?? '';
   try {
     team = await invoke<{ name: string; has_logo: boolean }>('v1_set_team_name', { name });
-    teamNotice = team.name ? '团队名称已保存。' : '已恢复默认名称。';
+    teamNotice = team.name ? t('团队名称已保存。') : t('已恢复默认名称。');
   } catch (error) { teamNotice = displayError(error); }
   render();
 }
@@ -1873,12 +2056,12 @@ async function saveTeamName(): Promise<void> {
 async function chooseTeamLogo(): Promise<void> {
   if (!isTauri()) return;
   try {
-    const picked = await openFileDialog({ multiple: false, filters: [{ name: '图片', extensions: ['png', 'jpg', 'jpeg'] }] });
+    const picked = await openFileDialog({ multiple: false, filters: [{ name: t('图片'), extensions: ['png', 'jpg', 'jpeg'] }] });
     if (!picked || typeof picked !== 'string') return;
     const source = new Uint8Array(await invoke<number[]>('v1_read_image_file', { path: picked }));
     const cropped = await cropSquare(source, 256);
     await invoke('v1_set_team_logo', { bytes: Array.from(cropped) });
-    team.has_logo = true; setTeamLogo(cropped); teamNotice = '团队 Logo 已保存。';
+    team.has_logo = true; setTeamLogo(cropped); teamNotice = t('团队 Logo 已保存。');
   } catch (error) { teamNotice = displayError(error); }
   render();
 }
@@ -1887,7 +2070,7 @@ async function clearTeamLogo(): Promise<void> {
   if (!isTauri()) return;
   try {
     await invoke('v1_clear_team_logo');
-    team.has_logo = false; setTeamLogo(null); teamNotice = '团队 Logo 已移除。';
+    team.has_logo = false; setTeamLogo(null); teamNotice = t('团队 Logo 已移除。');
   } catch (error) { teamNotice = displayError(error); }
   render();
 }
@@ -1896,12 +2079,12 @@ async function clearTeamLogo(): Promise<void> {
 async function chooseGroupAvatar(): Promise<void> {
   if (!isTauri() || !groupChat.groupId) return;
   try {
-    const picked = await openFileDialog({ multiple: false, filters: [{ name: '图片', extensions: ['png', 'jpg', 'jpeg'] }] });
+    const picked = await openFileDialog({ multiple: false, filters: [{ name: t('图片'), extensions: ['png', 'jpg', 'jpeg'] }] });
     if (!picked || typeof picked !== 'string') return;
     const source = new Uint8Array(await invoke<number[]>('v1_read_image_file', { path: picked }));
     const cropped = await cropAvatarInteractively(source, {
-      title: '调整群头像',
-      hint: '拖动图片调整位置，滚轮或滑块缩放；群头像会压缩到 96 KiB 以内再发送。',
+      title: t('调整群头像'),
+      hint: t('拖动图片调整位置，滚轮或滑块缩放；群头像会压缩到 96 KiB 以内再发送。'),
       maxBytes: 96 * 1024,
     });
     if (!cropped) return;
@@ -1921,11 +2104,11 @@ async function clearGroupAvatar(): Promise<void> {
 async function searchGroups(): Promise<void> {
   if (!isTauri()) return;
   const query = app.querySelector<HTMLInputElement>('#group-search-name')?.value.trim() ?? '';
-  if (!query) { groupSearchStatus = '请输入群名关键词'; groupSearchHits = []; paintGroupSearch(); return; }
-  groupSearchBusy = true; groupSearchHits = []; groupSearchStatus = '正在向已确认联系人查询…'; paintGroupSearch();
+  if (!query) { groupSearchStatus = t('请输入群名关键词'); groupSearchHits = []; paintGroupSearch(); return; }
+  groupSearchBusy = true; groupSearchHits = []; groupSearchStatus = t('正在向已确认联系人查询…'); paintGroupSearch();
   try {
     groupSearchHits = await invoke<GroupSearchHit[]>('v1_search_groups', { query });
-    groupSearchStatus = groupSearchHits.length ? `找到 ${groupSearchHits.length} 个群` : '没有找到匹配的群；需要联系人同时在线。';
+    groupSearchStatus = groupSearchHits.length ? `找到 ${groupSearchHits.length} 个群` : t('没有找到匹配的群；需要联系人同时在线。');
   } catch (error) { groupSearchStatus = displayError(error); }
   groupSearchBusy = false; paintGroupSearch();
 }
@@ -1942,7 +2125,7 @@ async function requestJoin(groupId: string, name: string, owner: string): Promis
 async function refreshJoinRequests(): Promise<void> {
   if (!isTauri()) return;
   try { joinRequests = await invoke<{ incoming: JoinRequest[]; outgoing: JoinRequest[] }>('v1_join_requests', {}); }
-  catch { joinNotice = '无法读取入群申请'; }
+  catch { joinNotice = t('无法读取入群申请'); }
   paintJoinRequests();
 }
 
@@ -1950,7 +2133,7 @@ async function resolveJoin(id: string, accept: boolean): Promise<void> {
   if (!isTauri()) return;
   try {
     await invoke('v1_resolve_join_request', { id, accept });
-    joinNotice = accept ? '已同意加入，正在通知群成员。' : '已拒绝该申请。';
+    joinNotice = accept ? t('已同意加入，正在通知群成员。') : t('已拒绝该申请。');
   } catch (error) { joinNotice = displayError(error); }
   await refreshJoinRequests();
   await refreshContacts();
@@ -1964,7 +2147,7 @@ function paintJoinRequests(): void {
   box.hidden = false;
   const heading = (text: string): HTMLElement => { const node = document.createElement('p'); node.className = 'file-meta'; node.textContent = text; return node; };
   if (joinRequests.incoming.length) {
-    box.append(heading('待处理的入群申请'));
+    box.append(heading(t('待处理的入群申请')));
     for (const request of joinRequests.incoming) {
       const row = document.createElement('div'); row.className = 'offer-card';
       const text = document.createElement('div'); text.className = 'offer-text';
@@ -1973,15 +2156,15 @@ function paintJoinRequests(): void {
       const meta = document.createElement('small'); meta.className = 'file-meta'; meta.textContent = new Date(request.created_at * 1000).toLocaleString();
       text.append(title, meta);
       const actions = document.createElement('div'); actions.className = 'file-actions';
-      const accept = document.createElement('button'); accept.className = 'outline'; accept.textContent = '同意';
+      const accept = document.createElement('button'); accept.className = 'outline'; accept.textContent = t('同意');
       accept.dataset.action = 'accept-join'; accept.dataset.id = request.id;
-      const reject = document.createElement('button'); reject.className = 'linkish'; reject.textContent = '拒绝';
+      const reject = document.createElement('button'); reject.className = 'linkish'; reject.textContent = t('拒绝');
       reject.dataset.action = 'reject-join'; reject.dataset.id = request.id;
       actions.append(accept, reject); row.append(text, actions); box.append(row);
     }
   }
   if (joinRequests.outgoing.length) {
-    box.append(heading('我提交的申请'));
+    box.append(heading(t('我提交的申请')));
     for (const request of joinRequests.outgoing) {
       const row = document.createElement('div'); row.className = 'offer-card';
       const title = document.createElement('div'); title.className = 'file-title';
@@ -2005,11 +2188,11 @@ function paintGroupSearch(): void {
     title.textContent = `${hit.name} · ${hit.member_count} 人 · 群主 ${hit.owner.slice(0, 12)}…`;
     item.append(title);
     const actions = document.createElement('div'); actions.className = 'contact-actions';
-    const button = document.createElement('button'); button.className = 'outline'; button.textContent = '申请加入';
+    const button = document.createElement('button'); button.className = 'outline'; button.textContent = t('申请加入');
     button.dataset.action = 'join-group';
     button.dataset.group = hit.group_id; button.dataset.name = hit.name; button.dataset.owner = hit.owner;
     button.disabled = !hit.owner_known;
-    button.title = hit.owner_known ? '向群主发送加入申请' : '群主不在本机已确认联系人中，无法直接申请';
+    button.title = hit.owner_known ? t('向群主发送加入申请') : t('群主不在本机已确认联系人中，无法直接申请');
     actions.append(button); item.append(actions); list.append(item);
   }
 }
@@ -2019,8 +2202,8 @@ function paintGroupSearch(): void {
 
 function presenceDot(fingerprint: string, label = true): string {
   const online = presence.get(fingerprint) === true;
-  return `<span class="presence-dot ${online ? 'online' : ''}" title="${online ? '在线：局域网可见或地址可连接' : '离线：当前不可达'}" aria-label="${online ? '在线' : '离线'}"></span>`
-    + (label ? `<span class="presence-text">${online ? '在线' : '离线'}</span>` : '');
+  return `<span class="presence-dot ${online ? 'online' : ''}" title="${online ? t('在线：局域网可见或地址可连接') : t('离线：当前不可达')}" aria-label="${online ? t('在线') : t('离线')}"></span>`
+    + (label ? `<span class="presence-text">${online ? t('在线') : t('离线')}</span>` : '');
 }
 
 function contactInitial(name: string): string {
@@ -2052,7 +2235,17 @@ function contactSidebarView(): string {
   const groupsHtml = groups.length
     ? groups.map(sideGroupRow).join('')
     : '<li class="side-list-empty">还没有群聊。</li>';
-  return `<div class="side-section">
+  const requests = incomingRequests.length
+    ? `<div class="side-section" id="side-requests">
+      <div class="side-section-head"><span>待处理申请</span><small>${incomingRequests.length}</small></div>
+      <ul class="side-list">${incomingRequests.map((request) => `<li class="side-row request-row" data-id="${request.id}">
+        <span class="av av-32">${escapeText(contactInitial(request.nickname || request.peer.slice(0, 4)))}</span>
+        <span class="side-row-body"><strong>${escapeText(request.nickname || request.peer.slice(0, 8))}</strong><small>${request.username ? '@' + escapeText(request.username) : t('请求添加好友')}</small></span>
+        <span class="request-actions"><button class="outline" data-action="accept-request" data-id="${request.id}">接受</button><button class="linkish" data-action="reject-request" data-id="${request.id}">拒绝</button></span>
+      </li>`).join('')}</ul>
+    </div>`
+    : '';
+  return `${requests}<div class="side-section">
       <div class="side-section-head"><span>好友</span><small id="side-contact-count">${verified.length}</small></div>
       <ul id="side-contacts" class="side-list"><li><button class="side-row" data-action="open-self"><span class="av av-32">我</span><span class="side-row-body"><strong>自己</strong><small>本地自聊</small></span></button></li>${friends}</ul>
     </div>
@@ -2067,16 +2260,16 @@ function contactCardRow(contact: Contact): string {
   const verified = contact.trust_state === 'verified';
   const meta = [contact.username ? `@${contact.username}` : null, `QBird ID ${shortId(contact.fingerprint)}`, contact.category ? `分组 ${contact.category}` : null]
     .filter(Boolean).join(' · ');
-  return `<li class="contact-card contact-row" draggable="true" data-fingerprint="${contact.fingerprint}" data-name="${escapeText(contact.display_name)}" data-trust="${contact.trust_state}" title="拖到「群聊」里的群可邀请入群">
+  return `<li class="contact-card contact-row" draggable="true" data-fingerprint="${escapeText(contact.fingerprint)}" data-name="${escapeText(contact.display_name)}" data-trust="${escapeText(contact.trust_state)}" title="${escapeText(t('拖到「群聊」里的群可邀请入群'))}">
     <span class="av av-44">${escapeText(contactInitial(name))}</span>
     <div class="contact-card-body">
-      <div class="contact-card-title"><strong>${escapeText(name)}</strong>${verified ? presenceDot(contact.fingerprint) : ''}<span class="chip ${verified ? 'chip-ok' : 'chip-warn'}">${verified ? '已添加' : '待确认'}</span></div>
+      <div class="contact-card-title"><strong>${escapeText(name)}</strong>${verified ? presenceDot(contact.fingerprint) : ''}<span class="chip ${verified ? 'chip-ok' : 'chip-warn'}">${verified ? t('已添加') : t('待确认')}</span></div>
       ${contact.remark && contact.remark !== contact.display_name ? `<div class="contact-card-sub">昵称 ${escapeText(contact.display_name)}</div>` : ''}
       <div class="contact-card-sub">${escapeText(meta)}</div>
       <details class="contact-card-more"><summary>备注与分组</summary>
         <div class="probe-row">
-          <input type="text" maxlength="64" placeholder="备注" value="${escapeText(contact.remark ?? '')}" data-remark-for="${contact.fingerprint}" aria-label="联系人备注">
-          <input type="text" maxlength="64" placeholder="分组" value="${escapeText(contact.category ?? '')}" data-category-for="${contact.fingerprint}" aria-label="联系人分组">
+          <input type="text" maxlength="64" placeholder="${escapeText(t('备注'))}" value="${escapeText(contact.remark ?? '')}" data-remark-for="${escapeText(contact.fingerprint)}" aria-label="${escapeText(t('联系人备注'))}">
+          <input type="text" maxlength="64" placeholder="${escapeText(t('分组'))}" value="${escapeText(contact.category ?? '')}" data-category-for="${escapeText(contact.fingerprint)}" aria-label="${escapeText(t('联系人分组'))}">
           <button class="outline" data-action="save-contact-profile" data-peer="${contact.fingerprint}">保存</button>
         </div>
       </details>
@@ -2094,7 +2287,7 @@ function groupCardRow(group: Group): string {
     <span class="av av-44 av-group">群</span>
     <div class="contact-card-body">
       <div class="contact-card-title"><strong>${escapeText(group.name)}</strong>${group.is_owner ? '<span class="chip">我创建的</span>' : ''}</div>
-      <div class="contact-card-sub">${group.member_count} 位成员 · ${escapeText(group.last_body || '暂无消息')}</div>
+      <div class="contact-card-sub">${group.member_count} 位成员 · ${escapeText(group.last_body || t('暂无消息'))}</div>
     </div>
     <div class="contact-card-actions">
       <button class="outline" data-action="open-group" data-group="${group.id}" data-name="${escapeText(group.name)}">打开群聊</button>
@@ -2107,7 +2300,7 @@ function groupTabView(): string {
     <ul id="groups-list" class="contact-cards"></ul>
     <div class="probe-box" id="group-invite-box"><h3>群聊邀请</h3><div id="group-invitations"></div></div>
     <div class="probe-box"><h3>新建群聊</h3>
-      <label for="group-name">群聊名称</label><input id="group-name" type="text" maxlength="128" placeholder="例如：项目组">
+      <label for="group-name">群聊名称</label><input id="group-name" type="text" maxlength="128" placeholder="${escapeText(t('例如：项目组'))}">
       <div id="group-members-pick" class="group-pick"></div>
       <button class="outline" data-action="create-group">创建群聊</button>
       <p id="group-create-status" aria-live="polite"></p>
@@ -2117,7 +2310,7 @@ function groupTabView(): string {
       <label><input id="auto-join-groups" type="checkbox" ${autoJoinGroups ? 'checked' : ''}> 被拉进群时自动加入</label>
       <div id="join-requests"></div>
       <label for="group-search-name">按群名搜索并申请加入</label>
-      <div class="probe-row"><input id="group-search-name" type="text" maxlength="64" placeholder="群名关键词"><button class="outline" data-action="search-groups" ${groupSearchBusy ? 'disabled' : ''}>搜索</button></div>
+      <div class="probe-row"><input id="group-search-name" type="text" maxlength="64" placeholder="${escapeText(t('群名关键词'))}"><button class="outline" data-action="search-groups" ${groupSearchBusy ? 'disabled' : ''}>搜索</button></div>
       <p id="group-search-status" role="status">${escapeText(groupSearchStatus)}</p>
       <ul id="group-search-results" class="discovery-results"></ul>
       <small>只会向已确认且有地址的联系人查询；申请直接发给群主。对方离线时不保证送达。</small>
@@ -2125,6 +2318,10 @@ function groupTabView(): string {
     <div class="probe-box"><h3>已退出的群聊</h3>
       <p class="hint">退出后消息记录仍保留在本机，可随时查看或导出。</p>
       <ul id="left-groups-list" class="discovery-results"></ul>
+    </div>
+    <div class="probe-box"><h3>无效群（已解散）</h3>
+      <p class="hint">群主解散后成员都会被移出，本机记录保留；只有你主动删除才会清空，删除会同时删除已下载的群文件。</p>
+      <ul id="dissolved-groups-list" class="discovery-results"></ul>
     </div>
   </section>`;
 }
@@ -2136,21 +2333,34 @@ function contactsPageView(): string {
       <div>
         <span class="eyebrow">CONTACTS / 联系人</span>
         <h2>联系人</h2>
-        <p>联系人保存在本机；添加是单向的，对方也添加你之后才能互发消息。</p>
+        <p>联系人保存在本机；添加对方需要对方同意，双方确认后才能互发消息。</p>
       </div>
-      <div class="segmented" role="tablist" aria-label="联系人与群聊">
+      <div class="segmented" role="tablist" aria-label="${escapeText(t('联系人与群聊'))}">
         <button role="tab" class="${contactTab === 'direct' ? 'active' : ''}" data-action="contact-tab" data-tab="direct" aria-selected="${contactTab === 'direct'}">单聊 · ${verified}</button>
         <button role="tab" class="${contactTab === 'group' ? 'active' : ''}" data-action="contact-tab" data-tab="group" aria-selected="${contactTab === 'group'}">群聊 · ${groups.length}</button>
       </div>
     </header>
+    <div class="contacts-body" id="contacts-body">
     ${contactTab === 'direct' ? `<div class="contacts-toolbar">
-        <input id="contact-search" type="search" maxlength="64" placeholder="搜索用户名、昵称或备注" value="${escapeText(contactQuery)}" aria-label="搜索联系人">
+        <input id="contact-search" type="search" maxlength="64" placeholder="${escapeText(t('搜索用户名、昵称或备注'))}" value="${escapeText(contactQuery)}" aria-label="${escapeText(t('搜索联系人'))}">
         <button class="outline" data-action="contacts-add">添加联系人</button>
       </div>
       <p id="contacts-status" role="status" aria-live="polite"></p>
       <ul id="contacts-list" class="contact-cards"></ul>`
     : `<p id="contacts-status" role="status" aria-live="polite"></p>${groupTabView()}`}
+    </div>
   </section>`;
+}
+
+/// The contacts head is fixed and the list scrolls under it; show a hairline only once
+/// something is actually hidden behind it, so the card keeps its quiet resting look.
+function watchContactsScroll(): void {
+  const body = app.querySelector<HTMLElement>('#contacts-body');
+  const head = app.querySelector<HTMLElement>('.contacts-head');
+  if (!body || !head) return;
+  const sync = (): void => { head.classList.toggle('stuck', body.scrollTop > 2); };
+  body.addEventListener('scroll', sync, { passive: true });
+  sync();
 }
 
 function paintContactsSidebar(): void {
@@ -2176,10 +2386,10 @@ function paintContactCards(): void {
     || (contact.remark ?? '').toLowerCase().includes(query));
   if (query) {
     const status = app.querySelector<HTMLElement>('#contacts-status');
-    if (status) status.textContent = rows.length ? `匹配 ${rows.length} 位联系人` : '没有匹配的联系人';
+    if (status) status.textContent = rows.length ? `匹配 ${rows.length} 位联系人` : t('没有匹配的联系人');
   }
   if (!rows.length) {
-    list.innerHTML = `<li class="contact-card-empty">${query ? '没有匹配的联系人。' : '还没有联系人，点右上角「添加联系人」去局域网用户页添加。'}</li>`;
+    list.innerHTML = `<li class="contact-card-empty">${query ? t('没有匹配的联系人。') : t('还没有联系人，点右上角「添加联系人」去局域网用户页添加。')}</li>`;
     return;
   }
   list.innerHTML = rows.map(contactCardRow).join('');
@@ -2208,24 +2418,24 @@ function paintPresenceHeader(): void {
   if (!peer) return;
   const online = presence.get(peer) === true;
   dot.classList.toggle('online', online);
-  dot.title = online ? '在线：局域网可见或地址可连接' : '离线：当前不可达';
+  dot.title = online ? t('在线：局域网可见或地址可连接') : t('离线：当前不可达');
   const text = app.querySelector<HTMLElement>('#direct-presence-text');
-  if (text) text.textContent = online ? '在线' : '离线';
+  if (text) text.textContent = online ? t('在线') : t('离线');
 }
 
 async function acceptContact(peer: string): Promise<void> {
   try {
     await invoke('v1_accept_contact', { fingerprint: peer });
-    contactNotice = '已接受该联系人，双方现在可以互发消息。';
+    contactNotice = t('已接受该联系人，双方现在可以互发消息。');
   } catch (error) { contactNotice = displayError(error); }
   await refreshContacts();
 }
 
 async function declineContact(peer: string): Promise<void> {
-  if (!window.confirm('删除这条待确认的联系人请求？对方之后仍可再次添加你。')) return;
+  if (!window.confirm(t('删除这条待确认的联系人请求？对方之后仍可再次添加你。'))) return;
   try {
     await invoke('v1_decline_contact', { fingerprint: peer });
-    contactNotice = '已移除待确认请求。';
+    contactNotice = t('已移除待确认请求。');
   } catch (error) { contactNotice = displayError(error); }
   await refreshContacts();
 }
@@ -2233,7 +2443,7 @@ async function declineContact(peer: string): Promise<void> {
 async function refreshContacts(): Promise<void> {
   if (!isTauri()) {
     const status = app.querySelector<HTMLElement>('#contacts-status');
-    if (status) status.textContent = '仅桌面应用支持联系人';
+    if (status) status.textContent = t('仅桌面应用支持联系人');
     return;
   }
   try {
@@ -2256,7 +2466,7 @@ async function refreshContacts(): Promise<void> {
       const incoming = contactsCache.length - verified;
       status.textContent = contactNotice || (contactsCache.length
         ? `${verified} 位已添加联系人${incoming > 0 ? ` · ${incoming} 条待确认请求` : ''}`
-        : '暂无联系人，可前往「局域网用户」添加。');
+        : t('暂无联系人，可前往「局域网用户」添加。'));
       contactNotice = '';
     }
     paintContactsSidebar();
@@ -2269,7 +2479,7 @@ async function refreshContacts(): Promise<void> {
     await refreshJoinRequests();
   } catch {
     const status = app.querySelector<HTMLElement>('#contacts-status');
-    if (status) status.textContent = '无法读取联系人';
+    if (status) status.textContent = t('无法读取联系人');
   }
 }
 
@@ -2284,13 +2494,179 @@ async function refreshGroupInvites(): Promise<void> {
   } catch { /* keep the last list on a transient read failure */ }
 }
 
+async function refreshContactRequests(): Promise<void> {
+  if (!isTauri()) return;
+  try {
+    const [incoming, outgoing] = await Promise.all([
+      invoke<ContactRequest[]>('v1_contact_requests', { direction: 'in' }),
+      invoke<ContactRequest[]>('v1_contact_requests', { direction: 'out' }),
+    ]);
+    const pendingIn = incoming.filter((item) => item.status === 'pending');
+    const pendingOut = outgoing.filter((item) => item.status === 'pending');
+    if (JSON.stringify(pendingIn) !== JSON.stringify(incomingRequests)) {
+      incomingRequests = pendingIn;
+      if (page === 'contacts') paintContactsSidebar();
+    }
+    outgoingRequests = pendingOut;
+  } catch { /* keep the last list on a transient read failure */ }
+}
+
+async function refreshDissolvedGroups(): Promise<void> {
+  if (!isTauri()) return;
+  try {
+    const list = await invoke<DissolvedGroup[]>('v1_list_dissolved_groups');
+    if (JSON.stringify(list) !== JSON.stringify(dissolvedGroups)) {
+      dissolvedGroups = list;
+      paintDissolvedGroups();
+    }
+  } catch { /* keep the last list */ }
+}
+
+function paintDissolvedGroups(): void {
+  const list = app.querySelector<HTMLUListElement>('#dissolved-groups-list');
+  if (!list) return;
+  list.replaceChildren();
+  if (!dissolvedGroups.length) {
+    const empty = document.createElement('li');
+    empty.textContent = t('没有已解散的群聊。');
+    list.append(empty);
+    return;
+  }
+  for (const group of dissolvedGroups) {
+    const item = document.createElement('li');
+    const info = document.createElement('span');
+    const when = group.dissolved_at ? new Date(group.dissolved_at * 1000).toLocaleDateString() : '';
+    info.textContent = `${group.name} · 已解散${when ? ` · ${when}` : ''}`;
+    const open = document.createElement('button');
+    open.className = 'outline'; open.textContent = t('查看历史');
+    open.dataset.action = 'open-dissolved-group';
+    open.dataset.group = group.id;
+    open.dataset.name = group.name;
+    const remove = document.createElement('button');
+    remove.className = 'linkish danger'; remove.textContent = t('删除记录');
+    remove.dataset.action = 'delete-dissolved-group';
+    remove.dataset.group = group.id;
+    remove.dataset.name = group.name;
+    item.append(info, open, remove);
+    list.append(item);
+  }
+}
+
+async function respondContactRequest(id: string, accept: boolean): Promise<void> {
+  if (!isTauri()) return;
+  try {
+    await invoke('v1_respond_contact_request', { id, accept });
+    requestNotice = accept ? t('已接受好友申请。') : t('已拒绝好友申请。');
+    incomingRequests = incomingRequests.filter((item) => item.id !== id);
+    if (page === 'contacts') paintContactsSidebar();
+    await refreshContacts();
+  } catch (error) {
+    requestNotice = displayError(error);
+  }
+}
+
+async function deleteDissolvedGroup(groupId: string, name: string): Promise<void> {
+  if (!isTauri()) return;
+  if (!window.confirm(`删除「${name}」的本地记录？消息与已下载的群文件都会被删除，无法恢复。`)) return;
+  try {
+    await invoke('v1_delete_group_history', { groupId });
+    await refreshDissolvedGroups();
+    if (page === 'contacts') paintLeftGroups();
+  } catch (error) {
+    const status = app.querySelector<HTMLElement>('#contacts-status');
+    if (status) status.textContent = displayError(error);
+  }
+}
+
+async function refreshPrivacyState(): Promise<void> {
+  if (!isTauri()) return;
+  try {
+    lanVisible = await invoke<boolean>('v1_lan_visibility');
+    const sync = await invoke<{ auto_accept: boolean }>('v1_contact_sync_settings');
+    contactRequestMode = sync.auto_accept ? 'auto' : 'ask';
+  } catch { /* keep defaults */ }
+}
+
+async function refreshNoticeState(): Promise<void> {
+  if (!isTauri()) return;
+  try {
+    noticeSettings = await invoke<{ mode: NoticeMode; raise_window: boolean; preview: boolean }>('v1_notice_settings');
+  } catch { /* keep defaults */ }
+}
+
+async function saveNoticeSettings(): Promise<void> {
+  if (!isTauri()) return;
+  const mode = (app.querySelector<HTMLSelectElement>('#notice-mode')?.value || 'popup') as NoticeMode;
+  const raise = app.querySelector<HTMLInputElement>('#notice-raise')?.checked ?? false;
+  const preview = app.querySelector<HTMLInputElement>('#notice-preview')?.checked ?? true;
+  try {
+    noticeSettings = await invoke('v1_set_notice_settings', { mode, raiseWindow: raise, preview });
+    noticeNotice = t('status.noticeSaved');
+  } catch (error) {
+    noticeNotice = displayError(error);
+  }
+  if (page === 'settings') render();
+}
+
+async function saveContactPrivacy(): Promise<void> {
+  if (!isTauri()) return;
+  const mode = app.querySelector<HTMLSelectElement>('#contact-request-mode')?.value === 'auto' ? 'auto' : 'ask';
+  const visible = app.querySelector<HTMLInputElement>('#lan-visible')?.checked ?? true;
+  try {
+    await invoke('v1_set_contact_sync', { autoAccept: mode === 'auto' });
+    lanVisible = await invoke<boolean>('v1_set_lan_visibility', { visible });
+    contactRequestMode = mode;
+    privacyNotice = t('status.saved');
+  } catch (error) {
+    privacyNotice = displayError(error);
+  }
+  if (page === 'settings') render();
+}
+
+async function handleIncomingNotice(payload: { kind: 'direct' | 'group'; id: string; preview: string }): Promise<void> {
+  if (noticeSettings.mode === 'off') return;
+  if (document.hasFocus()) return;
+  let name = payload.kind === 'group' ? t('群消息') : t('新的消息');
+  if (payload.kind === 'direct') {
+    const contact = contactsCache.find((item) => item.fingerprint === payload.id);
+    if (contact) name = contact.remark || contact.display_name;
+  } else {
+    const group = groups.find((item) => item.id === payload.id);
+    if (group) name = group.name;
+  }
+  void invoke('v1_flash_tray', { label: name }).catch(() => undefined);
+  if (noticeSettings.mode === 'popup') {
+    const preview = noticeSettings.preview ? payload.preview : t('发来一条消息');
+    void invoke('v1_show_notice', { payload: { ...payload, name, preview } }).catch(() => undefined);
+  }
+  if (noticeSettings.raise_window) {
+    const window = getCurrentWindow();
+    await window.show().catch(() => undefined);
+    await window.setFocus().catch(() => undefined);
+  }
+}
+
+async function openFromNotice(payload: { kind: 'direct' | 'group'; id: string }): Promise<void> {
+  if (payload.kind === 'direct') {
+    const contact = contactsCache.find((item) => item.fingerprint === payload.id);
+    direct.clear(); groupChat.clear(); selfOpen = false; page = 'messages';
+    render();
+    await direct.open(payload.id, contact?.remark || contact?.display_name || payload.id.slice(0, 8));
+  } else {
+    const group = groups.find((item) => item.id === payload.id);
+    direct.clear(); selfOpen = false; page = 'messages';
+    render();
+    await groupChat.open(payload.id, group?.name || t('群聊'));
+  }
+}
+
 function paintLeftGroups(): void {
   const list = app.querySelector<HTMLUListElement>('#left-groups-list');
   if (!list) return;
   list.replaceChildren();
   if (!leftGroups.length) {
     const empty = document.createElement('li');
-    empty.textContent = '没有已退出的群聊。';
+    empty.textContent = t('没有已退出的群聊。');
     list.append(empty);
     return;
   }
@@ -2300,7 +2676,7 @@ function paintLeftGroups(): void {
     info.textContent = `${group.name} · ${group.member_count} 人 · 已退出`;
     const button = document.createElement('button');
     button.className = 'outline';
-    button.textContent = '查看历史';
+    button.textContent = t('查看历史');
     button.dataset.action = 'open-left-group';
     button.dataset.group = group.id;
     button.dataset.name = group.name;
@@ -2318,7 +2694,7 @@ function paintGroupInvitations(): void {
   if (!groupInvites.length) {
     const empty = document.createElement('p');
     empty.className = 'hint';
-    empty.textContent = '没有待处理的邀请。';
+    empty.textContent = t('没有待处理的邀请。');
     host.append(empty);
     return;
   }
@@ -2329,16 +2705,16 @@ function paintGroupInvitations(): void {
     const title = document.createElement('strong');
     title.textContent = invite.name;
     const meta = document.createElement('small');
-    meta.textContent = `${invite.owner_name || '群主'} 邀请你加入 · ${invite.member_count} 人`;
+    meta.textContent = `${invite.owner_name || t('群主')} 邀请你加入 · ${invite.member_count} 人`;
     text.append(title, meta);
     const accept = document.createElement('button');
     accept.className = 'outline';
-    accept.textContent = '同意';
+    accept.textContent = t('同意');
     accept.dataset.action = 'accept-invite';
     accept.dataset.id = invite.id;
     const decline = document.createElement('button');
     decline.className = 'linkish';
-    decline.textContent = '拒绝';
+    decline.textContent = t('拒绝');
     decline.dataset.action = 'decline-invite';
     decline.dataset.id = invite.id;
     const actions = document.createElement('div');
@@ -2374,7 +2750,7 @@ function paintGroups(contacts: Contact[]): void {
   if (pick) {
     pick.replaceChildren();
     const verified = contacts.filter(contact => contact.trust_state === 'verified');
-    if (!verified.length) { pick.textContent = '需要先在发现页面确认至少一位联系人。'; return; }
+    if (!verified.length) { pick.textContent = t('需要先在发现页面确认至少一位联系人。'); return; }
     for (const contact of verified) {
       const label = document.createElement('label');
       const box = document.createElement('input');
@@ -2391,7 +2767,7 @@ async function addDroppedMember(groupId: string, fingerprint: string): Promise<v
   const status = app.querySelector<HTMLElement>('#group-create-status');
   try {
     await invoke('v1_add_group_member', { groupId, member: fingerprint });
-    if (status) status.textContent = '已邀请该联系人入群，正在通知成员。';
+    if (status) status.textContent = t('已邀请该联系人入群，正在通知成员。');
     await refreshContacts();
   } catch (error) { if (status) status.textContent = displayError(error); }
 }
@@ -2403,13 +2779,13 @@ async function createGroup(): Promise<void> {
   const name = input.value.trim();
   const members = [...app.querySelectorAll<HTMLInputElement>('input[data-group-member]:checked')]
     .map(node => node.dataset.groupMember || '').filter(Boolean);
-  if (!name) { status.textContent = '请输入群聊名称'; return; }
-  if (!members.length) { status.textContent = '请至少选择一位已确认联系人'; return; }
+  if (!name) { status.textContent = t('请输入群聊名称'); return; }
+  if (!members.length) { status.textContent = t('请至少选择一位已确认联系人'); return; }
   try {
     const created = await invoke<Group>('v1_create_group', { name, members });
     input.value = '';
     for (const node of app.querySelectorAll<HTMLInputElement>('input[data-group-member]')) node.checked = false;
-    status.textContent = '群聊已创建；邀请会在对方在线时送达。';
+    status.textContent = t('群聊已创建；邀请会在对方在线时送达。');
     selfOpen = false; page = 'messages';
     await groupChat.open(created.id, created.name);
   } catch (error) { status.textContent = displayError(error); }
@@ -2419,33 +2795,34 @@ function render(): void {
   if (lockState.locked) { workspace.suspend(); app.innerHTML = lockView(); return; }
   workspace.resume();
   window.requestAnimationFrame(() => workspace.refreshLayout());
-  if (!onboardingLoaded) { app.innerHTML = '<div class="boot">正在准备 Qbird…</div>'; return; }
+  if (!onboardingLoaded) { app.innerHTML = `<div class="boot">${t('boot.preparing')}</div>`; return; }
   if (isTauri() && onboarding && !onboarding.done) { paintOnboarding(); return; }
   const current = pages[page];
   app.innerHTML = `
     <div class="shell">
-      <aside class="rail" aria-label="主导航">
-        <button class="profile" data-page="profile" aria-label="我的资料" title="我的资料">${avatarMarkup()}</button>
-        <nav class="rail-nav" aria-label="主要功能">
-          <button data-page="messages" class="${page === 'messages' ? 'active' : ''}" aria-label="消息" title="消息">${icon('messages')}</button>
-          <button data-page="contacts" class="${page === 'contacts' ? 'active' : ''}" aria-label="联系人" title="联系人">${icon('contacts')}</button>
-          <button data-page="discover" class="${page === 'discover' ? 'active' : ''}" aria-label="局域网用户" title="局域网用户">${icon('discover')}</button>
+      <aside class="rail" aria-label="${t('nav.mainNav')}">
+        <button class="profile" data-page="profile" aria-label="${t('nav.profile')}" title="${t('nav.profile')}">${avatarMarkup()}</button>
+        <nav class="rail-nav" aria-label="${t('nav.primary')}">
+          <button data-page="messages" class="${page === 'messages' ? 'active' : ''}" aria-label="${t('nav.messages')}" title="${t('nav.messages')}">${icon('messages')}</button>
+          <button data-page="contacts" class="${page === 'contacts' ? 'active' : ''}" aria-label="${t('nav.contacts')}" title="${t('nav.contacts')}">${icon('contacts')}</button>
+          <button data-page="discover" class="${page === 'discover' ? 'active' : ''}" aria-label="${t('nav.discover')}" title="${t('nav.discover')}">${icon('discover')}</button>
         </nav>
         <span class="rail-brand">Qbird</span>
-        <button class="rail-bottom" data-action="lock-now" aria-label="临时离开锁定" title="临时离开锁定">${icon('lock')}</button>
-        <button class="rail-bottom" data-action="menu" aria-label="更多" aria-expanded="${menuOpen}" title="更多">${icon('menu')}</button>
+        <button class="rail-bottom" data-action="lock-now" aria-label="${t('nav.lock')}" title="${t('nav.lock')}">${icon('lock')}</button>
+        <button class="rail-bottom" data-action="menu" aria-label="${t('nav.more')}" aria-expanded="${menuOpen}" title="${t('nav.more')}">${icon('menu')}</button>
       </aside>
-      ${menuOpen ? '<div class="menu" role="menu"><button data-page="settings" role="menuitem">设置</button><button data-page="settings" data-settings-tab="privacy" role="menuitem">聊天备份</button><span>用户备份 · 待实现（将含身份私钥）</span><span>用户还原 · 待实现</span><button data-page="settings" data-settings-tab="privacy" role="menuitem">聊天记录还原</button><button data-page="about" role="menuitem">关于</button></div>' : ''}
+      ${menuOpen ? `<div class="menu" role="menu"><button data-page="settings" role="menuitem">${t('menu.settings')}</button><button data-page="settings" data-settings-tab="privacy" role="menuitem">${t('menu.chatBackup')}</button><span>${t('menu.userBackupTodo')}</span><span>${t('menu.userRestoreTodo')}</span><button data-page="settings" data-settings-tab="privacy" role="menuitem">${t('menu.chatRestore')}</button><button data-page="about" role="menuitem">${t('menu.about')}</button></div>` : ''}
       <aside class="sidebar">
-        <div class="team"><span class="team-mark">${teamLogoUrl ? `<img class="team-logo" src="${teamLogoUrl}" alt="团队 Logo">` : icon('spark')}</span><div><strong>${team.name ? escapeText(team.name) : 'Qbird 青鸟'}</strong><small>LOCAL NETWORK MESSENGER</small></div></div>
-        <div class="side-heading"><div><span class="eyebrow">${current.eyebrow}</span><h1>${current.title}</h1></div></div>
-        ${page === 'settings' || page === 'about' ? `<div class="settings-links">${SETTINGS_TABS.map((tab) => `<button data-settings-tab="${tab.id}" class="${page === 'settings' && settingsTab === tab.id ? 'selected' : ''}">${tab.label}</button>`).join('')}<button data-page="about" class="${page === 'about' ? 'selected' : ''}">关于</button></div>` : page === 'messages' ? `<div class="side-search"><input id="global-search" type="search" maxlength="200" placeholder="搜索全部消息" aria-label="搜索全部消息" value="${searchQuery.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;')}"></div><div id="search-results" class="search-hits" hidden></div><div id="conversation-list" class="conversation-list">正在读取…</div>` : page === 'contacts' ? contactSidebarView() : '<div class="side-empty">暂无内容</div>'}
-        <div class="side-foot"><span class="dot"></span>开发中 · 本地桌面版</div>
+        <div class="team"><span class="team-mark">${teamLogoUrl ? `<img class="team-logo" src="${escapeText(teamLogoUrl)}" alt="${escapeText(t('团队 Logo'))}">` : icon('spark')}</span><div><strong>${team.name ? escapeText(team.name) : 'Qbird'}</strong><small>LOCAL NETWORK MESSENGER</small></div></div>
+        <div class="side-heading"><div><span class="eyebrow">${current.eyebrow}</span><h1>${current.title()}</h1></div></div>
+        ${page === 'settings' || page === 'about' ? `<div class="settings-links">${SETTINGS_TABS.map((tab) => `<button data-settings-tab="${tab.id}" class="${page === 'settings' && settingsTab === tab.id ? 'selected' : ''}">${tab.label()}</button>`).join('')}<button data-page="about" class="${page === 'about' ? 'selected' : ''}">${t('menu.about')}</button></div>` : page === 'messages' ? `<div class="side-search"><input id="global-search" type="search" maxlength="200" placeholder="${t('side.searchAll')}" aria-label="${t('side.searchAll')}" value="${searchQuery.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;')}"></div><div id="search-results" class="search-hits" hidden></div><div id="conversation-list" class="conversation-list">${t('side.reading')}</div>` : page === 'contacts' ? contactSidebarView() : `<div class="side-empty">${t('side.empty')}</div>`}
+        <div class="side-foot"><span class="dot"></span>${t('side.localDesktop')}</div>
       </aside>
       <main class="workspace">
-        ${page === 'messages' && groupChat.groupId ? groupChat.view() : page === 'messages' && direct.peer ? direct.view() : page === 'messages' && selfOpen ? selfChatView() : page === 'discover' ? discoveryView() : page === 'settings' ? settingsView() : page === 'profile' ? profileView() : page === 'contacts' ? contactsPageView() : page === 'about' ? `<section class="card about"><span class="eyebrow">ABOUT / 关于</span><h2>Qbird 青鸟</h2><p>面向局域网的本地优先聊天与文件交流工具。</p><dl><div><dt>当前阶段</dt><dd>Windows 开发版 ${appVersion}</dd></div><div><dt>许可证</dt><dd>Apache License 2.0</dd></div><div><dt>平台规划</dt><dd>Windows 首发 · 后续 Linux / macOS</dd></div></dl><p class="notice">开发版未经安全审计，本地数据库未加密。</p></section>` : `<section class="empty"><div class="empty-mark">${icon('spark')}</div><h2>${current.heading}</h2><p>${current.copy}</p></section>`}
+        ${page === 'messages' && groupChat.groupId ? groupChat.view() : page === 'messages' && direct.peer ? direct.view() : page === 'messages' && selfOpen ? selfChatView() : page === 'discover' ? discoveryView() : page === 'settings' ? settingsView() : page === 'profile' ? profileView() : page === 'contacts' ? contactsPageView() : page === 'about' ? `<section class="card about"><span class="eyebrow">${t('about.eyebrow')}</span><h2>${t('page.about.heading')}</h2><p>${t('about.tagline')}</p><dl><div><dt>${t('about.stage')}</dt><dd>${t('about.stageValue')} ${appVersion}</dd></div><div><dt>${t('about.license')}</dt><dd>Apache License 2.0</dd></div><div><dt>${t('about.platform')}</dt><dd>${t('about.platformValue')}</dd></div></dl></section>` : `<section class="empty"><div class="empty-mark">${icon('spark')}</div><h2>${current.heading()}</h2><p>${current.copy()}</p></section>`}
       </main>
     </div>`;
+  if (page === 'contacts') watchContactsScroll();
   if (page === 'discover') { paintLan(); void refreshLanPeople(); }
   if (page === 'settings') void refreshStorage();
   if (page === 'settings' && settingsTab === 'debug') void refreshDebugReports();
@@ -2494,9 +2871,9 @@ function paintDiscovery(): void {
   setText('#probe-status', probeNotice);
   setText('#probe-message', probeMessage);
   setText('#local-fingerprint', fingerprint);
-  setText('#remote-fingerprint', remoteFingerprint || '暂无');
+  setText('#remote-fingerprint', remoteFingerprint || t('暂无'));
   setText('#remote-target', observedAddress);
-  setText('#selected-fingerprint', selectedFingerprint || '请先选择探测结果');
+  setText('#selected-fingerprint', selectedFingerprint || t('请先选择探测结果'));
   const requests = app.querySelector<HTMLUListElement>('#probe-requests');
   if (requests) {
     requests.replaceChildren();
@@ -2504,7 +2881,7 @@ function paintDiscovery(): void {
       const item = document.createElement('li');
       item.textContent = `${request.remote_ip} · ${request.fingerprint}（未确认）`;
       const button = document.createElement('button');
-      button.className = 'outline'; button.textContent = '选择此指纹核对';
+      button.className = 'outline'; button.textContent = t('选择此指纹核对');
       button.dataset.action = 'select-inbound'; button.dataset.fingerprint = request.fingerprint;
       button.disabled = !isTauri() || probeBusy;
       item.append(button);
@@ -2530,10 +2907,10 @@ async function refreshDiscovery(): Promise<void> {
   discoveryLoading = true;
   try {
     candidates = await invoke<Candidate[]>('v1_discovery_snapshot');
-    discoveryStatus = candidates.length ? `发现 ${candidates.length} 个候选服务` : '暂未发现候选服务';
+    discoveryStatus = candidates.length ? `发现 ${candidates.length} 个候选服务` : t('暂未发现候选服务');
   } catch {
     candidates = [];
-    discoveryStatus = '局域网发现不可用，请检查网络和防火墙';
+    discoveryStatus = t('局域网发现不可用，请检查网络和防火墙');
   } finally {
     discoveryLoading = false;
     if (page === 'discover') paintDiscovery();
@@ -2544,14 +2921,14 @@ async function refreshProbeStatus(): Promise<void> {
   if (!isTauri() || page !== 'discover') return;
   try {
     probeStatus = await invoke<ProbeStatus>('v1_probe_status');
-    probeNotice = probeStatus.running ? `聊天与探测监听中：TCP ${probeStatus.port}` : probeStatus.port !== null ? '监听异常停止，请先停止再重试' : '聊天与探测服务未启动';
-  } catch { probeNotice = '无法读取探测服务状态'; }
+    probeNotice = probeStatus.running ? `聊天与探测监听中：TCP ${probeStatus.port}` : probeStatus.port !== null ? t('监听异常停止，请先停止再重试') : t('聊天与探测服务未启动');
+  } catch { probeNotice = t('无法读取探测服务状态'); }
   if (page === 'discover') paintLan();
 }
 
 function lockView(): string {
-  return `<div class="lock-screen"><section class="card lock-card" aria-label="应用已锁定">
-    <span class="eyebrow">LOCKED / 已锁定</span><h2>Qbird 青鸟</h2>
+  return `<div class="lock-screen"><section class="card lock-card" aria-label="${escapeText(t('应用已锁定'))}">
+    <span class="eyebrow">LOCKED / 已锁定</span><h2>Qbird</h2>
     ${lockState.has_password
       ? '<label for="lock-password">应用锁密码</label><input id="lock-password" type="password" maxlength="128" autocomplete="current-password">'
       : '<p>此应用锁未设置密码，点击下方按钮返回。</p>'}
@@ -2564,7 +2941,7 @@ function lockView(): string {
 async function initLock(): Promise<void> {
   if (!isTauri()) { lockInitialized = true; return; }
   try { lockState = await invoke<LockStatus>('v1_lock_status'); }
-  catch { lockNotice = '无法读取应用锁状态'; }
+  catch { lockNotice = t('status.lockReadErr2'); }
   lockInitialized = true;
   if (lockState.locked) render();
 }
@@ -2594,7 +2971,7 @@ async function unlockApp(): Promise<void> {
   try {
     lockState = await invoke<LockStatus>('v1_unlock', { password: password || null });
     lockNotice = ''; lastActivity = Date.now();
-  } catch (error) { lockNotice = typeof error === 'string' ? error : '解锁失败'; }
+  } catch (error) { lockNotice = trError(error, t('解锁失败')); }
   finally { lockBusy = false; render(); }
   if (!lockState.locked) void restoreWorkspace();
 }
@@ -2606,8 +2983,8 @@ async function saveLockPassword(): Promise<void> {
   lockBusy = true;
   try {
     lockState = await invoke<LockStatus>('v1_set_lock_password', { current: current || null, next });
-    lockNotice = next ? '应用锁密码已保存；下次启动或临时锁定时需要输入。' : '应用锁密码已移除。';
-  } catch (error) { lockNotice = typeof error === 'string' ? error : '无法保存应用锁密码'; }
+    lockNotice = next ? t('status.lockPwSaved') : t('status.lockPwRemoved');
+  } catch (error) { lockNotice = trError(error, t('status.lockSaveErr')); }
   finally { lockBusy = false; if (page === 'settings') render(); }
 }
 
@@ -2615,12 +2992,12 @@ async function saveLockIdle(): Promise<void> {
   if (!isTauri() || lockBusy) return;
   const input = app.querySelector<HTMLInputElement>('#lock-idle');
   const minutes = Number(input?.value ?? '0');
-  if (!Number.isInteger(minutes) || minutes < 0 || minutes > 240) { lockNotice = '请输入 0–240 之间的整数分钟'; if (page === 'settings') render(); return; }
+  if (!Number.isInteger(minutes) || minutes < 0 || minutes > 240) { lockNotice = t('status.idleRange'); if (page === 'settings') render(); return; }
   lockBusy = true;
   try {
     lockState = await invoke<LockStatus>('v1_set_lock_idle', { minutes });
-    lockNotice = minutes ? `无操作 ${minutes} 分钟后将自动锁定。` : '空闲自动锁定已关闭。';
-  } catch (error) { lockNotice = typeof error === 'string' ? error : '无法保存空闲锁定设置'; }
+    lockNotice = minutes ? `无操作 ${minutes} 分钟后将自动锁定。` : t('空闲自动锁定已关闭。');
+  } catch (error) { lockNotice = trError(error, t('status.idleSaveErr')); }
   finally { lockBusy = false; if (page === 'settings') render(); }
 }
 
@@ -2641,7 +3018,7 @@ async function runSearch(): Promise<void> {
     const hits = await invoke<SearchHit[]>('v1_search_all', { query, category: 'all', limit: 100 });
     if (sequence === searchSeq) searchHits = hits;
   } catch {
-    if (sequence === searchSeq) { searchHits = []; searchError = '搜索失败，请稍后重试'; }
+    if (sequence === searchSeq) { searchHits = []; searchError = t('搜索失败，请稍后重试'); }
   } finally {
     if (sequence === searchSeq) { searchBusy = false; paintSearchList(); }
   }
@@ -2656,9 +3033,9 @@ function paintSearchList(): void {
   list.hidden = active;
   results.replaceChildren();
   if (!active) return;
-  if (searchBusy) { results.textContent = '正在搜索…'; return; }
+  if (searchBusy) { results.textContent = t('正在搜索…'); return; }
   if (searchError) { results.textContent = searchError; return; }
-  if (!searchHits.length) { results.textContent = '没有匹配的消息'; return; }
+  if (!searchHits.length) { results.textContent = t('没有匹配的消息'); return; }
   for (const hit of searchHits) {
     const button = document.createElement('button');
     button.className = 'search-hit';
@@ -2668,7 +3045,7 @@ function paintSearchList(): void {
     button.dataset.message = hit.message_id;
     button.dataset.name = hit.conversation_name;
     const head = document.createElement('strong');
-    const kindLabel = hit.conversation_kind === 'self' ? '自聊' : hit.conversation_kind === 'direct' ? '单聊' : '群聊';
+    const kindLabel = hit.conversation_kind === 'self' ? t('自聊') : hit.conversation_kind === 'direct' ? t('单聊') : t('群聊');
     head.textContent = `${kindLabel} · ${hit.conversation_name}`;
     const body = document.createElement('span');
     body.textContent = `${hit.sender_name || ''}：${hit.body}`;
@@ -2695,7 +3072,7 @@ async function openSearchHit(kind: string, id: string, messageId: string, name: 
   }
   if (kind === 'group') {
     direct.clear(); selfOpen = false; page = 'messages';
-    await groupChat.open(id, name || '群聊');
+    await groupChat.open(id, name || t('群聊'));
     await groupChat.jumpTo(messageId);
   }
 }
@@ -2708,7 +3085,7 @@ async function jumpSelf(messageId: string): Promise<void> {
     if (selfMessages.length === before) break;
   }
   const node = app.querySelector<HTMLElement>(`#self-messages [data-id="${messageId}"]`);
-  if (!node) { const status = app.querySelector<HTMLElement>('#self-error'); if (status) status.textContent = '该消息暂不在本机记录中'; return; }
+  if (!node) { const status = app.querySelector<HTMLElement>('#self-error'); if (status) status.textContent = t('该消息暂不在本机记录中'); return; }
   node.scrollIntoView({ block: 'center' });
   node.classList.add('jump-target');
   window.setTimeout(() => node.classList.remove('jump-target'), 1600);
@@ -2721,20 +3098,20 @@ async function exportChat(kind: 'self' | 'direct' | 'group'): Promise<void> {
   const id = kind === 'self' ? 'self' : kind === 'direct' ? direct.peer : groupChat.groupId;
   const status = kind === 'self' ? '#self-error' : kind === 'direct' ? '#direct-file-status' : '#group-error';
   if (!id) return;
-  if (!window.confirm('导出的纯文本未加密，任何能打开该文件的人都能读到内容。确认导出？')) return;
+  if (!window.confirm(t('导出的纯文本未加密，任何能打开该文件的人都能读到内容。确认导出？'))) return;
   const date = new Date();
   const stamp = `${date.getFullYear()}${String(date.getMonth() + 1).padStart(2, '0')}${String(date.getDate()).padStart(2, '0')}`;
   const target = await saveFileDialog({
-    title: '导出聊天记录',
+    title: t('导出聊天记录'),
     defaultPath: `qbird-chat-${stamp}.txt`,
-    filters: [{ name: '纯文本', extensions: ['txt'] }],
+    filters: [{ name: t('纯文本'), extensions: ['txt'] }],
   }).catch(() => null);
   if (!target) return;
   const report = (value: string) => { const node = app.querySelector<HTMLElement>(status); if (node) node.textContent = value; };
   try {
     const result = await invoke<ExportResult>('v1_export_chat', { kind, id, path: target });
     report(`已导出 ${result.message_count} 条消息到 ${result.path}`);
-  } catch (error) { report(typeof error === 'string' ? error : '导出失败'); }
+  } catch (error) { report(trError(error, t('导出失败'))); }
 }
 
 function contactTooltip(): HTMLElement {
@@ -2754,7 +3131,7 @@ function showContactTip(row: HTMLElement): void {
   const name = row.dataset.name ?? '';
   const remark = row.querySelector<HTMLInputElement>('input[data-remark-for]')?.value.trim() ?? '';
   const category = row.querySelector<HTMLInputElement>('input[data-category-for]')?.value.trim() ?? '';
-  const trust = row.dataset.trust === 'verified' ? '已确认' : '待确认';
+  const trust = row.dataset.trust === 'verified' ? t('已确认') : t('待确认');
   tip.replaceChildren();
   const head = document.createElement('strong'); head.textContent = remark ? `${remark}（${name}）` : name;
   const meta = document.createElement('span'); meta.textContent = `${trust}${category ? ` · ${category}` : ''}`;
@@ -2770,12 +3147,12 @@ function showContactTip(row: HTMLElement): void {
       if (tip.hidden || tip.dataset.fingerprint !== fingerprint) return;
       if (hover.show_ip) {
         const line = document.createElement('span');
-        line.textContent = `IP：${info.ip ?? '未记录地址'}`;
+        line.textContent = `IP：${info.ip ?? t('未记录地址')}`;
         tip.append(line);
       }
       if (hover.show_mac) {
         const mac = document.createElement('span');
-        mac.textContent = `MAC：${info.mac ?? '未获取（跨网段或本机 ARP 无记录）'}`;
+        mac.textContent = `MAC：${info.mac ?? t('未获取（跨网段或本机 ARP 无记录）')}`;
         tip.append(mac);
       }
     }).catch(() => {});
@@ -2788,14 +3165,14 @@ function escapeText(value: string): string {
 }
 
 function displayError(error: unknown): string {
-  return typeof error === 'string' && error.length <= 200 ? error : '操作失败，请检查网络后重试';
+  return trError(error, t('操作失败，请检查网络后重试'));
 }
 
 async function setProbeService(start: boolean): Promise<void> {
   if (!isTauri() || probeBusy) return;
   const port = Number(probePort);
   if (start && (!Number.isInteger(port) || port < 1 || port > 65535)) {
-    probeMessage = '请输入 1–65535 的端口'; paintDiscovery(); return;
+    probeMessage = t('请输入 1–65535 的端口'); paintDiscovery(); return;
   }
   probeBusy = true; probeMessage = ''; paintLan();
   try {
@@ -2811,12 +3188,12 @@ async function probePeer(address: string): Promise<void> {
   manualAddress = address.trim();
   const targetAddress = manualAddress;
   remoteFingerprint = ''; observedAddress = '';
-  probeBusy = true; probeMessage = '正在探测…'; paintDiscovery();
+  probeBusy = true; probeMessage = t('正在探测…'); paintDiscovery();
   try {
     const value = await invoke<string>('v1_probe_peer', { address: targetAddress });
     if (!/^[0-9a-f]{64}$/.test(value)) throw new Error('invalid fingerprint');
     remoteFingerprint = value; observedAddress = targetAddress;
-    probeMessage = value === fingerprint ? '该地址使用与本机相同的身份密钥' : '请双方通过可靠渠道核对完整指纹；此结果尚未建立信任';
+    probeMessage = value === fingerprint ? t('该地址使用与本机相同的身份密钥') : t('请双方通过可靠渠道核对完整指纹；此结果尚未建立信任');
   } catch (error) { probeMessage = displayError(error); }
   finally { probeBusy = false; if (page === 'discover') paintDiscovery(); }
 }
@@ -2852,16 +3229,16 @@ app.addEventListener('keydown', (event) => {
 });
 async function respondToInvite(id: string, accept: boolean): Promise<void> {
   if (!isTauri()) return;
-  invitesNotice = accept ? '正在加入…' : '正在拒绝…';
+  invitesNotice = accept ? t('正在加入…') : t('正在拒绝…');
   paintGroupInvitations();
   try {
     if (accept) {
       const groupId = await invoke<string | null>('v1_accept_group_invitation', { id });
-      invitesNotice = groupId ? '已加入群聊。' : '邀请已失效或群身份不一致。';
-      if (groupId) { await refreshContacts(); await groupChat.open(groupId, groupInvites.find((item) => item.id === id)?.name || '群聊'); }
+      invitesNotice = groupId ? t('已加入群聊。') : t('邀请已失效或群身份不一致。');
+      if (groupId) { await refreshContacts(); await groupChat.open(groupId, groupInvites.find((item) => item.id === id)?.name || t('群聊')); }
     } else {
       await invoke<boolean>('v1_decline_group_invitation', { id });
-      invitesNotice = '已拒绝邀请，群主会收到退出通知。';
+      invitesNotice = t('已拒绝邀请，群主会收到退出通知。');
     }
     if (accept) await refreshContacts();
   } catch (error) {
@@ -2872,15 +3249,16 @@ async function respondToInvite(id: string, accept: boolean): Promise<void> {
 
 app.addEventListener('change', (event) => {
   const target = event.target;
+  if (target instanceof HTMLSelectElement && target.id === 'app-language') { setLang(target.value as Lang); syncLangToBackend(getLang()); render(); return; }
   if (target instanceof HTMLInputElement && target.id === 'auto-accept-contacts') {
     void (async () => {
       try {
         const result = await invoke<{ auto_accept: boolean }>('v1_set_contact_sync', { autoAccept: target.checked });
         autoAcceptContacts = result.auto_accept;
-        contactSyncNotice = autoAcceptContacts ? '已开启：同事添加你时自动互相加入。' : '已关闭：对方添加你时不会自动加入联系人。';
+        contactSyncNotice = autoAcceptContacts ? t('已开启：同事添加你时自动互相加入。') : t('已关闭：对方添加你时不会自动加入联系人。');
       } catch {
         target.checked = !target.checked;
-        contactSyncNotice = '无法保存联系人设置';
+        contactSyncNotice = t('无法保存联系人设置');
       }
       const notice = app.querySelector<HTMLElement>('#contact-sync-notice');
       if (notice) notice.textContent = contactSyncNotice;
@@ -2892,10 +3270,10 @@ app.addEventListener('change', (event) => {
       try {
         const result = await invoke<{ auto_join: boolean }>('v1_set_group_auto_join', { autoJoin: target.checked });
         autoJoinGroups = result.auto_join;
-        invitesNotice = autoJoinGroups ? '之后被拉进群会自动加入。' : '之后被拉进群会先询问。';
+        invitesNotice = autoJoinGroups ? t('之后被拉进群会自动加入。') : t('之后被拉进群会先询问。');
       } catch {
         target.checked = !target.checked;
-        invitesNotice = '无法保存群设置';
+        invitesNotice = t('无法保存群设置');
       }
       paintGroupInvitations();
     })();
@@ -2914,7 +3292,7 @@ app.addEventListener('click', (event) => {
   if (!(target instanceof Element)) return;
   const action = target.closest<HTMLButtonElement>('button[data-action]');
   if (action?.dataset.action === 'open-group' && action.dataset.group) {
-    const groupId = action.dataset.group, name = action.dataset.name || '群聊';
+    const groupId = action.dataset.group, name = action.dataset.name || t('群聊');
     direct.clear(); selfOpen = false; page = 'messages';
     void groupChat.open(groupId, name).catch(error => {
       const status = app.querySelector<HTMLElement>('#group-error'); if (status) status.textContent = displayError(error);
@@ -2933,6 +3311,9 @@ app.addEventListener('click', (event) => {
     contactTab = action.dataset.tab === 'group' ? 'group' : 'direct';
     contactQuery = '';
     render();
+    // Each tab starts at the top so the switch never keeps the other tab's scroll offset.
+    const body = app.querySelector<HTMLElement>('#contacts-body');
+    if (body) body.scrollTop = 0;
     void refreshContacts();
     return;
   }
@@ -2981,7 +3362,7 @@ app.addEventListener('click', (event) => {
   if (action?.dataset.action === 'ob-next') {
     syncOnboardingDraft();
     if (onboardingStep === 1) {
-      if (!onboardingDraft.nickname.trim()) { onboardingNotice = '请先填写昵称'; paintOnboarding(); return; }
+      if (!onboardingDraft.nickname.trim()) { onboardingNotice = t('请先填写昵称'); paintOnboarding(); return; }
       if (!onboardingDraft.username) onboardingDraft.username = suggestUsername();
       if (!USERNAME_PATTERN.test(onboardingDraft.username)) { onboardingNotice = `用户名须为${USERNAME_HINT}`; paintOnboarding(); return; }
     }
@@ -3002,7 +3383,7 @@ app.addEventListener('click', (event) => {
   if (action?.dataset.action === 'lan-manual-add') { void addManualLan(); return; }
   if (action?.dataset.action === 'lan-identity') { page = 'profile'; render(); return; }
   if (action?.dataset.action === 'open-left-group' && action.dataset.group) {
-    const groupId = action.dataset.group, name = action.dataset.name || '群聊';
+    const groupId = action.dataset.group, name = action.dataset.name || t('群聊');
     direct.clear(); selfOpen = false; page = 'messages';
     void groupChat.open(groupId, name, true).catch((error) => {
       page = 'contacts';
@@ -3075,7 +3456,35 @@ app.addEventListener('click', (event) => {
   if (action?.dataset.action === 'group-older') { void groupChat.load(true); return; }
   if (action?.dataset.action === 'hide-group') { void groupChat.hide(); return; }
   if (action?.dataset.action === 'leave-group') { void groupChat.leave(); return; }
+  if (action?.dataset.action === 'save-notice-settings') { void saveNoticeSettings(); return; }
+  if (action?.dataset.action === 'save-contact-privacy') { void saveContactPrivacy(); return; }
+  if (action?.dataset.action === 'accept-request' && action.dataset.id) { void respondContactRequest(action.dataset.id, true); return; }
+  if (action?.dataset.action === 'reject-request' && action.dataset.id) { void respondContactRequest(action.dataset.id, false); return; }
+  if (action?.dataset.action === 'open-dissolved-group' && action.dataset.group) {
+    const groupId = action.dataset.group, name = action.dataset.name || t('群聊');
+    direct.clear(); selfOpen = false; page = 'messages';
+    void groupChat.open(groupId, name, true, true).catch((error) => {
+      page = 'contacts'; render();
+      const status = app.querySelector<HTMLElement>('#contacts-status');
+      if (status) status.textContent = displayError(error);
+    });
+    return;
+  }
+  if (action?.dataset.action === 'delete-dissolved-group' && action.dataset.group) {
+    void deleteDissolvedGroup(action.dataset.group, action.dataset.name || t('该群'));
+    return;
+  }
   if (action?.dataset.action === 'toggle-group-members') { groupChat.toggleMembers(); return; }
+  if (action?.dataset.action === 'group-notice-edit' || action?.dataset.action === 'group-notice-close') { groupChat.toggleNoticeEditor(); return; }
+  if (action?.dataset.action === 'group-notice-save') {
+    const input = app.querySelector<HTMLTextAreaElement>('#group-notice-input');
+    if (input) void groupChat.saveNotice(input.value.trim());
+    return;
+  }
+  if (action?.dataset.action === 'group-notice-clear') {
+    if (window.confirm(t('确定清除群公告吗？所有成员的公告都会被清除。'))) void groupChat.saveNotice('');
+    return;
+  }
   if (action?.dataset.action === 'add-group-member') { void groupChat.addMember(); return; }
   if (action?.dataset.action === 'remove-group-member' && action.dataset.member) { void groupChat.removeMember(action.dataset.member); return; }
   if (action?.dataset.action === 'create-group') { void createGroup(); return; }
@@ -3108,6 +3517,7 @@ app.addEventListener('click', (event) => {
   if (action?.dataset.action === 'save-lock-password') { void saveLockPassword(); return; }
   if (action?.dataset.action === 'save-lock-idle') { void saveLockIdle(); return; }
   if (action?.dataset.action === 'export-text' && action.dataset.kind) { void exportChat(action.dataset.kind as 'self' | 'direct' | 'group'); return; }
+  if (action?.dataset.action === 'chat-menu') { openChatMenu(action as HTMLElement, event); return; }
   if (action?.dataset.action === 'open-hit' && action.dataset.kind && action.dataset.id && action.dataset.message) {
     void openSearchHit(action.dataset.kind, action.dataset.id, action.dataset.message, action.dataset.name || '');
     return;
@@ -3150,6 +3560,16 @@ app.addEventListener('click', (event) => {
 });
 render();
 void refreshOnboarding();
+// Prefer the language persisted on the Rust side (authoritative for the tray).
+if (isTauri()) {
+  void import('@tauri-apps/api/core').then(({ invoke }) => invoke<string>('v1_get_language'))
+    .then((lang) => {
+      if ((lang === 'zh-CN' || lang === 'zh-TW' || lang === 'en') && lang !== getLang()) { setLang(lang); render(); }
+      else if (lang === 'zh-CN' && getLang() !== 'zh-CN') { syncLangToBackend(getLang()); }
+      else { syncLangToBackend(getLang()); }
+    })
+    .catch(() => undefined);
+}
 void initLock().then(() => { if (!lockState.locked) void restoreWorkspace(); });
 void refreshAvatar().then(() => { if (!lockState.locked) render(); });
 void refreshOwnNickname();
@@ -3186,7 +3606,11 @@ document.addEventListener('mouseout', (event) => {
   contactTooltip().hidden = true;
 });
 window.setInterval(() => { void checkIdleLock(); }, 15_000);
-app.addEventListener('conversations-changed', () => { void refreshConversations(); });
+app.addEventListener('conversations-changed', () => {
+  void refreshConversations();
+  // A synced announcement updates silently; refresh the open group's notice.
+  if (groupChat.groupId) void groupChat.loadNotice();
+});
 window.setInterval(() => {
   if (page === 'contacts' || page === 'messages' || direct.peer) void refreshPresence();
 }, 10_000);
@@ -3194,7 +3618,7 @@ window.setInterval(() => {
   if (page === 'discover') void refreshLanPeople();
   void refreshProbeStatus();
   if (page === 'messages') { void refreshConversations(); if (direct.peer) void direct.load(); if (groupChat.groupId) void groupChat.load(); }
-  if (page === 'contacts') { void refreshGroupInvites(); void refreshContacts(); }
+  if (page === 'contacts') { void refreshGroupInvites(); void refreshContacts(); void refreshContactRequests(); void refreshDissolvedGroups(); }
 }, 4000);
 if (isTauri()) {
   document.addEventListener('paste', (event) => { void handleImagePaste(event); });
@@ -3204,6 +3628,17 @@ if (isTauri()) {
     if (direct.peer) await direct.stagePaths([path]);
     else if (groupChat.groupId) await groupChat.stagePaths([path]);
   }).catch(() => undefined);
+  // Incoming-message notices: the backend only forwards, the frontend applies settings.
+  void listen<{ kind: 'direct' | 'group'; id: string; preview: string }>('qbird://notice', (event) => {
+    void handleIncomingNotice(event.payload);
+  }).catch(() => undefined);
+  void listen<{ kind: 'direct' | 'group'; id: string }>('qbird://open-chat', (event) => {
+    void openFromNotice(event.payload);
+  }).catch(() => undefined);
+  void refreshNoticeState();
+  void refreshPrivacyState();
+  void refreshContactRequests();
+  void refreshDissolvedGroups();
   // The close button is intercepted in Rust; this prompt asks what to do.
   void listen('qbird://close-requested', () => {
     showClosePrompt(() => { void refreshWindowSettings().then(() => { if (page === 'settings') render(); }); });
@@ -3217,10 +3652,10 @@ if (isTauri()) {
     else if (groupChat.groupId) void groupChat.stagePaths(paths);
   }).catch(() => undefined);
   invoke<string>('identity_fingerprint').then((value) => {
-    fingerprint = /^[0-9a-f]{64}$/.test(value) ? value : '无法读取';
+    fingerprint = /^[0-9a-f]{64}$/.test(value) ? value : t('无法读取');
     if (page === 'settings') render(); else if (page === 'discover') paintDiscovery();
   }).catch(() => {
-    fingerprint = '无法读取';
+    fingerprint = t('无法读取');
     if (page === 'settings') render(); else if (page === 'discover') paintDiscovery();
   });
 }

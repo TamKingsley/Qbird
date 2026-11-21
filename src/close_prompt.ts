@@ -2,6 +2,7 @@
 // "minimize to tray" or "quit". The choice can be remembered, and the settings
 // page can change the saved behavior later.
 import { invoke } from '@tauri-apps/api/core';
+import { t } from './i18n';
 
 export type CloseChoice = 'tray' | 'quit';
 
@@ -18,14 +19,14 @@ export function showClosePrompt(onDone?: (choice: CloseChoice | null) => void): 
   prompt.className = 'close-dialog-backdrop';
   prompt.innerHTML = `
     <div class="close-dialog" role="dialog" aria-modal="true" aria-labelledby="close-dialog-title">
-      <span class="eyebrow">CLOSE / 关闭窗口</span>
-      <h2 id="close-dialog-title">最小化到托盘，还是退出 Qbird？</h2>
-      <p>最小化到托盘后 Qbird 仍在后台运行，可以继续接收消息；随时点击系统托盘图标重新打开。</p>
-      <label class="close-dialog-remember"><input id="close-dialog-remember" type="checkbox" checked> 记住我的选择，下次不再询问（可在设置中修改）</label>
+      <span class="eyebrow">${t('close.eyebrow')}</span>
+      <h2 id="close-dialog-title">${t('close.title')}</h2>
+      <p>${t('close.body')}</p>
+      <label class="close-dialog-remember"><input id="close-dialog-remember" type="checkbox" checked> ${t('close.remember')}</label>
       <div class="close-dialog-actions">
-        <button type="button" class="outline" data-close="tray">最小化到托盘</button>
-        <button type="button" class="outline danger" data-close="quit">退出 Qbird</button>
-        <button type="button" class="linkish" data-close="cancel">取消</button>
+        <button type="button" class="outline" data-close="tray">${t('close.tray')}</button>
+        <button type="button" class="outline danger" data-close="quit">${t('close.quit')}</button>
+        <button type="button" class="linkish" data-close="cancel">${t('close.cancel')}</button>
       </div>
     </div>`;
   document.body.append(prompt);

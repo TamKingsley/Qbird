@@ -25,6 +25,14 @@ pub struct ContactAnnounce {
     pub nickname: String,
     #[serde(default)]
     pub username: Option<String>,
+    /// `announce` (legacy mutual add), `request`, `accept` or `reject`.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Requester's `ip:port`, used to send the accept or reject back.
+    #[serde(default)]
+    pub address: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -242,6 +250,19 @@ pub(crate) fn read_contact_announce(stream: &mut TcpStream) -> ProbeResult<Conta
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid contact body"))?;
     if announce.nickname.chars().count() > 64 || announce.nickname.chars().any(char::is_control) {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid nickname").into());
+    }
+    if let Some(kind) = announce.kind.as_deref() {
+        if !matches!(kind, "announce" | "request" | "accept" | "reject") {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid contact kind").into());
+        }
+    }
+    if let Some(address) = announce.address.as_deref() {
+        if address.is_empty() || address.len() > 128 || crate::address::parse_manual_address(address).is_err() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid contact address").into());
+        }
+    }
+    if announce.reason.as_deref().is_some_and(|value| value.len() > 32 || value.chars().any(char::is_control)) {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid contact reason").into());
     }
     if let Some(username) = announce.username.as_deref() {
         if username.len() > 20 || !username.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_') {

@@ -926,7 +926,14 @@ body.ws-open .shell{padding-right:var(--ws-width,420px)}
 
 
 
-.conversation-row{position:relative}.unread-badge{position:absolute;top:8px;right:10px;min-width:18px;padding:1px 5px;border-radius:9px;background:var(--accent-soft);color:#fff;font-size:10px;line-height:1.5;text-align:center}
+.conversation-row{position:relative}.unread-badge{position:absolute;top:8px;right:10px;min-width:18px;padding:1px 5px;border-radius:9px;background:var(--accent-soft);font-size:10px;line-height:1.5;text-align:center}
+/* The row's generic span colour must not wash out the count. */
+.conversation-row .unread-badge{color:#fff;font-weight:600;font-size:10px}
+/* A muted row whispers: a dot instead of a number, plus a small crossed bell. */
+.conversation-row .unread-dot{position:absolute;top:12px;right:13px;width:7px;height:7px;border-radius:50%;background:var(--accent-soft);box-shadow:0 0 0 3px rgba(185,114,80,.14)}
+.conversation-row .mute-mark{display:inline-block;margin-right:3px;color:#a4978b;font-size:0}
+.conversation-row .mute-mark svg{width:11px;height:11px;vertical-align:-1.5px}
+.conversation-row.muted strong{color:#7d6a5c}
 
 
 
@@ -1000,6 +1007,8 @@ body.ws-open .shell{padding-right:var(--ws-width,420px)}
 .context-menu{position:fixed;z-index:80;min-width:190px;padding:6px;border:1px solid var(--line);border-radius:10px;background:var(--surface);box-shadow:0 12px 30px rgba(70,50,30,.16)}
 .context-menu button{display:block;width:100%;padding:8px 10px;border:0;border-radius:var(--r-sm);background:transparent;color:#4a3d34;font-size:12px;text-align:left}
 .context-menu button:hover{background:#f2e8dd}
+.context-menu button.danger{color:#b4442f}
+.context-menu button.danger:hover{background:#fbeae4}
 .settings-card select{display:block;width:100%;max-width:320px;padding:8px 10px;margin:4px 0 10px;border:1px solid var(--line-input);border-radius:var(--r-sm);background:var(--surface);color:var(--text);font-size:var(--fs-body);line-height:1.3}
 .recv-dir{display:block;word-break:break-all;font-size:11px;background:var(--surface);border:1px solid #efe4d8;border-radius:6px;padding:6px 8px;margin:2px 0 6px}
 
@@ -1201,13 +1210,19 @@ body.ws-open .shell{padding-right:var(--ws-width,420px)}
 .av-32{width:32px;height:32px;border-radius:10px;font-size:12px}
 .av-44{width:44px;height:44px;font-size:15px}
 .av-group{background:#eadfd2;color:#8a6a52}
-.contacts-page{width:min(760px,100%);max-height:calc(100vh - 40px);overflow:auto;padding:24px 28px 40px;border:1px solid var(--line);border-radius:var(--r-xl);background:var(--surface-warm)}
-.contacts-head{display:flex;align-items:flex-start;justify-content:space-between;gap:18px;flex-wrap:wrap}
+.contacts-page{display:flex;flex-direction:column;width:min(760px,100%);height:calc(100vh - 40px);overflow:hidden;border:1px solid var(--line);border-radius:var(--r-xl);background:var(--surface-warm)}
+/* The head and the switch never scroll, so both tabs keep the control in the same place. */
+.contacts-head{flex:0 0 auto;display:flex;align-items:flex-start;justify-content:space-between;gap:10px 18px;flex-wrap:wrap;padding:24px 28px 14px;box-shadow:inset 0 -1px 0 transparent;transition:box-shadow .18s ease}
+.contacts-head.stuck{box-shadow:inset 0 -1px 0 var(--line)}
+.contacts-head>div{min-width:0}
 .contacts-head h2{margin:4px 0 6px;font-size:var(--fs-title)}
 .contacts-head p{margin:0;font-size:12.5px;color:var(--text-3);line-height:1.7;max-width:460px}
-.segmented{display:flex;padding:3px;border-radius:999px;background:var(--surface-sunken);border:1px solid var(--line)}
-.segmented button{border:0;border-radius:999px;padding:7px 16px;background:transparent;color:var(--text-2);font-size:12.5px;font-weight:600}
-.segmented button.active{background:var(--surface);color:var(--accent);box-shadow:0 1px 4px rgba(70,50,35,.12)}
+.contacts-body{flex:1 1 auto;min-height:0;overflow:auto;padding:0 28px 32px}
+.segmented{display:inline-flex;align-items:stretch;flex:0 0 auto;height:36px;padding:3px;border-radius:999px;background:var(--surface-sunken);border:1px solid var(--line);box-sizing:border-box}
+.segmented button{display:inline-flex;align-items:center;justify-content:center;height:100%;min-width:0;border:0;border-radius:999px;padding:0 16px;background:transparent;color:var(--text-2);font-family:inherit;font-size:12.5px;font-weight:600;line-height:1;white-space:nowrap;cursor:pointer;transition:background .16s ease,color .16s ease,box-shadow .16s ease}
+.segmented button:hover{color:var(--text)}
+.segmented button.active{background:var(--surface);color:var(--accent);box-shadow:0 1px 3px rgba(70,50,35,.14)}
+.segmented button:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
 .contacts-toolbar{display:flex;gap:10px;margin:18px 0 6px}
 .contacts-toolbar input{flex:1;padding:9px 12px;border:1px solid var(--line-input);border-radius:var(--r-sm);background:var(--surface)}
 .contacts-toolbar .outline{margin:0}
@@ -1264,3 +1279,50 @@ body.ws-open .shell{padding-right:var(--ws-width,420px)}
 .presence-dot.online{background:#7fa06a;box-shadow:0 0 0 2px rgba(127,160,106,.18)}
 .presence-text{margin-left:4px;font-size:11px;color:var(--text-3)}
 .contact-card-title .presence-dot{margin-left:8px}
+
+/* Withdrawn messages keep their place but never show content again. */
+.message-bubble.recalled { color: #8b7b6a; font-style: italic; background: transparent; border: 1px dashed #d8cbbd; }
+.request-row { align-items: center; }
+.request-actions { margin-left: auto; display: flex; gap: 6px; }
+.request-actions .outline { padding: 2px 8px; }
+
+/* ── Chat "⋯" header button ─────────────────────────────────────────────── */
+.chat-more { width: 30px; height: 30px; padding: 0; border: none; border-radius: 50%; background: #f3ede4; color: #8b7d6b; font-size: 16px; line-height: 1; display: inline-flex; align-items: center; justify-content: center; cursor: pointer; }
+.chat-more:hover { background: #e9dfd0; color: #5c5142; }
+
+/* ── Standalone chat-records window ─────────────────────────────────────── */
+.records-window { display: flex; flex-direction: column; height: 100vh; background: #f7f2ec; color: #3d342a; }
+.records-titlebar { display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; border-bottom: 1px solid #e4d9cc; user-select: none; }
+.records-titlebar strong { font-size: 14px; }
+.records-close { border: none; background: transparent; font-size: 14px; cursor: pointer; color: #8b7b6a; padding: 4px 8px; border-radius: 6px; }
+.records-close:hover { background: #ece2d5; color: #3d342a; }
+.records-toolbar { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-bottom: 1px solid #e4d9cc; }
+.records-toolbar input[type="search"] { flex: 1; padding: 6px 10px; border: 1px solid #d8cbbd; border-radius: 8px; background: #fffdf9; color: inherit; }
+.records-tab { padding: 5px 12px; border: none; border-radius: 8px; background: transparent; color: #8b7d6b; font-size: 13px; cursor: pointer; white-space: nowrap; }
+.records-tab:hover { background: #efe7db; }
+.records-tab.active { background: #e9dcc9; color: #3d342a; font-weight: 600; }
+.records-select-all { display: flex; align-items: center; gap: 4px; font-size: 13px; white-space: nowrap; cursor: pointer; }
+.records-toolbar .danger { color: #b3402a; }
+.records-toolbar .outline { padding: 6px 12px; white-space: nowrap; }
+.records-list { flex: 1; overflow-y: auto; padding: 8px 14px; }
+.records-empty { text-align: center; color: #8b7b6a; padding: 32px 0; }
+.records-row { display: grid; grid-template-columns: auto auto 1fr; align-items: baseline; gap: 10px; padding: 8px 10px; border-radius: 8px; cursor: pointer; }
+.records-row:hover { background: #efe7db; }
+.records-row.selected { background: #e9dcc9; }
+.records-meta { display: flex; gap: 8px; align-items: baseline; min-width: 170px; }
+.records-meta b { font-size: 13px; }
+.records-meta time { font-size: 12px; color: #8b7b6a; }
+.records-body { font-size: 13px; word-break: break-word; white-space: pre-wrap; }
+.records-foot { padding: 8px 14px; border-top: 1px solid #e4d9cc; font-size: 12px; color: #8b7b6a; }
+
+/* ── Group announcement banner & editor ─────────────────────────────────── */
+.group-notice-bar { display: flex; align-items: center; gap: 8px; margin: 8px 16px 0; padding: 6px 10px; background: #f3ead9; border: 1px solid #e4d5b8; border-radius: 8px; font-size: 13px; }
+.group-notice-bar .notice-tag { flex: none; font-weight: 600; color: #8a6d3b; }
+.group-notice-bar .notice-text { flex: 1; color: #5c5142; word-break: break-word; white-space: pre-wrap; max-height: 3.6em; overflow-y: auto; }
+.group-notice-bar .outline { flex: none; padding: 2px 10px; }
+.group-notice-editor { margin: 8px 16px; padding: 12px; background: #fffdf9; border: 1px solid #e4d9cc; border-radius: 10px; display: flex; flex-direction: column; gap: 8px; }
+.group-notice-editor label { font-size: 13px; font-weight: 600; color: #5c5142; }
+.group-notice-editor textarea { resize: vertical; min-height: 80px; padding: 8px 10px; border: 1px solid #d8cbbd; border-radius: 8px; background: #fff; color: inherit; font: inherit; }
+.notice-actions { display: flex; gap: 8px; }
+.notice-actions .outline { padding: 4px 12px; }
+.notice-actions .danger { color: #b3402a; }

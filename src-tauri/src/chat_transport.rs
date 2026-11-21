@@ -120,6 +120,9 @@ pub fn accept_one(identity: &Identity, store: &Mutex<Store>, socket: TcpStream) 
                 if !matches!(result, crate::storage::IncomingResult::Inserted | crate::storage::IncomingResult::Duplicate) {
                     return Err(invalid("message rejected").into());
                 }
+                if result == IncomingResult::Inserted {
+                    crate::notice::incoming("direct", &peer, crate::notice::preview(&body));
+                }
                 let ack = Payload::Ack { id };
                 gate.outbound(&ack)?;
                 protocol::write_frame(&mut stream, &ack)?;
@@ -135,6 +138,9 @@ pub fn accept_one(identity: &Identity, store: &Mutex<Store>, socket: TcpStream) 
                 // NotMember is acknowledged so a removed member stops being retried.
                 if !matches!(result, IncomingResult::Inserted | IncomingResult::Duplicate | IncomingResult::NotMember) {
                     return Err(invalid("group message rejected").into());
+                }
+                if result == IncomingResult::Inserted {
+                    crate::notice::incoming("group", &group_id, crate::notice::preview(&body));
                 }
                 acknowledge(&mut stream, &mut gate, &id)?;
             }
@@ -183,6 +189,32 @@ pub fn accept_one(identity: &Identity, store: &Mutex<Store>, socket: TcpStream) 
                     .receive_group_control(&self_id, &peer, "dissolve", &group_id, "{}", unix_now())?;
                 if !matches!(result, IncomingResult::Inserted | IncomingResult::Duplicate | IncomingResult::NotMember) {
                     return Err(invalid("group dissolve rejected").into());
+                }
+                acknowledge(&mut stream, &mut gate, &id)?;
+            }
+            Payload::GroupNotice { id, group_id, notice } => {
+                let payload = serde_json::json!({ "notice": notice }).to_string();
+                let result = store.lock().map_err(|_| invalid("store unavailable"))?
+                    .receive_group_control(&self_id, &peer, "notice", &group_id, &payload, unix_now())?;
+                if !matches!(result, IncomingResult::Inserted | IncomingResult::Duplicate | IncomingResult::NotMember) {
+                    return Err(invalid("group notice rejected").into());
+                }
+                acknowledge(&mut stream, &mut gate, &id)?;
+            }
+            Payload::RecallDirect { id, message_id } => {
+                let result = store.lock().map_err(|_| invalid("store unavailable"))?
+                    .receive_recall_direct(&self_id, &peer, &message_id, unix_now())?;
+                if result == IncomingResult::Unverified {
+                    return Err(invalid("recall rejected").into());
+                }
+                acknowledge(&mut stream, &mut gate, &id)?;
+            }
+            Payload::RecallGroup { id, group_id, message_id } => {
+                let payload = serde_json::json!({ "message_id": message_id }).to_string();
+                let result = store.lock().map_err(|_| invalid("store unavailable"))?
+                    .receive_group_control(&self_id, &peer, "recall", &group_id, &payload, unix_now())?;
+                if !matches!(result, IncomingResult::Inserted | IncomingResult::Duplicate | IncomingResult::NotMember) {
+                    return Err(invalid("group recall rejected").into());
                 }
                 acknowledge(&mut stream, &mut gate, &id)?;
             }
@@ -632,6 +664,18 @@ pub fn send_control_one(identity: &Identity, store: &Mutex<Store>, target: &str,
             Payload::GroupTransfer { id: task.id.clone(), group_id: task.group_id.clone(), name, owner, members }
         }
         "dissolve" => Payload::GroupDissolve { id: task.id.clone(), group_id: task.group_id.clone() },
+        "notice" => {
+            let value: serde_json::Value = serde_json::from_str(&task.payload)?;
+            let notice = value.get("notice").and_then(|v| v.as_str())
+                .ok_or_else(|| invalid("invalid control payload"))?.to_owned();
+            Payload::GroupNotice { id: task.id.clone(), group_id: task.group_id.clone(), notice }
+        }
+        "recall" => {
+            let value: serde_json::Value = serde_json::from_str(&task.payload)?;
+            let message_id = value.get("message_id").and_then(|v| v.as_str())
+                .ok_or_else(|| invalid("invalid control payload"))?.to_owned();
+            Payload::RecallGroup { id: task.id.clone(), group_id: task.group_id.clone(), message_id }
+        }
         "remove" => Payload::GroupRemove { id: task.id.clone(), group_id: task.group_id.clone() },
         "join" => {
             let value: serde_json::Value = serde_json::from_str(&task.payload)?;
@@ -665,6 +709,23 @@ pub fn send_control_one(identity: &Identity, store: &Mutex<Store>, target: &str,
     if reply != (Payload::Ack { id: task.id.clone() }) { return Err(invalid("invalid control acknowledgement").into()); }
     if !store.lock().map_err(|_| invalid("store unavailable"))?.ack_control(&task.id)? {
         return Err(invalid("control state changed").into());
+    }
+    Ok(())
+}
+
+/// Sends one queued direct recall notice and marks it delivered on success.
+pub fn send_recall_one(identity: &Identity, store: &Mutex<Store>, peer: &str, address: SocketAddr,
+    recall_id: &str, message_id: &str) -> ChatResult<()> {
+    if address.port() == 0 || !crate::address::is_unicast(address.ip()) { return Err(invalid("invalid address").into()); }
+    let payload = Payload::RecallDirect { id: recall_id.to_owned(), message_id: message_id.to_owned() };
+    let (mut stream, mut gate) = connect(identity, peer, address)?;
+    gate.outbound(&payload)?;
+    protocol::write_frame(&mut stream, &payload)?;
+    let reply = protocol::read_frame(&mut stream)?;
+    gate.inbound(&reply)?;
+    if reply != (Payload::Ack { id: recall_id.to_owned() }) { return Err(invalid("invalid recall acknowledgement").into()); }
+    if !store.lock().map_err(|_| invalid("store unavailable"))?.ack_recall(recall_id)? {
+        return Err(invalid("recall state changed").into());
     }
     Ok(())
 }

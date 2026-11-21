@@ -1,6 +1,6 @@
 /// One small right-click menu shared by chats. Only the actions passed in can run;
 /// attachment paths are always resolved again on the backend from the message id.
-export type ContextItem = { label: string; run: () => void };
+export type ContextItem = { label: string; run: () => void; danger?: boolean };
 
 let menu: HTMLElement | null = null;
 
@@ -19,6 +19,7 @@ export function showContextMenu(event: MouseEvent, items: ContextItem[]): void {
     const button = document.createElement('button');
     button.type = 'button';
     button.setAttribute('role', 'menuitem');
+    if (item.danger) button.className = 'danger';
     button.textContent = item.label;
     button.addEventListener('click', (clickEvent) => {
       clickEvent.stopPropagation();

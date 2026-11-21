@@ -1,0 +1,21 @@
+:root { color-scheme: light; }
+html, body { margin: 0; height: 100%; background: transparent; overflow: hidden; }
+.notice-body { font-family: "Microsoft YaHei UI", "Segoe UI", system-ui, sans-serif; }
+.notice-card {
+  display: flex; align-items: center; gap: 10px; width: calc(100% - 2px); height: calc(100% - 2px);
+  margin: 1px; padding: 12px 14px; box-sizing: border-box; border: 1px solid #e6ddd2; border-radius: 12px;
+  background: #fffaf4; box-shadow: 0 8px 24px rgba(80, 60, 40, 0.18); cursor: pointer; text-align: left;
+  font: inherit; color: #3f3327;
+}
+.notice-card:hover { background: #fff4e6; }
+.notice-avatar {
+  flex: none; width: 40px; height: 40px; border-radius: 50%; display: flex; align-items: center;
+  justify-content: center; background: #b1705a; color: #fff; font-size: 18px; font-weight: 600;
+}
+.notice-body-text { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.notice-body-text strong { font-size: 14px; }
+.notice-body-text span { font-size: 12px; color: #6b5c4c; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.notice-count {
+  margin-left: auto; flex: none; min-width: 20px; height: 20px; padding: 0 6px; border-radius: 10px;
+  background: #b1705a; color: #fff; font-size: 12px; display: flex; align-items: center; justify-content: center;
+}

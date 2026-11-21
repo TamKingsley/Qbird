@@ -1,6 +1,7 @@
 node_modules/
 dist/
 src-tauri/target/
+src-tauri/target2/
 src-tauri/gen/schemas/
 *.log
 .env
@@ -33,6 +34,7 @@ releases/
 *.rpm
 *.AppImage
 scripts/tmp_patch_*.py
+_s2t.py
 scripts/build-nsis.bat
 scripts/probe-cl.bat
 .lingxi/

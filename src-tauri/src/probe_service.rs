@@ -231,6 +231,9 @@ pub struct ProbeService {
     address_worker: Option<JoinHandle<()>>,
     // Keep discovery alive until the service is dropped.
     discovery: Discovery,
+    /// Advertised identity, kept so visibility can be toggled without rebinding.
+    instance: String,
+    properties: Vec<(String, String)>,
 }
 
 impl ProbeService {
@@ -255,6 +258,7 @@ impl ProbeService {
         let digest = Sha256::digest(random_key.subject_public_key_info());
         let instance: String = digest[..12].iter().map(|b| format!("{b:02x}")).collect();
         let mut discovery = Discovery::browse()?;
+        let properties = announce.properties().into_iter().map(|(key, value)| (key.to_owned(), value.to_owned())).collect::<Vec<_>>();
         discovery.advertise_bound(&listener, &instance, &announce.properties())?;
         let stopping = Arc::new(AtomicBool::new(false));
         let running = Arc::new(AtomicBool::new(true));
@@ -306,25 +310,44 @@ impl ProbeService {
                                     if let Ok((fingerprint, kind)) = probe::accept_classified(&identity, &mut socket) {
                                         match kind {
                                             probe::ProbeKind::Contact => {
-                                                // A peer added us. Automatic acceptance is a local
-                                                // preference; the fingerprint still comes from TLS.
+                                                // A peer asks to become a contact. The fingerprint always
+                                                // comes from TLS; the body only carries display hints and
+                                                // the requester's return address.
                                                 if let Some(store) = &store {
                                                     let accepted = match probe::read_contact_announce(&mut socket) {
                                                         Ok(announce) => {
-                                                            let result = store.lock().ok().and_then(|store| {
-                                                                let enabled = store.auto_accept_contacts().unwrap_or(true);
-                                                                if !enabled { return Some(false); }
-                                                                if store.add_candidate_with_username(&fingerprint, &announce.nickname, announce.username.as_deref()).is_err() {
-                                                                    return Some(false);
+                                                            let now = std::time::SystemTime::now()
+                                                                .duration_since(std::time::UNIX_EPOCH)
+                                                                .map(|value| value.as_secs() as i64).unwrap_or(0);
+                                                            store.lock().ok().map(|store| {
+                                                                match announce.kind.as_deref().unwrap_or("announce") {
+                                                                    "accept" => {
+                                                                        let _ = store.confirm_candidate(&fingerprint);
+                                                                        let _ = store.resolve_contact_request_by_peer(&fingerprint, "out", true, now);
+                                                                        true
+                                                                    }
+                                                                    "reject" => {
+                                                                        let _ = store.resolve_contact_request_by_peer(&fingerprint, "out", false, now);
+                                                                        true
+                                                                    }
+                                                                    _ => {
+                                                                        if !store.lan_visible().unwrap_or(true) { return false; }
+                                                                        let nickname = if announce.nickname.trim().is_empty() { fingerprint[..8].to_string() } else { announce.nickname.clone() };
+                                                                        let _ = store.create_contact_request("in", &fingerprint, &nickname,
+                                                                            announce.username.as_deref(), announce.address.as_deref(), now);
+                                                                        if store.contact_request_mode().unwrap_or_else(|_| "ask".into()) == "auto" {
+                                                                            let _ = store.add_candidate_with_username(&fingerprint, &nickname, announce.username.as_deref());
+                                                                            store.confirm_candidate(&fingerprint).unwrap_or(false)
+                                                                        } else {
+                                                                            false
+                                                                        }
+                                                                    }
                                                                 }
-                                                                Some(store.confirm_candidate(&fingerprint).unwrap_or(false))
-                                                            }).unwrap_or(false);
-                                                            let _ = probe::write_contact_ack(&mut socket, result);
-                                                            result
+                                                            }).unwrap_or(false)
                                                         }
                                                         Err(_) => false,
                                                     };
-                                                    let _ = accepted;
+                                                    let _ = probe::write_contact_ack(&mut socket, accepted);
                                                 }
                                             }
                                             probe::ProbeKind::Automatic => {}
@@ -356,11 +379,23 @@ impl ProbeService {
             thread_stopping.store(true, Ordering::Release);
             thread_running.store(false, Ordering::Release);
         });
-        let mut service = Self { port: actual_port, stopping, running, requests, connections, worker: Some(worker), address_worker: None, discovery };
+        let mut service = Self { port: actual_port, stopping, running, requests, connections, worker: Some(worker), address_worker: None, discovery, instance, properties };
         if let Some(store) = address_store {
             service.address_worker = Some(crate::auto_address::start(address_identity, store, service.discovery.candidate_view(), Arc::clone(&service.stopping))?);
         }
         Ok(service)
+    }
+
+    /// Hides from LAN discovery without stopping the listener, so confirmed
+    /// contacts keep working while new peers cannot find this device.
+    pub fn set_visible(&mut self, visible: bool) {
+        if visible {
+            if self.discovery.is_advertised() { return; }
+            let props: Vec<(&str, &str)> = self.properties.iter().map(|(key, value)| (key.as_str(), value.as_str())).collect();
+            let _ = self.discovery.advertise_port(self.port, &self.instance, &props);
+        } else {
+            self.discovery.unadvertise();
+        }
     }
 
     pub fn port(&self) -> u16 { self.port }
