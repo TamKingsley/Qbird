@@ -15,7 +15,7 @@ if (!root) throw new Error('capture root missing');
 
 const image = document.createElement('img');
 image.className = 'shot';
-image.alt = '屏幕截图';
+image.alt = 'Screen capture';
 root.append(image);
 
 const selection = document.createElement('div');
@@ -27,14 +27,14 @@ root.append(selection);
 
 const toolbar = document.createElement('div');
 toolbar.className = 'toolbar';
-toolbar.innerHTML = '<span class="hint">拖动框选 · 拖动边缘调整 · Enter 确认 · Esc 取消</span>' +
-  '<button type="button" data-act="cancel">取消</button>' +
-  '<button type="button" class="primary" data-act="confirm">确认并放入输入框</button>';
+toolbar.innerHTML = '<span class="hint">Drag to select · Drag edges to resize · Enter to confirm · Esc to cancel</span>' +
+  '<button type="button" data-act="cancel">Cancel</button>' +
+  '<button type="button" class="primary" data-act="confirm">Confirm and add to composer</button>';
 root.append(toolbar);
 
 const loading = document.createElement('div');
 loading.className = 'loading';
-loading.textContent = '正在准备截图…';
+loading.textContent = 'Preparing screenshot…';
 root.append(loading);
 
 const sizeLabel = selection.querySelector<HTMLElement>('.size');
@@ -135,11 +135,11 @@ async function finish(confirm: boolean): Promise<void> {
     canvas.width = Math.max(1, Math.round(rect.w * scaleX));
     canvas.height = Math.max(1, Math.round(rect.h * scaleY));
     const context = canvas.getContext('2d');
-    if (!context) throw new Error('无法裁剪截图');
+    if (!context) throw new Error('Could not crop the screenshot');
     context.drawImage(image, rect.x * scaleX, rect.y * scaleY, rect.w * scaleX, rect.h * scaleY,
       0, 0, canvas.width, canvas.height);
     const blob = await new Promise<Blob | null>((done) => canvas.toBlob(done, 'image/png'));
-    if (!blob) throw new Error('无法裁剪截图');
+    if (!blob) throw new Error('Could not crop the screenshot');
     const bytes = Array.from(new Uint8Array(await blob.arrayBuffer()));
     const path = await invoke<string>('v1_save_temp_image', { bytes, extension: 'png' });
     await invoke('v1_end_capture', { path });
@@ -168,7 +168,7 @@ async function start(): Promise<void> {
   try {
     shot = await invoke<Capture>('v1_capture_current');
   } catch {
-    loading.textContent = '截图已失效，请重新点击截图按钮';
+    loading.textContent = 'Screenshot expired. Click the capture button again.';
     window.setTimeout(() => { void invoke('v1_end_capture', { path: null }).catch(() => undefined); }, 1200);
     return;
   }

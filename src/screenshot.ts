@@ -16,7 +16,7 @@ function selectRegion(capture: Capture): Promise<Uint8Array | null> {
   return new Promise((resolve) => {
     const overlay = document.createElement('div');
     overlay.className = 'capture-overlay';
-    overlay.innerHTML = '<img class="capture-shot" alt="屏幕截图"><div class="capture-box" hidden></div><p class="capture-hint">拖动选择区域 · Esc 取消</p>';
+    overlay.innerHTML = '<img class="capture-shot" alt="Screen capture"><div class="capture-box" hidden></div><p class="capture-hint">Drag to select an area · Esc to cancel</p>';
     document.body.append(overlay);
     const image = overlay.querySelector<HTMLImageElement>('.capture-shot');
     const box = overlay.querySelector<HTMLElement>('.capture-box');

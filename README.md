@@ -6,11 +6,11 @@ English · [简体中文](README_CN.md)
 
 Qbird is a Windows desktop app for discovering nearby Qbird users and communicating directly between devices. It has no hosted relay or account service; chat history and identity data are stored locally.
 
-> **0.1.13 · Windows x64 preview.** Qbird has not received an independent security audit. The local SQLite database is not encrypted, and App Lock only hides the interface. Do not use this preview for sensitive information or production communication. LAN discovery advertises the nickname and username configured in the app.
+> **0.1.14 · Windows x64 preview.** Qbird has not received an independent security audit. The local SQLite database is not encrypted, and App Lock only hides the interface. Do not use this preview for sensitive information or production communication. LAN discovery advertises the nickname and username configured in the app.
 
 ## Preview
 
-![Qbird 0.1.13 message screen](docs/assets/qbird-demo.png)
+![Qbird 0.1.14 message screen](docs/assets/qbird-demo.png)
 
 *The screenshot shows the current build with an isolated local profile and no personal data.*
 
@@ -44,3 +44,7 @@ Focused pull requests and issue reports are welcome. Please discuss identity, cr
 ## License
 
 [Apache License 2.0](LICENSE). Third-party dependencies retain their respective licenses.
+
+## Development assistance
+
+Development assistance: MuseWork and Lingxi.
