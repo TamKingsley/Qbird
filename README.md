@@ -1,5 +1,7 @@
 # Qbird
 
+[![Version](https://img.shields.io/badge/version-0.1.14-orange)](https://github.com/TamKingsley/Qbird/releases)
+
 **A local-first messenger for direct communication over a local network.**
 
 English · [简体中文](README_CN.md)

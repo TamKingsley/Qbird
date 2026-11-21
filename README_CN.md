@@ -1,5 +1,7 @@
 # Qbird
 
+[![版本](https://img.shields.io/badge/version-0.1.14-orange)](https://github.com/TamKingsley/Qbird/releases)
+
 **面向局域网设备直连的本地优先聊天工具。**
 
 [English](README.md) · 简体中文
