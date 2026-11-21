@@ -665,6 +665,21 @@ pub async fn v1_space_diagnostics(app: tauri::AppHandle) -> Result<crate::diagno
     }).await.map_err(|_| "空间检测任务异常".to_owned())?
 }
 
+/// Recent application log text for the debug panel (at most 256 KiB).
+#[tauri::command]
+pub fn v1_read_logs() -> Result<String, String> {
+    crate::logging::read_recent(256 * 1024).map_err(|error| format!("无法读取日志: {error}"))
+}
+
+/// Opens the folder that holds qbird.log in the system file manager.
+#[tauri::command]
+pub fn v1_open_logs_dir() -> Result<(), String> {
+    let path = crate::logging::log_path()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .ok_or_else(|| "日志目录不可用".to_owned())?;
+    open_url(&path.to_string_lossy())
+}
+
 struct ProbeGuard(Arc<AtomicBool>);
 impl Drop for ProbeGuard { fn drop(&mut self) { self.0.store(false, Ordering::Release); } }
 

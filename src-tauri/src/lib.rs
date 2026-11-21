@@ -17,6 +17,7 @@ pub mod discovery;
 pub mod files;
 pub mod identity;
 pub mod lock;
+pub mod logging;
 pub mod probe;
 pub mod probe_service;
 pub mod protocol;
@@ -153,6 +154,7 @@ fn migrate_legacy_data(legacy: &Path, target: &Path) {
         }
         Ok(())
     };
+    crate::log_info!("从旧位置迁移数据: {} -> {}", legacy.display(), target.display());
     let result = std::fs::copy(&legacy_identity, target.join("identity.bin"))
         .and_then(|_| std::fs::copy(&legacy_db, &migrated))
         .and_then(|_| copy_stickers());
@@ -179,8 +181,17 @@ pub fn run() {
                 .filter(|value| !value.is_empty()).map(std::path::PathBuf::from).unwrap_or(resolved);
             #[cfg(not(debug_assertions))]
             let dir = resolved;
-            let state = app_state::AppState::initialize(&dir).map_err(|error| std::io::Error::other(error.to_string()))?;
+            logging::init(&dir.join("logs"));
+            crate::log_info!("数据目录: {}", dir.display());
+            let state = match app_state::AppState::initialize(&dir) {
+                Ok(state) => state,
+                Err(error) => {
+                    crate::log_error!("AppState 初始化失败: {error}");
+                    return Err(Box::new(std::io::Error::other(error.to_string())));
+                }
+            };
             app.manage(state);
+            crate::log_info!("启动监听与守护线程已安排");
             app_state::start_listener_on_launch(app.handle().clone());
             app_state::watch_listener(app.handle().clone());
             setup_tray(app.handle())?;
@@ -309,6 +320,8 @@ pub fn run() {
             app_state::v1_network_diagnostics,
             app_state::v1_network_repair,
             app_state::v1_space_diagnostics,
+            app_state::v1_read_logs,
+            app_state::v1_open_logs_dir,
             app_state::v1_create_group,
             app_state::v1_list_groups,
             app_state::v1_list_left_groups,

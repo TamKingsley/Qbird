@@ -1207,6 +1207,9 @@ function spaceReportHtml(): string {
     ${report.notes.length ? `<ul class="diag-notes">${report.notes.map((note) => `<li>${escapeText(note)}</li>`).join('')}</ul>` : `<p class="diag-ok">${t('空间状态正常。')}</p>`}`;
 }
 
+let logText = '';
+let logVisible = false;
+
 function debugSettingsHtml(): string {
   return `<p>${t('用于排查“看不到同事、收不到消息或文件”的本机自检。检测只读取本机状态，不上传任何内容。')}</p>
     <div class="probe-box"><h3>${t('网络检测与修复')}</h3>
@@ -1219,6 +1222,14 @@ function debugSettingsHtml(): string {
       <p id="debug-network-notice" role="status">${escapeText(diagnosticsNotice)}</p>
       <div id="debug-network-report">${networkReportHtml()}</div>
       <small>${t('“重启聊天服务”会短暂断开监听后按原端口恢复，原端口不可用时改用默认端口；“重建局域网发现”只刷新广播浏览。两者都不会改动身份、联系人和聊天记录。')}</small>
+    </div>
+    <div class="probe-box"><h3>${t('日志')}</h3>
+      <div class="probe-row">
+        <button class="outline" data-action="debug-log-view">${t('查看最新日志')}</button>
+        <button class="outline" data-action="debug-log-dir">${t('打开日志目录')}</button>
+      </div>
+      <pre id="debug-log-view" class="debug-log" hidden></pre>
+      <small>${t('日志保存在本机数据目录的 logs 文件夹，仅用于排查问题；提交问题反馈时可附上日志，但请注意其中可能包含本机路径等信息。')}</small>
     </div>
     <div class="probe-box"><h3>${t('空间检测')}</h3>
       <div class="probe-row"><button class="outline" data-action="debug-space" ${diagnosticsLoading ? 'disabled' : ''}>${t('重新检测空间')}</button></div>
@@ -1234,6 +1245,7 @@ async function loadDebugData(): Promise<void> {
   ]);
   networkReport = network;
   spaceReport = space;
+  try { logText = await invoke<string>('v1_read_logs'); } catch { logText = ''; }
 }
 
 async function refreshDebugReports(notice?: string): Promise<void> {
@@ -1259,6 +1271,8 @@ function paintDebugReports(): void {
   if (space) space.innerHTML = spaceReportHtml();
   const notice = app.querySelector<HTMLElement>('#debug-network-notice');
   if (notice) notice.textContent = diagnosticsNotice;
+  const logBox = app.querySelector<HTMLElement>('#debug-log-view');
+  if (logBox) { logBox.hidden = !logVisible; logBox.textContent = logText || t('暂无日志。'); }
 }
 
 async function runNetworkRepair(mode: 'restart' | 'rediscover' | 'all'): Promise<void> {
@@ -3342,6 +3356,13 @@ app.addEventListener('click', (event) => {
   if (action?.dataset.action === 'direct-reveal' && action.dataset.id) { void direct.reveal(action.dataset.id); return; }
   if (action?.dataset.action === 'save-storage-quota') { void saveQuota(); return; }
   if (action?.dataset.action === 'debug-scan' || action?.dataset.action === 'debug-space') { void refreshDebugReports(); return; }
+  if (action?.dataset.action === 'debug-log-view') {
+    logVisible = !logVisible;
+    if (logVisible) { void invoke<string>('v1_read_logs').then((text) => { logText = text; paintDebugReports(); }).catch(() => paintDebugReports()); }
+    else paintDebugReports();
+    return;
+  }
+  if (action?.dataset.action === 'debug-log-dir') { void invoke('v1_open_logs_dir').catch((error) => workspace.notify(displayError(error))); return; }
   if (action?.dataset.action === 'debug-repair' && action.dataset.mode) {
     const mode = action.dataset.mode;
     if (mode === 'restart' || mode === 'rediscover' || mode === 'all') void runNetworkRepair(mode);
