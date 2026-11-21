@@ -330,6 +330,8 @@ pub fn run() {
             app_state::v1_space_diagnostics,
             app_state::v1_read_logs,
             app_state::v1_chat_display_settings,
+            app_state::v1_list_export_targets,
+            app_state::v1_export_chat_archives,
             app_state::v1_set_chat_display,
             app_state::v1_migration_notice,
             app_state::v1_open_logs_dir,

@@ -695,6 +695,64 @@ pub fn v1_set_chat_display(state: tauri::State<'_, AppState>, show_seconds: bool
     Ok(ChatDisplaySettings { show_seconds })
 }
 
+/// Exportable conversations for the archive wizard: self, verified direct
+/// contacts and active groups.
+#[derive(Clone, Debug, serde::Serialize, PartialEq, Eq)]
+pub struct ExportTarget { pub kind: String, pub target: String, pub name: String }
+
+#[tauri::command]
+pub fn v1_list_export_targets(state: tauri::State<'_, AppState>) -> Result<Vec<ExportTarget>, String> {
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    let self_id = state.identity.fingerprint();
+    let rows = store.list_export_targets(&self_id).map_err(|_| "无法读取可导出的会话".to_owned())?;
+    Ok(rows.into_iter().map(|(kind, target, name)| ExportTarget { kind, target, name }).collect())
+}
+
+/// Exports each selected conversation to its own .qchat file inside `dir`.
+#[derive(Clone, Debug, serde::Deserialize, PartialEq, Eq)]
+pub struct ExportSelection { pub kind: String, pub target: String }
+
+#[derive(Clone, Debug, serde::Serialize, PartialEq, Eq)]
+pub struct ExportBatchReport { pub exported: u32, pub skipped: Vec<String>, pub dir: String }
+
+#[tauri::command]
+pub async fn v1_export_chat_archives(state: tauri::State<'_, AppState>, selections: Vec<ExportSelection>,
+    password: String, dir: String, since: Option<i64>, until: Option<i64>) -> Result<ExportBatchReport, String> {
+    let store = Arc::clone(&state.store);
+    let self_id = state.identity.fingerprint();
+    tauri::async_runtime::spawn_blocking(move || {
+        if dir.len() > 4096 || dir.contains('\0') { return Err("导出目录无效".to_owned()); }
+        let guard = store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+        let root = std::path::Path::new(&dir);
+        if !root.is_dir() { return Err("导出目录不存在".to_owned()); }
+        // YYYY-MM-DD from the shared logger timestamp (no extra dependency).
+        let today = crate::logging::timestamp();
+        let stamp = format!("qbird-chat-{}", today.get(..10).unwrap_or_default().replace('-', ""));
+        let mut exported = 0u32; let mut skipped = Vec::new();
+        for selection in &selections {
+            let name = guard.archive_export(&selection.kind, &selection.target, &self_id, since.unwrap_or(0), until.unwrap_or(0))
+                .map(|export| export.name).unwrap_or_else(|_| selection.target.clone());
+            let safe = sanitize_file_name(&name);
+            let path = root.join(format!("{stamp}-{safe}.qchat"));
+            match crate::chatfile::export(&selection.kind, &selection.target, &password, &guard, &self_id, &path, since.unwrap_or(0), until.unwrap_or(0)) {
+                Ok(_) => exported += 1,
+                Err(error) => skipped.push(format!("{name}: {error}")),
+            }
+        }
+        Ok(ExportBatchReport { exported, skipped, dir: dir.clone() })
+    }).await.map_err(|_| "聊天记录导出任务异常".to_owned())?
+}
+
+fn sanitize_file_name(name: &str) -> String {
+    let cleaned: String = name.chars().map(|c| match c {
+        '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+        c if (c as u32) < 32 => '_',
+        c => c,
+    }).take(80).collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() { "未命名".to_owned() } else { trimmed.to_owned() }
+}
+
 /// Recent application log text for the debug panel (at most 256 KiB).
 #[tauri::command]
 pub fn v1_read_logs() -> Result<String, String> {
@@ -1779,14 +1837,14 @@ pub fn v1_avatar(state: tauri::State<'_, AppState>) -> Result<Option<Vec<u8>>, S
 /// Replaces the avatar with a cropped square PNG produced by the front end.
 /// Encrypted per-conversation archive; attachments are not included.
 #[tauri::command]
-pub async fn v1_export_chat_archive(state: tauri::State<'_, AppState>, kind: String, target: String, password: String, path: String)
+pub async fn v1_export_chat_archive(state: tauri::State<'_, AppState>, kind: String, target: String, password: String, path: String, since: Option<i64>, until: Option<i64>)
     -> Result<crate::chatfile::ChatArchiveInfo, String> {
     let store = Arc::clone(&state.store);
     let self_id = state.identity.fingerprint();
     tauri::async_runtime::spawn_blocking(move || {
         if path.len() > 4096 { return Err("导出路径无效".to_owned()); }
         let guard = store.lock().map_err(|_| "本地存储不可用".to_owned())?;
-        crate::chatfile::export(&kind, &target, &password, &guard, &self_id, std::path::Path::new(&path))
+        crate::chatfile::export(&kind, &target, &password, &guard, &self_id, std::path::Path::new(&path), since.unwrap_or(0), until.unwrap_or(0))
     }).await.map_err(|_| "聊天记录导出任务异常".to_owned())?
 }
 

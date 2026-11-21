@@ -51,13 +51,13 @@ fn unix_now() -> i64 {
         .map(|value| value.as_secs() as i64).unwrap_or(0)
 }
 
-pub fn export(kind: &str, target: &str, password: &str, store: &Store, self_id: &str, destination: &Path)
+pub fn export(kind: &str, target: &str, password: &str, store: &Store, self_id: &str, destination: &Path, since: i64, until: i64)
     -> Result<ChatArchiveInfo, String> {
     validate_password(password)?;
     let text = destination.to_string_lossy();
     if text.is_empty() || text.len() > 4096 || text.contains('\0') { return Err("导出路径无效".into()); }
     if destination.exists() { return Err("目标文件已存在，请换一个文件名".into()); }
-    let ArchiveExport { kind, target, name, owner, messages } = store.archive_export(kind, target, self_id)
+    let ArchiveExport { kind, target, name, owner, messages } = store.archive_export(kind, target, self_id, since, until)
         .map_err(|_| invalid("无法读取该会话；请确认联系人已确认或你仍是群成员"))?;
     if messages.len() > MAX_MESSAGES { return Err("会话消息过多，无法一次导出".into()); }
     let header = Header {
@@ -113,10 +113,10 @@ mod tests {
         assert!(matches!(reply, crate::storage::IncomingResult::Inserted));
 
         let path = temp_file("roundtrip");
-        let info = export("direct", &peer, "password123", &store, &me, &path).unwrap();
+        let info = export("direct", &peer, "password123", &store, &me, &path, 0, 0).unwrap();
         assert_eq!(info.message_count, 2);
         // A second export to the same path is refused, never overwritten.
-        assert!(export("direct", &peer, "password123", &store, &me, &path).is_err());
+        assert!(export("direct", &peer, "password123", &store, &me, &path, 0, 0).is_err());
         // Wrong password and a missing file both fail cleanly.
         assert!(import("wrongpass", &path, &store, &me).is_err());
         assert!(import("password123", &temp_file("missing"), &store, &me).is_err());
@@ -144,7 +144,7 @@ mod tests {
         let path = temp_file("foreign");
         std::fs::write(&path, b"not an encrypted archive").unwrap();
         assert!(import("password123", &path, &store, &me).is_err());
-        assert!(export("direct", &"b".repeat(64), "short", &store, &me, &temp_file("pw")).is_err());
+        assert!(export("direct", &"b".repeat(64), "short", &store, &me, &temp_file("pw"), 0, 0).is_err());
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&store_path);
     }

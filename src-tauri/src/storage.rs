@@ -3411,18 +3411,38 @@ impl Store {
         Ok(self.connection.execute("UPDATE group_control SET status = 'delivered' WHERE id = ?1 AND status = 'pending'", [id])? == 1)
     }
 
-    /// Reads the text history of one conversation for an encrypted archive export.
-    /// Permissions mirror the UI: only verified direct peers and active groups.
-    pub fn archive_export(&self, kind: &str, target: &str, self_id: &str) -> Result<ArchiveExport> {
+    /// Reads the history of one conversation for an encrypted archive export.
+    /// `since`/`until` bound `created_at` (0 = unbounded). Permissions mirror the
+    /// UI: only verified direct peers and active groups.
+    pub fn archive_export(&self, kind: &str, target: &str, self_id: &str, since: i64, until: i64) -> Result<ArchiveExport> {
         if !valid_fingerprint(self_id) { return Err(rusqlite::Error::InvalidQuery); }
+        fn time_clause(since: i64, until: i64) -> String {
+            // Placeholders are numbered after ?1 (the peer/group id). Values bind as
+            // strings; INTEGER affinity converts them back to numbers for comparison.
+            let mut sql = String::new();
+            let mut index = 2;
+            if since > 0 { sql.push_str(&format!(" AND created_at >= ?{index}")); index += 1; }
+            if until > 0 { sql.push_str(&format!(" AND created_at <= ?{index}")); }
+            sql
+        }
+        fn time_params(since: i64, until: i64) -> Vec<String> {
+            let mut params = Vec::new();
+            if since > 0 { params.push(since.to_string()); }
+            if until > 0 { params.push(until.to_string()); }
+            params
+        }
+        fn named(kind: &str, target: &str, name: String, owner: Option<String>, messages: Vec<ArchiveMessage>) -> ArchiveExport {
+            ArchiveExport { kind: kind.to_owned(), target: target.to_owned(), name, owner, messages }
+        }
         match kind {
             "self" => {
-                let mut statement = self.connection.prepare(
+                let sql = format!(
                     "SELECT id, sender, body, created_at, logical FROM local_messages
-                     WHERE conversation_id = 'self' ORDER BY logical, sender, id LIMIT 50000")?;
-                let rows = statement.query_map([], row_message)?;
+                     WHERE conversation_id = 'self'{} ORDER BY logical, sender, id LIMIT 50000", time_clause(since, until));
+                let mut statement = self.connection.prepare(&sql)?;
+                let rows = statement.query_map(rusqlite::params_from_iter(time_params(since, until)), row_message)?;
                 let messages = rows.collect::<Result<Vec<_>>>()?;
-                Ok(ArchiveExport { kind: "self".into(), target: "self".into(), name: "自己".into(), owner: None, messages })
+                Ok(named("self", "self", "自己".into(), None, messages))
             }
             "direct" => {
                 if !valid_fingerprint(target) { return Err(rusqlite::Error::InvalidQuery); }
@@ -3433,12 +3453,14 @@ impl Store {
                 let name: String = self.connection.query_row(
                     "SELECT COALESCE(NULLIF(trim(COALESCE(remark, '')), ''), display_name) FROM contacts WHERE fingerprint = ?1",
                     [target], |row| row.get(0))?;
-                let mut statement = self.connection.prepare(
+                let sql = format!(
                     "SELECT id, sender, body, created_at, logical FROM direct_messages
-                     WHERE peer = ?1 AND kind = 'text' ORDER BY logical, sender, id LIMIT 50000")?;
-                let rows = statement.query_map([target], row_message)?;
+                     WHERE peer = ?1 AND kind = 'text'{} ORDER BY logical, sender, id LIMIT 50000", time_clause(since, until));
+                let mut statement = self.connection.prepare(&sql)?;
+                let bound = [target.to_string()].into_iter().chain(time_params(since, until)).collect::<Vec<_>>();
+                let rows = statement.query_map(rusqlite::params_from_iter(bound.iter()), row_message)?;
                 let messages = rows.collect::<Result<Vec<_>>>()?;
-                Ok(ArchiveExport { kind: "direct".into(), target: target.into(), name, owner: None, messages })
+                Ok(named("direct", target, name, None, messages))
             }
             "group" => {
                 if !valid_group_id(target) { return Err(rusqlite::Error::InvalidQuery); }
@@ -3447,16 +3469,42 @@ impl Store {
                      WHERE g.id = ?1 AND m.member = ?2 AND m.active = 1", params![target, self_id],
                     |row| Ok((row.get(0)?, row.get(1)?))).optional()?;
                 let Some((name, owner)) = info else { return Err(rusqlite::Error::InvalidQuery); };
-                let mut statement = self.connection.prepare(
+                let sql = format!(
                     "SELECT id, sender, body, created_at, logical FROM group_messages
-                     WHERE group_id = ?1 AND kind = 'text' ORDER BY logical, sender, id LIMIT 50000")?;
-                let rows = statement.query_map([target], row_message)?;
+                     WHERE group_id = ?1 AND kind = 'text'{} ORDER BY logical, sender, id LIMIT 50000", time_clause(since, until));
+                let mut statement = self.connection.prepare(&sql)?;
+                let bound = [target.to_string()].into_iter().chain(time_params(since, until)).collect::<Vec<_>>();
+                let rows = statement.query_map(rusqlite::params_from_iter(bound.iter()), row_message)?;
                 let messages = rows.collect::<Result<Vec<_>>>()?;
-                Ok(ArchiveExport { kind: "group".into(), target: target.into(), name, owner: Some(owner), messages })
+                Ok(named("group", target, name, Some(owner), messages))
             }
             _ => Err(rusqlite::Error::InvalidQuery),
         }
     }
+
+    /// Conversations available for archive export: self chat, verified direct
+    /// contacts and active groups; the wizard uses this to render the picker.
+    pub fn list_export_targets(&self, self_id: &str) -> Result<Vec<(String, String, String)>> {
+        if !valid_fingerprint(self_id) { return Err(rusqlite::Error::InvalidQuery); }
+        let mut targets = Vec::new();
+        targets.push(("self".to_owned(), "self".to_owned(), "自己".to_owned()));
+        let mut statement = self.connection.prepare(
+            "SELECT fingerprint, COALESCE(NULLIF(trim(COALESCE(remark, '')), ''), display_name) FROM contacts
+             WHERE trust_state = 'verified' ORDER BY display_name COLLATE NOCASE")?;
+        let rows = statement.query_map([], |row| {
+            Ok(("direct".to_owned(), row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows { targets.push(row?); }
+        let mut statement = self.connection.prepare(
+            "SELECT g.id, g.name FROM groups g JOIN group_members m ON m.group_id = g.id
+             WHERE m.member = ?1 AND m.active = 1 ORDER BY g.name COLLATE NOCASE")?;
+        let rows = statement.query_map([self_id], |row| {
+            Ok(("group".to_owned(), row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows { targets.push(row?); }
+        Ok(targets)
+    }
+
 
     /// Merges archived text messages into the local history. Existing ids are compared
     /// so identical rows are skipped and different content is reported, never overwritten.

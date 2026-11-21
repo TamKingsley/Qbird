@@ -49,7 +49,7 @@ macro_rules! log_error {
     ($($arg:tt)*) => { $crate::logging::error(&format!($($arg)*)) };
 }
 
-fn timestamp() -> String {
+pub fn timestamp() -> String {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
     let secs = now.as_secs();
     // Civil-time conversion without chrono: days since 1970-01-01 to y-m-d.

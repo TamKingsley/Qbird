@@ -968,11 +968,12 @@ async function saveComposer(): Promise<void> {
   if (page === 'settings') render();
 }
 
-type SettingsTab = 'general' | 'privacy' | 'workspace' | 'experimental' | 'debug';
+type SettingsTab = 'general' | 'privacy' | 'backup' | 'workspace' | 'experimental' | 'debug';
 let settingsTab: SettingsTab = 'general';
 const SETTINGS_TABS: { id: SettingsTab; label: () => string }[] = [
   { id: 'general', label: () => t('tab.general') },
   { id: 'privacy', label: () => t('tab.privacy') },
+  { id: 'backup', label: () => t('tab.backup') },
   { id: 'workspace', label: () => t('tab.workspace') },
   { id: 'experimental', label: () => t('tab.experimental') },
   { id: 'debug', label: () => t('tab.debug') },
@@ -982,7 +983,7 @@ function settingsView(): string {
   const tab = SETTINGS_TABS.find((item) => item.id === settingsTab) ?? SETTINGS_TABS[0];
   return `<section class="card settings-card">
     <span class="eyebrow">${t('settings.eyebrow')}</span><h2>${tab.label()}</h2>
-    ${settingsTab === 'privacy' ? privacySettingsHtml() : settingsTab === 'workspace' ? workspaceSettingsHtml() : settingsTab === 'experimental' ? experimentalSettingsHtml() : settingsTab === 'debug' ? debugSettingsHtml() : generalSettingsHtml()}
+    ${settingsTab === 'privacy' ? privacySettingsHtml() : settingsTab === 'backup' ? backupSettingsHtml() : settingsTab === 'workspace' ? workspaceSettingsHtml() : settingsTab === 'experimental' ? experimentalSettingsHtml() : settingsTab === 'debug' ? debugSettingsHtml() : generalSettingsHtml()}
   </section>`;
 }
 
@@ -1045,6 +1046,110 @@ function generalSettingsHtml(): string {
     <button data-page="about" class="outline">${t('about.aboutQbird')}</button>`;
 }
 
+type ExportTarget = { kind: string; target: string; name: string };
+let exportTargets: ExportTarget[] = [];
+let exportTargetsLoaded = false;
+const exportSelected = new Set<string>();
+let exportRange: 'all' | 'custom' = 'all';
+let exportSince = ''; let exportUntil = '';
+let exportBusy = false;
+let exportWizardOpen = false;
+
+function exportKey(item: ExportTarget): string { return `${item.kind}|${item.target}`; }
+
+async function loadExportTargets(): Promise<void> {
+  if (!isTauri()) return;
+  try {
+    exportTargets = await invoke<ExportTarget[]>('v1_list_export_targets');
+    exportTargetsLoaded = true;
+  } catch (error) { exportTargets = []; workspace.notify(displayError(error)); }
+  if (page === 'settings' && settingsTab === 'backup') render();
+}
+
+/// Runs the export wizard: one .qchat file per selected conversation in the
+/// chosen directory, encrypted with the archive password.
+async function runExportWizard(): Promise<void> {
+  if (!isTauri() || exportBusy) return;
+  const password = app.querySelector<HTMLInputElement>('#chat-archive-password')?.value ?? '';
+  if (password.length < 8) { chatArchiveNotice = t('聊天记录密码至少 8 个字符'); render(); return; }
+  if (!exportSelected.size) { chatArchiveNotice = t('请先选择要导出的会话'); render(); return; }
+  let since: number | null = null; let until: number | null = null;
+  if (exportRange === 'custom') {
+    if (exportSince) since = Math.floor(new Date(`${exportSince}T00:00:00`).getTime() / 1000);
+    if (exportUntil) until = Math.floor(new Date(`${exportUntil}T23:59:59`).getTime() / 1000);
+    if (since !== null && until !== null && since > until) { chatArchiveNotice = t('开始日期不能晚于结束日期'); render(); return; }
+  }
+  const picked = await openFileDialog({ multiple: false, directory: true, title: t('选择导出目录') }).catch(() => null);
+  if (!picked || typeof picked !== 'string') return;
+  const selections = exportTargets.filter((item) => exportSelected.has(exportKey(item)))
+    .map((item) => ({ kind: item.kind, target: item.target }));
+  exportBusy = true; chatArchiveNotice = t('正在导出…'); render();
+  try {
+    const report = await invoke<{ exported: number; skipped: string[]; dir: string }>('v1_export_chat_archives',
+      { selections, password, dir: picked, since, until });
+    chatArchiveNotice = report.skipped.length
+      ? `${t('已导出')} ${report.exported} ${t('个会话到')} ${report.dir}；${t('失败')} ${report.skipped.length} ${t('个')}：${report.skipped.join('；')}`
+      : `${t('已导出')} ${report.exported} ${t('个会话到')} ${report.dir}。`;
+  } catch (error) { chatArchiveNotice = displayError(error); }
+  finally { exportBusy = false; if (page === 'settings') render(); }
+}
+
+function backupSettingsHtml(): string {
+  const backupSummary = backupInfo ? t('pr.verifiedBackup', { n: backupInfo.message_count, time: new Date(backupInfo.created_at * 1000).toLocaleString(), chat: backupInfo.include_chat ? t('pr.withChat') : t('pr.noChat') }) : t('pr.noBackupYet');
+  const targetRows = exportTargets.map((item) => {
+    const key = exportKey(item);
+    const checked = exportSelected.has(key) ? 'checked' : '';
+    const kindLabel = item.kind === 'self' ? t('自聊') : item.kind === 'direct' ? t('单聊') : t('群聊');
+    return `<label class="export-target"><input type="checkbox" data-export-target="${escapeText(key)}" ${checked}> <span>${escapeText(item.name)}</span><small>${kindLabel}</small></label>`;
+  }).join('');
+  return `<p>${t('备份使用密码加密并校验完整性；恢复前会校验备份文件。合并恢复会跳过相同同 ID 且内容一致的消息；覆盖恢复会先在本机保存一份恢复前快照。')}</p>
+    <div class="probe-box"><h3>${t('pr.backup')}</h3>
+      <p>${t('pr.backupIntro')}${backupSummary}</p>
+      <label for="backup-password">${t('pr.backupPassword')}</label>
+      <input id="backup-password" type="password" maxlength="256" autocomplete="new-password" value="${backupPassword.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;')}">
+      <p><label><input id="backup-include-chat" type="checkbox" checked> ${t('pr.includeChat')}</label></p>
+      <div class="probe-row"><button class="outline" data-action="backup-export" ${backupBusy ? 'disabled' : ''}>${t('pr.exportBackup')}</button><button class="outline" data-action="backup-choose" ${backupBusy ? 'disabled' : ''}>${t('pr.chooseBackup')}</button><button class="outline" data-action="backup-inspect" ${backupBusy || !backupPath ? 'disabled' : ''}>${t('pr.inspect')}</button></div>
+      <p id="backup-path">${backupPath ? t('pr.currentFile', { path: backupPath }) : t('pr.mergeNote')}</p>
+      <div class="probe-row"><button class="outline" data-action="backup-restore-merge" ${backupBusy || !backupPath ? 'disabled' : ''}>${t('pr.merge')}</button><button class="outline danger" data-action="backup-restore-overwrite" ${backupBusy || !backupPath ? 'disabled' : ''}>${t('pr.overwrite')}</button></div>
+      <p id="backup-notice" role="status">${backupNotice}</p>
+      <small>${t('pr.backupHint')}</small>
+    </div>
+    <div class="probe-box"><h3>${t('导出会话')}</h3>
+      <p>${t('按联系人（单聊/群聊/自聊）选择要导出的会话与时间范围，导出为加密的 .qchat 文件。')}</p>
+      <label for="chat-archive-password">${t('pr.archivePassword')}</label>
+      <input id="chat-archive-password" type="password" maxlength="256" autocomplete="new-password">
+      <div class="probe-row">
+        <button class="outline" data-action="toggle-export-wizard">${exportWizardOpen ? t('收起会话列表') : t('选择要导出的会话…')}</button>
+      </div>
+      ${exportWizardOpen ? `<div class="export-wizard">
+        <div class="export-targets">${exportTargetsLoaded ? (targetRows || `<p>${t('暂无可导出的会话')}</p>`) : t('读取中…')}</div>
+        <label class="export-target"><input type="checkbox" id="export-select-all"> ${t('全选')}</label>
+        <div class="probe-row">
+          <label for="export-range">${t('时间范围')}</label>
+          <select id="export-range">
+            <option value="all" ${exportRange === 'all' ? 'selected' : ''}>${t('全部时间')}</option>
+            <option value="custom" ${exportRange === 'custom' ? 'selected' : ''}>${t('自定义')}</option>
+          </select>
+        </div>
+        ${exportRange === 'custom' ? `<div class="probe-row">
+          <label for="export-since">${t('开始')}</label><input id="export-since" type="date" value="${exportSince}">
+          <label for="export-until">${t('结束')}</label><input id="export-until" type="date" value="${exportUntil}">
+        </div>` : ''}
+        <div class="probe-row"><button class="outline" data-action="export-chat-archives" ${exportBusy ? 'disabled' : ''}>${t('导出所选会话')}</button></div>
+      </div>` : ''}
+      <p id="chat-archive-notice" role="status">${chatArchiveNotice}</p>
+      <small>${t('聊天记录密码至少 8 个字符')}</small>
+    </div>
+    <div class="probe-box"><h3>${t('导入聊天记录')}</h3>
+      <p>${t('pr.archiveIntro')}</p>
+      <label for="chat-archive-import-password">${t('请输入导出时使用的密码')}</label>
+      <input id="chat-archive-import-password" type="password" maxlength="256" autocomplete="off">
+      <div class="probe-row"><button class="outline" data-action="import-chat-archive" ${chatArchiveBusy ? 'disabled' : ''}>${t('pr.importArchive')}</button></div>
+      <p id="chat-archive-import-notice" role="status">${chatArchiveNotice}</p>
+      <small>${t('pr.archiveHint')}</small>
+    </div>`;
+}
+
 function privacySettingsHtml(): string {
   const idle = lockState.idle_minutes ? t('pr.idleMinutes', { n: lockState.idle_minutes }) : t('pr.off');
   const remembered = fileAccept.remembered.length ? t('pr.remembered', { n: fileAccept.remembered.length }) : t('pr.noneRemembered');
@@ -1090,25 +1195,7 @@ function privacySettingsHtml(): string {
       <p id="file-accept-notice" role="status">${fileAcceptNotice}</p>
       <small>${t('pr.recvHint')}</small>
     </div>
-    <div class="probe-box"><h3>${t('pr.backup')}</h3>
-      <p>${t('pr.backupIntro')}${backupSummary}</p>
-      <label for="backup-password">${t('pr.backupPassword')}</label>
-      <input id="backup-password" type="password" maxlength="256" autocomplete="new-password" value="${backupPassword.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;')}">
-      <p><label><input id="backup-include-chat" type="checkbox" checked> ${t('pr.includeChat')}</label></p>
-      <div class="probe-row"><button class="outline" data-action="backup-export" ${backupBusy ? 'disabled' : ''}>${t('pr.exportBackup')}</button><button class="outline" data-action="backup-choose" ${backupBusy ? 'disabled' : ''}>${t('pr.chooseBackup')}</button><button class="outline" data-action="backup-inspect" ${backupBusy || !backupPath ? 'disabled' : ''}>${t('pr.inspect')}</button></div>
-      <p id="backup-path">${backupPath ? t('pr.currentFile', { path: backupPath }) : t('pr.mergeNote')}</p>
-      <div class="probe-row"><button class="outline" data-action="backup-restore-merge" ${backupBusy || !backupPath ? 'disabled' : ''}>${t('pr.merge')}</button><button class="outline danger" data-action="backup-restore-overwrite" ${backupBusy || !backupPath ? 'disabled' : ''}>${t('pr.overwrite')}</button></div>
-      <p id="backup-notice" role="status">${backupNotice}</p>
-      <small>${t('pr.backupHint')}</small>
-    </div>
-    <div class="probe-box"><h3>${t('pr.archive')}</h3>
-      <p>${t('pr.archiveIntro')}</p>
-      <label for="chat-archive-password">${t('pr.archivePassword')}</label>
-      <input id="chat-archive-password" type="password" maxlength="256" autocomplete="new-password">
-      <div class="probe-row"><button class="outline" data-action="export-chat-archive" ${chatArchiveBusy ? 'disabled' : ''}>${t('pr.exportArchive')}</button><button class="outline" data-action="import-chat-archive" ${chatArchiveBusy ? 'disabled' : ''}>${t('pr.importArchive')}</button></div>
-      <p id="chat-archive-notice" role="status">${chatArchiveNotice}</p>
-      <small>${t('pr.archiveHint')}</small>
-    </div>`;
+`;
 }
 
 function workspaceSettingsHtml(): string {
@@ -1475,7 +1562,7 @@ async function exportChatArchive(): Promise<void> {
 
 async function importChatArchive(): Promise<void> {
   if (!isTauri() || chatArchiveBusy) return;
-  const password = app.querySelector<HTMLInputElement>('#chat-archive-password')?.value ?? '';
+  const password = app.querySelector<HTMLInputElement>('#chat-archive-import-password')?.value ?? '';
   if (password.length < 8) { chatArchiveNotice = t('请输入导出时使用的密码'); render(); return; }
   const picked = await openFileDialog({ multiple: false, filters: [{ name: 'Qbird 聊天记录', extensions: ['qchat'] }] }).catch(() => null);
   if (!picked || typeof picked !== 'string') return;
@@ -3286,6 +3373,26 @@ async function respondToInvite(id: string, accept: boolean): Promise<void> {
 app.addEventListener('change', (event) => {
   const target = event.target;
   if (target instanceof HTMLSelectElement && target.id === 'app-language') { setLang(target.value as Lang); syncLangToBackend(getLang()); render(); return; }
+  if (target instanceof HTMLInputElement && target.dataset.exportTarget) {
+    const key = target.dataset.exportTarget;
+    if (target.checked) exportSelected.add(key); else exportSelected.delete(key);
+    return;
+  }
+  if (target instanceof HTMLInputElement && target.id === 'export-select-all') {
+    exportSelected.clear();
+    if (target.checked) for (const item of exportTargets) exportSelected.add(exportKey(item));
+    render();
+    return;
+  }
+  if (target instanceof HTMLSelectElement && target.id === 'export-range') {
+    exportRange = target.value as 'all' | 'custom';
+    render();
+    return;
+  }
+  if (target instanceof HTMLInputElement && (target.id === 'export-since' || target.id === 'export-until')) {
+    if (target.id === 'export-since') exportSince = target.value; else exportUntil = target.value;
+    return;
+  }
   if (target instanceof HTMLInputElement && target.id === 'chat-show-seconds') {
     const value = target.checked;
     setShowSeconds(value);
@@ -3545,6 +3652,13 @@ app.addEventListener('click', (event) => {
   if (action?.dataset.action === 'save-file-open-mode') { void saveFileOpenMode(); return; }
   if (action?.dataset.action === 'group-preview-file' && action.dataset.id) { groupChat.openPreviewById(action.dataset.id); return; }
   if (action?.dataset.action === 'export-chat-archive') { void exportChatArchive(); return; }
+  if (action?.dataset.action === 'toggle-export-wizard') {
+    exportWizardOpen = !exportWizardOpen;
+    if (exportWizardOpen && !exportTargetsLoaded) void loadExportTargets();
+    render();
+    return;
+  }
+  if (action?.dataset.action === 'export-chat-archives') { void runExportWizard(); return; }
   if (action?.dataset.action === 'import-chat-archive') { void importChatArchive(); return; }
   if (action?.dataset.action === 'save-team-name') { void saveTeamName(); return; }
   if (action?.dataset.action === 'choose-team-logo') { void chooseTeamLogo(); return; }
