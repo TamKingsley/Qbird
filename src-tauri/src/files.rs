@@ -49,7 +49,10 @@ pub fn sanitize_name(name: &str) -> Option<String> {
     if trimmed.chars().any(|c| c.is_control()) {
         return None;
     }
-    let base = Path::new(trimmed).file_name()?.to_string_lossy().to_string();
+    let base = trimmed
+        .trim_end_matches(|c| c == '/' || c == '\\')
+        .rsplit(|c| c == '/' || c == '\\')
+        .next()?;
     let cleaned: String = base
         .chars()
         .map(|c| if matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') { '_' } else { c })

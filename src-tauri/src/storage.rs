@@ -988,7 +988,7 @@ impl Store {
                     id TEXT PRIMARY KEY NOT NULL CHECK(length(id) = 32),
                     group_id TEXT NOT NULL,
                     target TEXT NOT NULL CHECK(length(target) = 64),
-                    kind TEXT NOT NULL CHECK(kind IN ('invite', 'members', 'remove', 'leave', 'transfer', 'dissolve', 'recall')),
+                    kind TEXT NOT NULL CHECK(kind IN ('invite', 'members', 'remove', 'leave', 'transfer', 'dissolve', 'join', 'join_reject', 'recall')),
                     payload TEXT NOT NULL CHECK(length(payload) <= 65536),
                     status TEXT NOT NULL CHECK(status IN ('pending', 'delivered')),
                     created_at INTEGER NOT NULL
@@ -1009,7 +1009,7 @@ impl Store {
                     id TEXT PRIMARY KEY NOT NULL CHECK(length(id) = 32),
                     group_id TEXT NOT NULL,
                     target TEXT NOT NULL CHECK(length(target) = 64),
-                    kind TEXT NOT NULL CHECK(kind IN ('invite', 'members', 'remove', 'leave', 'transfer', 'dissolve', 'recall', 'notice')),
+                    kind TEXT NOT NULL CHECK(kind IN ('invite', 'members', 'remove', 'leave', 'transfer', 'dissolve', 'join', 'join_reject', 'recall', 'notice')),
                     payload TEXT NOT NULL CHECK(length(payload) <= 65536),
                     status TEXT NOT NULL CHECK(status IN ('pending', 'delivered')),
                     created_at INTEGER NOT NULL
