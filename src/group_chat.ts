@@ -469,7 +469,7 @@ export class GroupChat {
     const groupId = this.groupId, generation = this.generation;
     try {
       await invoke('v1_hide_group', { groupId });
-      if (generation === this.generation) { this.clear(); this.onChange(); }
+      if (generation === this.generation) { this.clear(); this.onChange(); workspace.notify(t('已隐藏会话；收到新消息时会重新出现。')); }
     } catch { if (generation === this.generation) this.status('#group-error', t('无法隐藏会话')); }
   }
 

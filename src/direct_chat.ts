@@ -71,7 +71,7 @@ export class DirectChat {
     const peer = this.peer, generation = this.generation;
     try {
       await invoke('v1_hide_direct', { peer });
-      if (generation === this.generation) { this.clear(); this.onChange(); }
+      if (generation === this.generation) { this.clear(); this.onChange(); workspace.notify(t('已隐藏会话；收到新消息时会重新出现。')); }
     } catch { if (generation === this.generation) this.status('#direct-error', t('无法隐藏会话')); }
   }
 
