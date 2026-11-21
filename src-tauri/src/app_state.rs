@@ -457,7 +457,10 @@ impl AppState {
             };
             ProbeService::start_announcing(Arc::clone(&self.identity), port, announce, Arc::clone(&self.store))
         };
-        let service = service.map_err(|_| "无法启动服务：端口可能被占用，或网络发现不可用".to_owned())?;
+        let service = service.map_err(|error| {
+            crate::log_error!("监听启动失败(port={port}): {error}");
+            format!("无法启动服务（端口 {port} 可能被占用，或网络发现不可用）: {error}")
+        })?;
         let mut retry = self.retry_queue.lock().map_err(|_| "消息重试服务不可用".to_owned())?;
         if chat {
             *retry = Some(crate::retry_queue::RetryQueue::start(Arc::clone(&self.identity), Arc::clone(&self.store), Arc::clone(&self.outbound_chat))
@@ -860,13 +863,23 @@ pub fn start_listener_on_launch(app: tauri::AppHandle) {
         // The previous instance may still be releasing the port.
         for attempt in 0..4u64 {
             if attempt > 0 { std::thread::sleep(std::time::Duration::from_millis(300 * attempt)); }
-            if state.start_listener(port, true).is_ok() {
-                let _ = state.ensure_discovery();
-                return;
+            match state.start_listener(port, true) {
+                Ok(()) => {
+                    crate::log_info!("启动监听成功，端口 {port}（第 {} 次尝试）", attempt + 1);
+                    let _ = state.ensure_discovery();
+                    return;
+                }
+                Err(error) => crate::log_warn!("启动监听失败（第 {} 次，端口 {port}）: {error}", attempt + 1),
             }
         }
         // Last resort: bind any free port; mDNS advertises the actual one.
-        if state.start_listener(0, true).is_ok() { let _ = state.ensure_discovery(); }
+        match state.start_listener(0, true) {
+            Ok(()) => {
+                crate::log_info!("首选端口不可用，已改用随机端口监听");
+                let _ = state.ensure_discovery();
+            }
+            Err(error) => crate::log_error!("启动监听完全失败（含随机端口）: {error}"),
+        }
     });
 }
 
