@@ -1,6 +1,6 @@
 # Qbird
 
-[![Version](https://img.shields.io/badge/version-0.1.14-orange)](https://github.com/TamKingsley/Qbird/releases)
+[![Version](https://img.shields.io/badge/version-0.1.14-orange)](https://github.com/TamKingsley/Qbird/releases) [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-blue)] [![License](https://img.shields.io/github/license/TamKingsley/Qbird)](LICENSE)
 
 **A local-first messenger for direct communication over a local network.**
 

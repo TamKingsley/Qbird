@@ -1,6 +1,6 @@
 # Qbird
 
-[![版本](https://img.shields.io/badge/version-0.1.14-orange)](https://github.com/TamKingsley/Qbird/releases)
+[![版本](https://img.shields.io/badge/version-0.1.14-orange)](https://github.com/TamKingsley/Qbird/releases) [![平台](https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-blue)] [![许可证](https://img.shields.io/github/license/TamKingsley/Qbird)](LICENSE)
 
 **面向局域网设备直连的本地优先聊天工具。**
 
