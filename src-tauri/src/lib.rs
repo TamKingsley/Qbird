@@ -329,6 +329,8 @@ pub fn run() {
             app_state::v1_network_repair,
             app_state::v1_space_diagnostics,
             app_state::v1_read_logs,
+            app_state::v1_chat_display_settings,
+            app_state::v1_set_chat_display,
             app_state::v1_migration_notice,
             app_state::v1_open_logs_dir,
             app_state::v1_create_group,

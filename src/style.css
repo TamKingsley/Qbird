@@ -1328,3 +1328,4 @@ body.ws-open .shell{padding-right:var(--ws-width,420px)}
 .notice-actions .danger { color: #b3402a; }
 
 .debug-log { max-height: 260px; overflow: auto; margin: 8px 0 4px; padding: 10px; border: 1px solid var(--line-input); border-radius: var(--r-sm); background: var(--surface); font-size: 12px; line-height: 1.5; white-space: pre-wrap; word-break: break-all; }
+.message-time { display: block; margin-top: 3px; font-size: 11px; color: var(--text-3); }

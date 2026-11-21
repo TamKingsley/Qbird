@@ -7,6 +7,7 @@ import { showContextMenu } from './context_menu';
 import { workspace, type LoadedTab } from './workspace';
 import { linkifiedText } from './linkify';
 import { t, trError } from './i18n';
+import { formatStamp } from './chat_prefs';
 
 type TextPreview = { name: string; kind: string; text: string };
 
@@ -1062,6 +1063,9 @@ export class GroupChat {
         bubble.append(badge);
       }
       column.append(bubble);
+      const time = document.createElement('small'); time.className = 'message-time';
+      time.textContent = formatStamp(message.created_at);
+      column.append(time);
       const tools = document.createElement('div'); tools.className = 'message-tools';
       const reply = document.createElement('button');
       reply.className = 'linkish'; reply.textContent = t('引用');

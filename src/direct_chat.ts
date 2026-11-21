@@ -7,6 +7,7 @@ import { workspace, type LoadedTab } from './workspace';
 import { linkifiedText } from './linkify';
 import { showContextMenu } from './context_menu';
 import { t, trError } from './i18n';
+import { formatStamp } from './chat_prefs';
 
 type DirectMessage = {
   id: string; peer: string; sender: string; body: string; created_at: number; logical: number;
@@ -669,6 +670,9 @@ export class DirectChat {
         body.addEventListener('contextmenu', (event) => this.textMenu(event, message));
         column.append(body);
       }
+      const time = document.createElement('small'); time.className = 'message-time';
+      time.textContent = formatStamp(message.created_at);
+      column.append(time);
       if (!incoming) {
         const status = document.createElement('small'); status.className = 'message-status';
         status.textContent = message.kind === 'file' ? '' : message.status === 'delivered' ? t('已送达') : t('待发送');

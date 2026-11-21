@@ -81,6 +81,9 @@ const dict: Record<string, Entry> = {
   // settings tabs
   'tab.general': { zh: '常规与网络', tw: '一般與網路', en: 'General & Network' },
   'tab.privacy': { zh: '隐私与安全', tw: '隱私與安全', en: 'Privacy & Security' },
+  'settings.chatDisplay': { zh: '聊天显示', tw: '聊天顯示', en: 'Chat display' },
+  'settings.showSeconds': { zh: '消息时间显示到秒', tw: '訊息時間顯示到秒', en: 'Show seconds in message timestamps' },
+  'settings.showSecondsHint': { zh: '关闭时消息时间只显示到分钟；设置保存在本机。', tw: '關閉時訊息時間只顯示到分鐘；設定儲存在本機。', en: 'When off, timestamps show minutes only; stored locally.' },
   'tab.workspace': { zh: '工作区', tw: '工作區', en: 'Workspace' },
   'tab.experimental': { zh: '实验功能', tw: '實驗功能', en: 'Experimental' },
   'tab.debug': { zh: '调试模式', tw: '偵錯模式', en: 'Debug' },

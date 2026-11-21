@@ -1,6 +1,7 @@
 import './style.css';
 import { invoke } from '@tauri-apps/api/core';
 import { t } from './i18n';
+import { loadChatDisplay, getShowSeconds } from './chat_prefs';
 
 /// Standalone chat-records window served from records.html. The conversation
 /// arrives via the query string (?kind=&id=). Offers search, type
@@ -33,7 +34,9 @@ function escapeText(value: string): string {
 function formatTime(seconds: number): string {
   const date = new Date(seconds * 1000);
   const pad = (n: number) => `${n}`.padStart(2, '0');
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  const base = `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+  const time = getShowSeconds() ? `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}` : `${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  return `${base} ${time}`;
 }
 
 function parseConversation(): boolean {
@@ -177,6 +180,7 @@ export async function runRecordsWindow(): Promise<void> {
   window.addEventListener('error', (event) => { console.error('[records] error', event); fail(`${t('页面出错：')}${event.message}`); });
   window.addEventListener('unhandledrejection', (event) => fail(`${t('页面出错：')}${String(event.reason)}`));
   if (!parseConversation()) { fail(`${t('聊天记录窗口参数无效。')} ${window.location.search}`); return; }
+  await loadChatDisplay();
   await resolveTitle();
   try { await loadRows(); }
   catch (error) { fail(`${t('无法加载聊天记录：')}${String(error)}`); return; }

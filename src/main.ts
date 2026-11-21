@@ -1,4 +1,5 @@
 import './style.css';
+import { formatStamp, loadChatDisplay, setShowSeconds, getShowSeconds } from './chat_prefs';
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import { open as openFileDialog, save as saveFileDialog } from '@tauri-apps/plugin-dialog';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
@@ -486,6 +487,7 @@ function paintSelfMessages(scroll: 'bottom' | 'preserve'): void {
   for (const message of selfMessages) {
     const row = document.createElement('div'); row.className = 'message-row'; row.dataset.id = message.id;
     const body = document.createElement('div'); body.className = 'message-bubble'; body.append(linkifiedText(message.body));
+    const time = document.createElement('small'); time.className = 'message-time'; time.textContent = formatStamp(message.created_at);
     body.addEventListener('contextmenu', (event) => {
       event.preventDefault();
       showContextMenu(event, [
@@ -493,7 +495,7 @@ function paintSelfMessages(scroll: 'bottom' | 'preserve'): void {
         { label: t('删除'), danger: true, run: () => { void deleteSelfMessage(message.id); } },
       ]);
     });
-    row.append(body); list.append(row);
+    row.append(body, time); list.append(row);
   }
   older.hidden = !selfHasOlder;
   history.scrollTop = scroll === 'bottom' ? history.scrollHeight : previousTop + history.scrollHeight - previousHeight;
@@ -994,6 +996,10 @@ function generalSettingsHtml(): string {
       <label for="app-language">${t('settings.language')}</label>
       <div class="probe-row"><select id="app-language">${langs}</select></div>
       <small>${t('settings.languageHint')}</small>
+    </div>
+    <div class="probe-box"><h3>${t('settings.chatDisplay')}</h3>
+      <p><label><input id="chat-show-seconds" type="checkbox" ${getShowSeconds() ? 'checked' : ''}> ${t('settings.showSeconds')}</label></p>
+      <small>${t('settings.showSecondsHint')}</small>
     </div>
     <div class="probe-box"><h3>${t('general.storage')}</h3>
       <p>${t('general.storageUsed')} <strong id="storage-used">${used}</strong>，${t('general.quotaLimit')} <strong id="storage-quota">${quota}</strong>。</p>
@@ -3280,6 +3286,13 @@ async function respondToInvite(id: string, accept: boolean): Promise<void> {
 app.addEventListener('change', (event) => {
   const target = event.target;
   if (target instanceof HTMLSelectElement && target.id === 'app-language') { setLang(target.value as Lang); syncLangToBackend(getLang()); render(); return; }
+  if (target instanceof HTMLInputElement && target.id === 'chat-show-seconds') {
+    const value = target.checked;
+    setShowSeconds(value);
+    void invoke('v1_set_chat_display', { showSeconds: value }).catch(() => undefined);
+    render();
+    return;
+  }
   if (target instanceof HTMLInputElement && target.id === 'auto-accept-contacts') {
     void (async () => {
       try {
@@ -3596,6 +3609,7 @@ app.addEventListener('click', (event) => {
   }
 });
 render();
+if (isTauri()) void loadChatDisplay().then(() => render());
 void refreshOnboarding();
 // One-time notice after an install migrated legacy data, so old records are
 // not mistaken for pre-seeded content.

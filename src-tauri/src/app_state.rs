@@ -677,6 +677,24 @@ pub fn v1_migration_notice(state: tauri::State<'_, AppState>) -> Result<Option<S
     }
 }
 
+/// Chat display preferences: timestamp granularity for message bubbles.
+#[derive(Clone, Debug, serde::Serialize, PartialEq, Eq)]
+pub struct ChatDisplaySettings { pub show_seconds: bool }
+
+#[tauri::command]
+pub fn v1_chat_display_settings(state: tauri::State<'_, AppState>) -> Result<ChatDisplaySettings, String> {
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    let show_seconds = store.get_setting("chat_show_seconds").map_err(|_| "无法读取显示设置".to_owned())?.as_deref() == Some("1");
+    Ok(ChatDisplaySettings { show_seconds })
+}
+
+#[tauri::command]
+pub fn v1_set_chat_display(state: tauri::State<'_, AppState>, show_seconds: bool) -> Result<ChatDisplaySettings, String> {
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    store.set_setting("chat_show_seconds", Some(if show_seconds { "1" } else { "0" })).map_err(|_| "无法保存显示设置".to_owned())?;
+    Ok(ChatDisplaySettings { show_seconds })
+}
+
 /// Recent application log text for the debug panel (at most 256 KiB).
 #[tauri::command]
 pub fn v1_read_logs() -> Result<String, String> {
