@@ -756,6 +756,13 @@ fn sanitize_file_name(name: &str) -> String {
     if trimmed.is_empty() { "未命名".to_owned() } else { trimmed.to_owned() }
 }
 
+/// Deletes a confirmed contact locally; chat history stays on this device.
+#[tauri::command]
+pub fn v1_remove_contact(state: tauri::State<'_, AppState>, fingerprint: String) -> Result<bool, String> {
+    state.store.lock().map_err(|_| "本地存储不可用".to_owned())?
+        .remove_contact(&fingerprint).map_err(|_| "无法删除联系人".to_owned())
+}
+
 /// Recent application log text for the debug panel (at most 256 KiB).
 #[tauri::command]
 pub fn v1_read_logs() -> Result<String, String> {

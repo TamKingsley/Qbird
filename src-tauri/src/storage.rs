@@ -1213,6 +1213,13 @@ impl Store {
     }
 
     /// Removes an inbound pending contact request; verified contacts are never touched.
+    /// Removes a confirmed contact locally. Chat history is kept on this device,
+    /// mirroring how left groups retain their records.
+    pub fn remove_contact(&self, fingerprint: &str) -> Result<bool> {
+        let removed = self.connection.execute("DELETE FROM contacts WHERE fingerprint = ?1", [fingerprint])?;
+        Ok(removed > 0)
+    }
+
     pub fn decline_candidate(&self, fingerprint: &str) -> Result<bool> {
         if !valid_fingerprint(fingerprint) { return Err(rusqlite::Error::InvalidQuery); }
         Ok(self.connection.execute(

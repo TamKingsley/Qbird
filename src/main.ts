@@ -2454,8 +2454,8 @@ function contactsPageView(): string {
   return `<section class="contacts-page">
     <header class="contacts-head">
       <div>
-        <span class="eyebrow">CONTACTS / 联系人</span>
-        <h2>联系人</h2>
+        <span class="eyebrow">CONTACTS / 通讯录</span>
+        <h2>通讯录</h2>
         <p>联系人保存在本机；添加对方需要对方同意，双方确认后才能互发消息。</p>
       </div>
       <div class="segmented" role="tablist" aria-label="${escapeText(t('联系人与群聊'))}">
@@ -2516,6 +2516,19 @@ function paintContactCards(): void {
     return;
   }
   list.innerHTML = rows.map(contactCardRow).join('');
+  for (const card of list.querySelectorAll<HTMLElement>('.contact-card[data-fingerprint]')) {
+    card.addEventListener('contextmenu', (event) => {
+      event.preventDefault();
+      const contact = contactsCache.find((c) => c.fingerprint === card.dataset.fingerprint);
+      if (!contact) return;
+      const name = contact.remark || contact.display_name;
+      const items: ContextItem[] = [
+        { label: t('发消息'), run: () => { page = 'messages'; render(); void direct.open(contact.fingerprint, name); } },
+        { label: t('删除联系人'), danger: true, run: () => { void removeContact(contact, name); } },
+      ];
+      showContextMenu(event, items);
+    });
+  }
 }
 
 /// Presence is advisory: LAN-visible or the saved address accepts a connection.
@@ -2561,6 +2574,29 @@ async function declineContact(peer: string): Promise<void> {
     contactNotice = t('已移除待确认请求。');
   } catch (error) { contactNotice = displayError(error); }
   await refreshContacts();
+}
+
+/// Removes a confirmed contact from the address book; local chat history stays.
+async function removeContact(contact: Contact, label: string): Promise<void> {
+  if (!isTauri()) return;
+  if (!window.confirm(`${t('删除联系人')}「${label}」？聊天记录会保留在本机。`)) return;
+  try {
+    await invoke('v1_remove_contact', { fingerprint: contact.fingerprint });
+    contactNotice = `${t('已删除')}「${label}」`;
+    await refreshContacts();
+  } catch (error) { contactNotice = displayError(error); }
+  if (page === 'contacts') render();
+}
+
+/// Leaves a group from the address book card context menu.
+async function leaveGroupFromCard(group: Group): Promise<void> {
+  if (!window.confirm(`${t('确定退出群聊')}「${group.name}」？历史记录会保留在本机。`)) return;
+  try {
+    await invoke('v1_leave_group', { groupId: group.id });
+    contactNotice = `${t('已退出')}「${group.name}」`;
+    await refreshContacts();
+  } catch (error) { contactNotice = displayError(error); }
+  if (page === 'contacts') render();
 }
 
 async function refreshContacts(): Promise<void> {
@@ -2859,6 +2895,17 @@ function paintGroups(contacts: Contact[]): void {
     list.innerHTML = groups.length
       ? groups.map(groupCardRow).join('')
       : '<li class="contact-card-empty">还没有群聊，先在下方创建一个。</li>';
+    for (const card of list.querySelectorAll<HTMLElement>('[data-group-drop]')) {
+      card.addEventListener('contextmenu', (event) => {
+        event.preventDefault();
+        const group = groups.find((g) => g.id === card.dataset.groupDrop);
+        if (!group) return;
+        showContextMenu(event, [
+          { label: t('发消息'), run: () => { page = 'messages'; render(); void groupChat.open(group.id, group.name); } },
+          { label: t('退出群聊'), danger: true, run: () => { void leaveGroupFromCard(group); } },
+        ]);
+      });
+    }
     for (const item of list.querySelectorAll<HTMLElement>('[data-group-drop]')) {
       const groupId = item.dataset.groupDrop ?? '';
       item.addEventListener('dragover', (event) => { event.preventDefault(); item.classList.add('drop-target'); });
