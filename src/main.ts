@@ -90,7 +90,7 @@ type GroupSearchHit = { group_id: string; name: string; owner: string; member_co
 type GroupInvitation = { id: string; group_id: string; name: string; owner: string; owner_name: string | null; member_count: number; created_at: number };
 let groupInvites: GroupInvitation[] = [];
 let leftGroups: Group[] = [];
-type ContactRequest = { id: string; direction: 'in' | 'out'; peer: string; nickname: string; username: string | null; address: string | null; created_at: number; status: string };
+type ContactRequest = { id: string; direction: 'in' | 'out'; peer: string; nickname: string; username: string | null; address: string | null; created_at: number; status: string; reason: string | null };
 type DissolvedGroup = { id: string; name: string; owner: string; dissolved_at: number | null; last_body: string; last_logical: number };
 let incomingRequests: ContactRequest[] = [];
 let outgoingRequests: ContactRequest[] = [];
@@ -572,7 +572,7 @@ function profileView(): string {
     <p id="profile-notice" role="status">${profileNotice}</p>
     <div class="probe-box"><h3>联系人添加</h3>
       <p>同一局域网的同事添加你时，会生成一条好友申请；你可以接受或拒绝，接受后双方才能互发消息。</p>
-      <p><label><input id="auto-accept-contacts" type="checkbox" ${autoAcceptContacts ? 'checked' : ''}> 自动接受对方添加（关闭后只在本机提示，不自动加入）</label></p>
+      <p><label><input id="auto-accept-contacts" type="checkbox" ${autoAcceptContacts ? 'checked' : ''}> 自动接受好友添加（关闭后需要验证信息并由你确认）</label></p>
       <p id="contact-sync-notice" class="hint" role="status">${contactSyncNotice}</p>
     </div>
     <div class="probe-box"><h3>联系人悬浮信息</h3>
@@ -1725,6 +1725,7 @@ function onboardingView(): string {
         <div class="ob-scan"><span class="pulse"></span><span id="ob-lan-status">${escapeText(lanStatus)}</span><span class="demo-tag">${t('ob.s3.unverified')}</span></div>
         <ul class="people" id="ob-people">${lanPeople.length ? '' : `<li class="people-empty">${lanLoading ? t('ob.s3.scanning') : t('ob.s3.none')}</li>`}</ul>
         <p class="hint">${t('ob.s3.hint')}</p>
+        <p id="ob-lan-notice" class="hint" role="status">${escapeText(lanNotice)}</p>
         <p class="ob-notice" role="status">${escapeText(onboardingNotice)}</p>
         <div class="ob-actions"><button class="ob-text" data-action="ob-finish">${t('ob.later')}</button>
           <button class="ob-primary" data-action="ob-finish" ${onboardingBusy ? 'disabled' : ''}>${onboardingBusy ? t('ob.finishing') : t('ob.finish')}</button></div>
@@ -1810,7 +1811,7 @@ function lanPersonRow(person: LanPerson, allowOpen = true): string {
   const name = person.nickname || person.username || `Qbird 用户 ${person.qbird_id.slice(-4)}`;
   const initial = escapeText(name.slice(0, 1).toUpperCase());
   const handle = person.username ? `<span class="p-user">@${escapeText(person.username)}</span>` : `<span class="p-user">${person.qbird_id}</span>`;
-  const meta = `<span>${escapeText(person.address)}</span><span class="sep">·</span><span>${person.verified ? t('已核对指纹') : t('身份未核对')}</span>`;
+  const meta = `<span>${escapeText(person.address)}</span><span class="sep">·</span><span>${person.known ? t('已添加') : t('身份未核对')}</span>`;
   return `<li data-fingerprint="${person.fingerprint}" class="${person.known ? 'is-added' : ''}">
     <span class="av av-40">${initial}</span>
     <div class="p-body"><div class="p-name"><strong>${escapeText(name)}</strong>${handle}</div><div class="p-meta">${meta}</div></div>
@@ -1876,12 +1877,17 @@ function discoveryView(): string {
       <div><strong>关于身份</strong><p>添加时以 Qbird ID 识别用户，昵称和用户名可以随时修改，ID 不变。需要更强确认时，可以核对完整身份指纹。</p></div>
       <button class="outline" data-action="lan-identity">查看我的身份</button>
     </div>
-    <p class="hint">${escapeText(lanNotice)}</p>
+    <p id="lan-notice" class="hint" role="status">${escapeText(lanNotice)}</p>
   </section>`;
 }
 
 function paintLan(): void {
   paintLanPeopleList(app.querySelector<HTMLUListElement>('#lan-list'));
+  paintLanPeopleList(app.querySelector<HTMLUListElement>('#ob-people'), false);
+  for (const selector of ['#lan-notice', '#ob-lan-notice']) {
+    const notice = app.querySelector<HTMLElement>(selector);
+    if (notice) notice.textContent = lanNotice;
+  }
   const status = app.querySelector<HTMLElement>('#lan-status');
   if (status) {
     const since = lanRefreshedAt ? `${Math.max(1, Math.round((Date.now() - lanRefreshedAt) / 1000))} 秒前刷新` : t('尚未刷新');
@@ -1910,6 +1916,47 @@ async function refreshLanPeople(force = false): Promise<void> {
   }
 }
 
+type AddContactArgs = { address: string; fingerprint: string; displayName: string; username: string | null; senderNickname: string | null; senderUsername: string | null };
+
+function askContactReason(): Promise<string | null> {
+  if (lockState.locked) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    const backdrop = document.createElement('div');
+    backdrop.className = 'close-dialog-backdrop';
+    backdrop.innerHTML = `<section class="close-dialog" role="dialog" aria-modal="true" aria-labelledby="contact-reason-title">
+      <h2 id="contact-reason-title">填写验证信息</h2><p>对方开启了好友验证，请告诉对方你是谁。</p>
+      <input id="contact-reason-input" type="text" maxlength="200" aria-label="验证信息" style="width:100%;margin-top:14px">
+      <p id="contact-reason-error" role="alert"></p><div class="close-dialog-actions"><button class="outline" data-cancel>取消</button><button class="outline" data-submit>发送申请</button></div></section>`;
+    document.body.append(backdrop);
+    const input = backdrop.querySelector<HTMLInputElement>('#contact-reason-input')!;
+    const close = (value: string | null): void => { document.removeEventListener('qbird:lock', onLock); backdrop.remove(); resolve(value); };
+    const onLock = (): void => close(null);
+    document.addEventListener('qbird:lock', onLock);
+    backdrop.querySelector<HTMLButtonElement>('[data-cancel]')!.onclick = () => close(null);
+    const submit = (): void => {
+      const value = input.value.trim();
+      if (!value || new TextEncoder().encode(value).length > 600 || /[\u0000-\u001f\u007f]/.test(value)) {
+        backdrop.querySelector<HTMLElement>('#contact-reason-error')!.textContent = t('请输入有效的验证信息，最长 600 字节。'); return;
+      }
+      close(value);
+    };
+    backdrop.querySelector<HTMLButtonElement>('[data-submit]')!.onclick = submit;
+    input.addEventListener('keydown', (event) => { if (event.key === 'Enter') submit(); if (event.key === 'Escape') close(null); });
+    input.focus();
+  });
+}
+
+async function addContactWithVerification(args: AddContactArgs): Promise<'accepted' | 'pending' | 'cancelled'> {
+  let result = await invoke<string>('v1_add_contact', { ...args, reason: null });
+  if (result === 'verify_required') {
+    const reason = await askContactReason();
+    if (reason === null) return 'cancelled';
+    result = await invoke<string>('v1_add_contact', { ...args, reason });
+  }
+  if (result === 'accepted' || result === 'pending') return result;
+  throw new Error(t('对方设置已变化，请重试添加。'));
+}
+
 async function addLanPerson(button: HTMLButtonElement): Promise<void> {
   if (!isTauri() || lanAddBusy) return;
   const { address, fingerprint, name, username } = button.dataset;
@@ -1917,22 +1964,24 @@ async function addLanPerson(button: HTMLButtonElement): Promise<void> {
   lanAddBusy = fingerprint;
   lanNotice = '';
   paintLan();
-  paintOnboarding();
   try {
-    await invoke('v1_set_contact_address', { peer: fingerprint, address });
-    const status = await invoke<string>('v1_request_contact', { peer: fingerprint });
-    const person = lanPeople.find((item) => item.fingerprint === fingerprint);
-    if (person) { person.known = true; person.verified = status === 'accepted' || status === 'verified'; }
-    lanNotice = status === 'accepted' || status === 'verified'
-      ? `已添加「${name || 'Qbird 用户'}」，现在可以互发消息。`
-      : `已向「${name || 'Qbird 用户'}」发送好友申请，等待对方同意。`;
+    const args = {
+      address, fingerprint, displayName: name || `Qbird ${fingerprint.slice(0, 8)}`, username: username || null,
+      senderNickname: onboarding && !onboarding.done ? onboardingDraft.nickname : null,
+      senderUsername: onboarding && !onboarding.done ? onboardingDraft.username : null,
+    };
+    const result = await addContactWithVerification(args);
+    if (result === 'accepted') {
+      const person = lanPeople.find((item) => item.fingerprint === fingerprint);
+      if (person) { person.known = true; person.verified = true; }
+      lanNotice = `已添加「${name || 'Qbird 用户'}」。`;
+    } else if (result === 'pending') lanNotice = t('好友申请已发送，等待对方确认。');
+    else lanNotice = t('已取消好友申请。');
   } catch (error) {
     lanNotice = displayError(error);
   } finally {
     lanAddBusy = '';
     paintLan();
-    paintOnboarding();
-    if (onboardingStep === 3) paintLanPeopleList(app.querySelector<HTMLUListElement>('#ob-people'), false);
     void refreshContacts();
   }
 }
@@ -1968,11 +2017,8 @@ async function addManualLan(): Promise<void> {
   paintLan();
   try {
     const fingerprint = await invoke<string>('v1_probe_peer', { address });
-    await invoke('v1_set_contact_address', { peer: fingerprint, address });
-    const status = await invoke<string>('v1_request_contact', { peer: fingerprint });
-    lanNotice = status === 'accepted' || status === 'verified'
-      ? `已添加 ${name || address} 到联系人。`
-      : `已向 ${name || address} 发送好友申请，等待对方同意。`;
+    const result = await addContactWithVerification({ address, fingerprint, displayName: name || `Qbird ${fingerprint.slice(0, 8)}`, username: null, senderNickname: null, senderUsername: null });
+    lanNotice = result === 'accepted' ? `已添加 ${name || address} 到联系人。` : result === 'pending' ? t('好友申请已发送，等待对方确认。') : t('已取消好友申请。');
     await refreshLanPeople(true);
   } catch (error) {
     lanNotice = displayError(error);
@@ -2363,7 +2409,7 @@ function contactSidebarView(): string {
       <div class="side-section-head"><span>待处理申请</span><small>${incomingRequests.length}</small></div>
       <ul class="side-list">${incomingRequests.map((request) => `<li class="side-row request-row" data-id="${request.id}">
         <span class="av av-32">${escapeText(contactInitial(request.nickname || request.peer.slice(0, 4)))}</span>
-        <span class="side-row-body"><strong>${escapeText(request.nickname || request.peer.slice(0, 8))}</strong><small>${request.username ? '@' + escapeText(request.username) : t('请求添加好友')}</small></span>
+        <span class="side-row-body"><strong>${escapeText(request.nickname || request.peer.slice(0, 8))}</strong><small>${escapeText(request.reason || t('请求添加好友'))}</small></span>
         <span class="request-actions"><button class="outline" data-action="accept-request" data-id="${request.id}">接受</button><button class="linkish" data-action="reject-request" data-id="${request.id}">拒绝</button></span>
       </li>`).join('')}</ul>
     </div>`
@@ -2653,8 +2699,45 @@ async function refreshGroupInvites(): Promise<void> {
   } catch { /* keep the last list on a transient read failure */ }
 }
 
+const deferredContactRequests = new Set<string>();
+let contactRequestDialogOpen = false;
+let contactRequestsRefreshing = false;
+let contactRequestsSyncing = false;
+
+function showContactRequest(request: ContactRequest): void {
+  contactRequestDialogOpen = true;
+  const backdrop = document.createElement('div');
+  backdrop.className = 'close-dialog-backdrop';
+  backdrop.innerHTML = `<section class="close-dialog" role="dialog" aria-modal="true" aria-labelledby="incoming-contact-title">
+    <h2 id="incoming-contact-title">好友申请</h2><p class="request-name"></p><p class="request-reason" style="white-space:pre-wrap;overflow-wrap:anywhere;margin-top:10px"></p>
+    <p class="request-error" role="alert"></p><div class="close-dialog-actions"><button class="outline" data-later>稍后处理</button><button class="outline" data-reject>拒绝</button><button class="outline" data-accept>同意</button></div></section>`;
+  backdrop.querySelector<HTMLElement>('.request-name')!.textContent = `${request.nickname || request.peer.slice(0, 8)}${request.username ? ' @' + request.username : ''} 请求添加你为好友`;
+  backdrop.querySelector<HTMLElement>('.request-reason')!.textContent = `验证信息：${request.reason || ''}`;
+  const close = (): void => { document.removeEventListener('qbird:lock', close); backdrop.remove(); contactRequestDialogOpen = false; };
+  document.addEventListener('qbird:lock', close);
+  backdrop.querySelector<HTMLButtonElement>('[data-later]')!.onclick = () => { deferredContactRequests.add(request.id); close(); };
+  const respond = async (accept: boolean): Promise<void> => {
+    for (const button of backdrop.querySelectorAll<HTMLButtonElement>('button')) button.disabled = true;
+    try {
+      await invoke('v1_respond_contact_request', { id: request.id, accept });
+      close();
+      await refreshContacts();
+      await refreshContactRequests();
+    } catch (error) {
+      backdrop.querySelector<HTMLElement>('.request-error')!.textContent = displayError(error);
+      for (const button of backdrop.querySelectorAll<HTMLButtonElement>('button')) button.disabled = false;
+    }
+  };
+  backdrop.querySelector<HTMLButtonElement>('[data-reject]')!.onclick = () => { void respond(false); };
+  backdrop.querySelector<HTMLButtonElement>('[data-accept]')!.onclick = () => { void respond(true); };
+  document.body.append(backdrop);
+  backdrop.querySelector<HTMLButtonElement>('[data-accept]')!.focus();
+}
+
 async function refreshContactRequests(): Promise<void> {
   if (!isTauri()) return;
+  if (contactRequestsRefreshing) return;
+  contactRequestsRefreshing = true;
   try {
     const [incoming, outgoing] = await Promise.all([
       invoke<ContactRequest[]>('v1_contact_requests', { direction: 'in' }),
@@ -2664,10 +2747,19 @@ async function refreshContactRequests(): Promise<void> {
     const pendingOut = outgoing.filter((item) => item.status === 'pending');
     if (JSON.stringify(pendingIn) !== JSON.stringify(incomingRequests)) {
       incomingRequests = pendingIn;
-      if (page === 'contacts') paintContactsSidebar();
+      if (page === 'contacts') render();
     }
     outgoingRequests = pendingOut;
+    const next = pendingIn.find((item) => !deferredContactRequests.has(item.id));
+    if (next && !contactRequestDialogOpen && lockInitialized && !lockState.locked) showContactRequest(next);
+    if (pendingOut.length && !contactRequestsSyncing) {
+      contactRequestsSyncing = true;
+      void invoke<boolean>('v1_sync_contact_requests').then((changed) => {
+        if (changed) { void refreshContacts(); void refreshContactRequests(); }
+      }).catch(() => undefined).finally(() => { contactRequestsSyncing = false; });
+    }
   } catch { /* keep the last list on a transient read failure */ }
+  finally { contactRequestsRefreshing = false; }
 }
 
 async function refreshDissolvedGroups(): Promise<void> {
@@ -2962,7 +3054,7 @@ async function createGroup(): Promise<void> {
 }
 
 function render(): void {
-  if (lockState.locked) { workspace.suspend(); app.innerHTML = lockView(); return; }
+  if (lockState.locked) { document.dispatchEvent(new Event('qbird:lock')); workspace.suspend(); app.innerHTML = lockView(); return; }
   workspace.resume();
   window.requestAnimationFrame(() => workspace.refreshLayout());
   if (!onboardingLoaded) { app.innerHTML = `<div class="boot">${t('boot.preparing')}</div>`; return; }
@@ -3452,7 +3544,7 @@ app.addEventListener('change', (event) => {
       try {
         const result = await invoke<{ auto_accept: boolean }>('v1_set_contact_sync', { autoAccept: target.checked });
         autoAcceptContacts = result.auto_accept;
-        contactSyncNotice = autoAcceptContacts ? t('已开启：同事添加你时自动互相加入。') : t('已关闭：对方添加你时不会自动加入联系人。');
+        contactSyncNotice = autoAcceptContacts ? t('已开启：同事添加你时自动互相加入。') : t('已关闭：对方需填写验证信息，等待你确认。');
       } catch {
         target.checked = !target.checked;
         contactSyncNotice = t('无法保存联系人设置');
@@ -3837,7 +3929,8 @@ window.setInterval(() => {
   if (page === 'discover') void refreshLanPeople();
   void refreshProbeStatus();
   if (page === 'messages') { void refreshConversations(); if (direct.peer) void direct.load(); if (groupChat.groupId) void groupChat.load(); }
-  if (page === 'contacts') { void refreshGroupInvites(); void refreshContacts(); void refreshContactRequests(); void refreshDissolvedGroups(); }
+  void refreshContactRequests();
+  if (page === 'contacts') { void refreshGroupInvites(); void refreshContacts(); void refreshDissolvedGroups(); }
 }, 4000);
 if (isTauri()) {
   document.addEventListener('paste', (event) => { void handleImagePaste(event); });

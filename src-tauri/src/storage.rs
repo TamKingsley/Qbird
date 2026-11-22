@@ -2598,13 +2598,6 @@ impl Store {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending')",
             params![id, direction, peer, nickname, username, address, now],
         )?;
-        // A pending outgoing request keeps the local contact visible but not usable.
-        if direction == "out" {
-            tx.execute(
-                "INSERT INTO direct_conversations(peer, hidden) VALUES (?1, 1) ON CONFLICT(peer) DO NOTHING",
-                [peer],
-            )?;
-        }
         tx.commit()?;
         self.contact_request(&id)
     }
@@ -2646,7 +2639,7 @@ impl Store {
 
     /// Answers a request. Accepting an inbound or outbound request makes the peer a
     /// verified contact; rejecting only closes the request row.
-    pub fn resolve_contact_request(&self, id: &str, accept: bool, now: i64) -> Result<Option<ContactRequest>> {
+    pub fn resolve_contact_request(&self, id: &str, accept: bool, _now: i64) -> Result<Option<ContactRequest>> {
         let Some(request) = self.contact_request(id)? else { return Ok(None); };
         if request.status != "pending" { return Ok(None); }
         let tx = self.connection.unchecked_transaction()?;
@@ -2654,10 +2647,10 @@ impl Store {
             params![id, if accept { "accepted" } else { "rejected" }])?;
         if accept {
             tx.execute(
-                "INSERT INTO contacts(fingerprint, display_name, trust_state, created_at, username)
-                 VALUES (?1, ?2, 'verified', ?3, ?4)
+                "INSERT INTO contacts(fingerprint, display_name, trust_state, username)
+                 VALUES (?1, ?2, 'verified', ?3)
                  ON CONFLICT(fingerprint) DO UPDATE SET trust_state = 'verified', display_name = excluded.display_name",
-                params![request.peer, request.nickname, now, request.username],
+                params![request.peer, request.nickname, request.username],
             )?;
             if let Some(address) = request.address.as_deref() {
                 tx.execute(
