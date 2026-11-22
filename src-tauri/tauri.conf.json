@@ -10,30 +10,7 @@
     "frontendDist": "../dist"
   },
   "app": {
-    "windows": [
-      {
-        "title": "Qbird",
-        "width": 1100,
-        "height": 740,
-        "minWidth": 700,
-        "minHeight": 480
-      },
-      {
-        "label": "notice",
-        "title": "Qbird Notifications",
-        "url": "notify.html",
-        "width": 360,
-        "height": 112,
-        "resizable": false,
-        "decorations": false,
-        "alwaysOnTop": true,
-        "skipTaskbar": true,
-        "visible": false,
-        "focus": false,
-        "transparent": true,
-        "shadow": true
-      }
-    ],
+    "windows": [],
     "security": {
       "csp": "default-src 'self'; img-src 'self' data: blob:; style-src 'self'; connect-src ipc: http://ipc.localhost; frame-src 'self' blob: https: http:; object-src 'self' blob:; media-src 'self' blob:"
     }

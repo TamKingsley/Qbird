@@ -199,6 +199,17 @@ pub fn run() {
                 }
             };
             app.manage(state);
+
+            // Create the main window only after AppState is managed: the config-created
+            // windows used to race with the frontend's first invoke (state() before
+            // manage() panics), which is the release-build flash crash on slower disks.
+            {
+                use tauri::{WebviewUrl, WebviewWindowBuilder};
+                let window = WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
+                    .title("Qbird").inner_size(1100.0, 740.0).min_inner_size(700.0, 480.0)
+                    .build().map_err(|error| Box::new(std::io::Error::other(error.to_string())))?;
+                let _ = window.set_focus();
+            }
             crate::log_info!("启动监听与守护线程已安排");
             app_state::start_listener_on_launch(app.handle().clone());
             app_state::watch_listener(app.handle().clone());
