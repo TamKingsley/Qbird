@@ -158,6 +158,14 @@ fn build_payload(snapshot: &[u8], include_chat: bool, message_count: u64, create
 /// Returns the verified header and the raw snapshot bytes.
 fn parse_payload(password: &str, data: &[u8]) -> Result<(BackupInfo, Vec<u8>), String> {
     let plaintext = decrypt(password, data)?;
+    parse_plaintext_payload(&plaintext)
+}
+
+/// Parses the verified v1 payload layout (magic + header + checksum + SQLite
+/// snapshot) from already-decrypted bytes. Shared by the v1 path and the
+/// format-2 bundle, whose `snapshot_b64` stores this exact payload, so the
+/// returned snapshot is the raw SQLite database and nothing else.
+fn parse_plaintext_payload(plaintext: &[u8]) -> Result<(BackupInfo, Vec<u8>), String> {
     let header = SNAP_MAGIC.len() + 1 + 8 + 8 + CHECKSUM_HEX;
     if plaintext.len() < header || &plaintext[..SNAP_MAGIC.len()] != SNAP_MAGIC {
         return Err("备份内容损坏".into());
@@ -369,7 +377,13 @@ fn remap_attachment_paths(store: &Store) -> Result<u64, String> {
 fn parse_bundle(password: &str, data: &[u8]) -> Result<(BackupInfo, Vec<u8>, Vec<AttachEntry>), String> {
     let plaintext = decrypt_with(MAGIC2, password, data, MAX_BACKUP + MAX_ATTACH_TOTAL * 2)?;
     let bundle: BackupBundle = serde_json::from_slice(&plaintext).map_err(|_| invalid("备份内容损坏"))?;
-    Ok((bundle.info, crate::base64::decode(&bundle.snapshot_b64).ok_or_else(|| invalid("备份内容损坏"))?, bundle.files))
+    // `snapshot_b64` stores the full v1 payload (magic + header + checksum + SQLite
+    // snapshot), so it must be parsed the same way as the v1 path to recover the raw
+    // SQLite bytes. Returning the payload verbatim would make `restore`'s ATTACH fail
+    // with "file is not a database".
+    let payload = crate::base64::decode(&bundle.snapshot_b64).ok_or_else(|| invalid("备份内容损坏"))?;
+    let (info, snapshot) = parse_plaintext_payload(&payload)?;
+    Ok((info, snapshot, bundle.files))
 }
 
 #[cfg(test)]
