@@ -2,6 +2,7 @@ import './style.css';
 import { invoke } from '@tauri-apps/api/core';
 import { t } from './i18n';
 import { loadChatDisplay, getShowSeconds } from './chat_prefs';
+import { recordsListState } from './records_window_state';
 
 /// Standalone chat-records window served from records.html. The conversation
 /// arrives via the query string (?kind=&id=). Offers search, type
@@ -24,6 +25,8 @@ let peerId = '';
 let title = t('聊天记录');
 let filter = '';
 let typeFilter: 'all' | 'file' = 'all';
+let loading = true;
+let loadError = '';
 const selected = new Set<string>();
 let rows: RecRow[] = [];
 
@@ -47,8 +50,9 @@ function parseConversation(): boolean {
 }
 
 function fail(message: string): void {
-  const app = document.getElementById('app');
-  if (app) app.innerHTML = `<p class="records-empty">${escapeText(message)}</p>`;
+  loading = false;
+  loadError = message;
+  render();
 }
 
 async function resolveTitle(): Promise<void> {
@@ -107,7 +111,20 @@ function visibleRows(): RecRow[] {
 function render(): void {
   document.title = title;
   const list = visibleRows();
+  const listState = recordsListState(loading, loadError, list.length);
   const app = document.getElementById('app')!;
+  let listContent: string;
+  switch (listState) {
+    case 'loading': listContent = t('读取中…'); break;
+    case 'error': listContent = escapeText(loadError); break;
+    case 'empty': listContent = t('没有匹配的聊天记录。'); break;
+    case 'rows': listContent = list.map((r) => `
+          <label class="records-row${selected.has(r.id) ? ' selected' : ''}">
+            <input type="checkbox" data-record-id="${escapeText(r.id)}" ${selected.has(r.id) ? 'checked' : ''}>
+            <span class="records-meta"><b>${escapeText(r.senderLabel)}</b><time>${formatTime(r.createdAt)}</time></span>
+            <span class="records-body">${escapeText(r.body)}</span>
+          </label>`).join(''); break;
+  }
   const fileTab = kind === 'group'
     ? `<button class="records-tab${typeFilter === 'file' ? ' active' : ''}" id="tab-file">${t('文件')}</button>`
     : '';
@@ -125,12 +142,7 @@ function render(): void {
         <button class="outline danger" id="records-delete" ${selected.size ? '' : 'disabled'}>${t('删除所选')}${selected.size ? `（${selected.size}）` : ''}</button>
       </div>
       <div class="records-list" id="records-list">
-        ${list.length === 0 ? `${t('没有匹配的聊天记录。')}` : list.map((r) => `
-          <label class="records-row${selected.has(r.id) ? ' selected' : ''}">
-            <input type="checkbox" data-record-id="${escapeText(r.id)}" ${selected.has(r.id) ? 'checked' : ''}>
-            <span class="records-meta"><b>${escapeText(r.senderLabel)}</b><time>${formatTime(r.createdAt)}</time></span>
-            <span class="records-body">${escapeText(r.body)}</span>
-          </label>`).join('')}
+        ${listContent}
       </div>
       <footer class="records-foot">${t('已选')}${selected.size}${t('条 · 删除仅影响本机记录')}</footer>
     </div>`;
@@ -176,13 +188,17 @@ async function deleteSelected(): Promise<void> {
 }
 
 export async function runRecordsWindow(): Promise<void> {
+  loading = true;
+  loadError = '';
   console.info('[records] boot', window.location.href);
   window.addEventListener('error', (event) => { console.error('[records] error', event); fail(`${t('页面出错：')}${event.message}`); });
   window.addEventListener('unhandledrejection', (event) => fail(`${t('页面出错：')}${String(event.reason)}`));
   if (!parseConversation()) { fail(`${t('聊天记录窗口参数无效。')} ${window.location.search}`); return; }
+  render();
   await loadChatDisplay();
   await resolveTitle();
   try { await loadRows(); }
   catch (error) { fail(`${t('无法加载聊天记录：')}${String(error)}`); return; }
+  loading = false;
   render();
 }
