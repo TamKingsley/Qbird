@@ -1,6 +1,6 @@
 # Qbird
 
-[![版本](https://img.shields.io/badge/version-0.1.14-orange)](https://github.com/TamKingsley/Qbird/releases) [![平台](https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-blue)] [![许可证](https://img.shields.io/github/license/TamKingsley/Qbird)](LICENSE)
+[![发布版本](https://img.shields.io/github/v/release/TamKingsley/Qbird?include_prereleases&label=release&color=orange)](https://github.com/TamKingsley/Qbird/releases) [![平台](https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-blue)](https://github.com/TamKingsley/Qbird/releases) [![Rust](https://img.shields.io/badge/Rust-stable-informational?logo=rust&logoColor=white)](https://www.rust-lang.org) [![TypeScript](https://img.shields.io/badge/TypeScript-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org) [![Tauri](https://img.shields.io/badge/Tauri-2-FFC131?logo=tauri&logoColor=white)](https://tauri.app) [![许可证](https://img.shields.io/github/license/TamKingsley/Qbird)](LICENSE)
 
 **面向局域网设备直连的本地优先聊天工具。**
 
@@ -8,13 +8,13 @@
 
 Qbird 是一款 Windows 桌面应用，可发现附近的 Qbird 用户并让设备之间直接通信。应用不依赖托管中转服务器或账号服务；聊天记录与身份数据保存在本机。
 
-> **0.1.14 · Windows x64 预览版。** Qbird 尚未经过独立安全审计。本地 SQLite 数据库未加密，应用锁仅隐藏界面。请勿将此预览版用于敏感信息或生产通信。局域网发现会广播应用中设置的昵称和用户名。
+> **0.1.15 · Windows x64 预览版。** Qbird 尚未经过独立安全审计。本地 SQLite 数据库未加密，应用锁仅隐藏界面。请勿将此预览版用于敏感信息或生产通信。局域网发现会广播应用中设置的昵称和用户名。
 
 ## 界面预览
 
-![Qbird 0.1.14 消息页面](docs/assets/qbird-demo.png)
+![Qbird 0.1.15 消息页面](docs/assets/qbird-demo.png)
 
-*截图来自当前版本的隔离本机配置，不含个人数据。*
+_截图来自当前版本的隔离本机配置，不含个人数据。_
 
 ## 当前功能
 
@@ -27,6 +27,40 @@ Qbird 是一款 Windows 桌面应用，可发现附近的 Qbird 用户并让设�
 - 界面框架及部分区域可选简体中文、繁体中文和英文；聊天页面与部分后端提示尚未完全翻译。
 
 Qbird 使用 Tauri、Rust、TypeScript、Vite 和 SQLite 构建，点对点通信不经过托管中转服务器。预览插件的权限边界见[插件说明](docs/PLUGIN.md)。
+
+## 软件架构
+
+Qbird 是 Tauri 应用：Rust 后端负责网络、存储与身份，TypeScript 前端负责界面渲染，两者通过 Tauri IPC 命令通信。
+
+```text
++-------------------------------------------------------------+
+|  前端（TypeScript / Vite）                                  |
+|  main.ts · 单聊/群聊 · 截图 · 聊天记录 · 插件预览          |
+|            |  invoke() / 事件（Tauri IPC）                  |
+|  后端（Rust）                                               |
+|  lib.rs · app_state · 监听 · 局域网发现 · 协议             |
+|  storage.rs（SQLite）· backup.rs · identity.rs · files      |
++-------------------------------------------------------------+
+```
+
+### 安装后数据目录
+
+所有用户数据均保存在本机，位于按用户隔离的数据目录 `%APPDATA%\im.qbird.desktop\`：
+
+```text
+%APPDATA%\im.qbird.desktop\        # 数据目录（identifier: im.qbird.desktop）
+├── qbird.sqlite3                  # 聊天记录、联系人、会话（未加密）
+├── identity.bin                   # 设备身份密钥，经 Windows DPAPI 保护
+├── logs\
+│   └── qbird.log                  # 轮转应用日志（含 panic 钩子）
+├── attachments\
+│   └── in\
+│       ├── direct\                # 单聊接收文件
+│       └── group\                 # 群聊接收文件
+└── pre-restore-<时间戳>.db         # 覆盖式恢复前创建的临时快照
+```
+
+> SQLite 数据库与身份文件仅存在于本机，无托管中转或账号服务器。备份经密码加密，但不包含 `identity.bin`。
 
 ## 从源码运行
 
