@@ -1,0 +1,33 @@
+# 构建产物 / 依赖 / 缓存
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/target2/
+src-tauri/gen/
+release/
+releases/
+.pnpm-store/
+.tools/
+.test-tmp/
+.tmp-*/
+
+# Rust 由 rustfmt 管，不让 Prettier 碰
+*.rs
+
+# 锁文件 / 生成 schema
+pnpm-lock.yaml
+Cargo.lock
+*.sqlite3
+*.log
+
+# 大体量文档，避免无关重排
+docs/PRD.md
+
+# 二进制 / 资源
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.ico
+*.woff
+*.woff2

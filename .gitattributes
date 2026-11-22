@@ -1,0 +1,37 @@
+# 统一行尾：仓库内一律用 LF，检出时由 git 处理跨平台差异
+* text=auto eol=lf
+
+# 明确文本类型，确保参与行尾规范化
+*.rs    text eol=lf
+*.ts    text eol=lf
+*.tsx   text eol=lf
+*.js    text eol=lf
+*.mjs   text eol=lf
+*.cjs   text eol=lf
+*.json  text eol=lf
+*.toml  text eol=lf
+*.md    text eol=lf
+*.html  text eol=lf
+*.css   text eol=lf
+*.yaml  text eol=lf
+*.yml   text eol=lf
+*.conf  text eol=lf
+*.nsh   text eol=lf
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+
+# 二进制文件不做任何文本/行尾处理
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.webp  binary
+*.woff  binary
+*.woff2 binary
+*.ttf   binary
+*.exe   binary
+*.dll   binary
+*.zip   binary
+*.gz    binary
+*.pdf   binary
