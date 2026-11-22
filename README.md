@@ -1,6 +1,6 @@
 # Qbird
 
-[![Version](https://img.shields.io/badge/version-0.1.14-orange)](https://github.com/TamKingsley/Qbird/releases) [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-blue)] [![License](https://img.shields.io/github/license/TamKingsley/Qbird)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/TamKingsley/Qbird?include_prereleases&label=release&color=orange)](https://github.com/TamKingsley/Qbird/releases) [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-blue)](https://github.com/TamKingsley/Qbird/releases) [![Rust](https://img.shields.io/badge/Rust-stable-informational?logo=rust&logoColor=white)](https://www.rust-lang.org) [![TypeScript](https://img.shields.io/badge/TypeScript-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org) [![Tauri](https://img.shields.io/badge/Tauri-2-FFC131?logo=tauri&logoColor=white)](https://tauri.app) [![License](https://img.shields.io/github/license/TamKingsley/Qbird)](LICENSE)
 
 **A local-first messenger for direct communication over a local network.**
 
@@ -8,13 +8,13 @@ English · [简体中文](README_CN.md)
 
 Qbird is a Windows desktop app for discovering nearby Qbird users and communicating directly between devices. It has no hosted relay or account service; chat history and identity data are stored locally.
 
-> **0.1.14 · Windows x64 preview.** Qbird has not received an independent security audit. The local SQLite database is not encrypted, and App Lock only hides the interface. Do not use this preview for sensitive information or production communication. LAN discovery advertises the nickname and username configured in the app.
+> **0.1.15 · Windows x64 preview.** Qbird has not received an independent security audit. The local SQLite database is not encrypted, and App Lock only hides the interface. Do not use this preview for sensitive information or production communication. LAN discovery advertises the nickname and username configured in the app.
 
 ## Preview
 
-![Qbird 0.1.14 message screen](docs/assets/qbird-demo.png)
+![Qbird 0.1.15 message screen](docs/assets/qbird-demo.png)
 
-*The screenshot shows the current build with an isolated local profile and no personal data.*
+_The screenshot shows the current build with an isolated local profile and no personal data._
 
 ## Features
 
@@ -27,6 +27,40 @@ Qbird is a Windows desktop app for discovering nearby Qbird users and communicat
 - Simplified Chinese, Traditional Chinese, and English options for the app frame and selected surfaces. Chat screens and some backend messages are not fully translated yet.
 
 Qbird is built with Tauri, Rust, TypeScript, Vite, and SQLite. Peer communication does not use a hosted relay. See [known limitations](docs/PLUGIN.md) for the preview-plugin boundary.
+
+## Architecture
+
+Qbird is a Tauri app: a Rust backend owns networking, storage and identity, while a TypeScript frontend renders the UI and talks to the backend through Tauri IPC commands.
+
+```text
++-------------------------------------------------------------+
+|  Frontend (TypeScript / Vite)                               |
+|  main.ts · chat/group/direct · capture · records · plugins  |
+|            |  invoke() / events (Tauri IPC)                 |
+|  Backend (Rust)                                             |
+|  lib.rs · app_state · listener · discovery · protocol       |
+|  storage.rs (SQLite) · backup.rs · identity.rs · files      |
++-------------------------------------------------------------+
+```
+
+### Installed data layout
+
+All user data is local. The app stores everything under the per-user data directory `%APPDATA%\im.qbird.desktop\`:
+
+```text
+%APPDATA%\im.qbird.desktop\        # app_data_dir (identifier: im.qbird.desktop)
+├── qbird.sqlite3                  # chat history, contacts, conversations (NOT encrypted)
+├── identity.bin                   # device identity key, protected via Windows DPAPI
+├── logs\
+│   └── qbird.log                  # rotating app log (+ panic hook)
+├── attachments\
+│   └── in\
+│       ├── direct\                # received files for direct chats
+│       └── group\                 # received files for group chats
+└── pre-restore-<ts>.db            # transient snapshot created before an overwrite restore
+```
+
+> The SQLite database and identity file live only on this machine; there is no hosted relay or account server. Backups are password-encrypted but do not include `identity.bin`.
 
 ## Run from source
 
