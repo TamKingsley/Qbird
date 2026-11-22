@@ -5,10 +5,11 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
-    "build": "node scripts/check-version.mjs && tsc --noEmit && vite build",
+    "build": "node scripts/check-version.mjs && node --experimental-strip-types --test scripts/records-window-state.test.mjs && tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit",
+    "test:records-window": "node --experimental-strip-types --test scripts/records-window-state.test.mjs",
     "tauri": "tauri",
-    "verify": "node scripts/check-version.mjs && tsc --noEmit",
+    "verify": "node scripts/check-version.mjs && node --experimental-strip-types --test scripts/records-window-state.test.mjs && tsc --noEmit",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "prepare": "husky"
