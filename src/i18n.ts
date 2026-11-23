@@ -51,8 +51,6 @@ const dict: Record<string, Entry> = {
   // "more" menu
   'menu.settings': { zh: '设置', tw: '設定', en: 'Settings' },
   'menu.chatBackup': { zh: '聊天备份', tw: '聊天備份', en: 'Chat Backup' },
-  'menu.userBackupTodo': { zh: '用户备份 · 待实现（将含身份私钥）', tw: '使用者備份 · 待實作（將含身份私鑰）', en: 'User backup · coming later (will include identity key)' },
-  'menu.userRestoreTodo': { zh: '用户还原 · 待实现', tw: '使用者還原 · 待實作', en: 'User restore · coming later' },
   'menu.chatRestore': { zh: '聊天记录还原', tw: '聊天記錄還原', en: 'Chat History Restore' },
   'menu.about': { zh: '关于', tw: '關於', en: 'About' },
 
