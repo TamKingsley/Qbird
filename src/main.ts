@@ -15,6 +15,7 @@ import { workspace } from './workspace';
 import { linkifiedText } from './linkify';
 import { showContextMenu, type ContextItem } from './context_menu';
 import { t, trError, getLang, setLang, syncLangToBackend, LANG_LABEL, type Lang } from './i18n';
+import { loadUntilFound } from './search_navigation';
 
 type Page = 'messages' | 'contacts' | 'discover' | 'settings' | 'about' | 'profile';
 const root = document.querySelector<HTMLDivElement>('#app');
@@ -217,6 +218,10 @@ let searchBusy = false;
 let searchError = '';
 let searchSeq = 0;
 let searchTimer: number | null = null;
+let searchScopeKey = 'all';
+let searchOffset = 0;
+let searchHasMore = false;
+const searchPageSize = 100;
 type LockStatus = { has_password: boolean; locked: boolean; idle_minutes: number };
 let lockState: LockStatus = { has_password: false, locked: false, idle_minutes: 0 };
 let lockNotice = '';
@@ -397,7 +402,6 @@ function openChatMenu(button: HTMLElement, event: MouseEvent): void {
   const items: ContextItem[] = [
     { label: t('聊天记录'), run: () => { void openRecordsWindow(kind); } },
     ...(kind === 'group' ? [{ label: t('群公告'), run: () => { groupChat.toggleNoticeEditor(); } }] : []),
-    { label: t('导出文本'), run: () => { void exportChat(kind); } },
     { label: t('不显示此会话'), danger: true, run: () => {
       if (kind === 'direct') void direct.hide();
       else if (kind === 'group') void groupChat.hide();
@@ -1049,21 +1053,25 @@ function generalSettingsHtml(): string {
 type ExportTarget = { kind: string; target: string; name: string };
 let exportTargets: ExportTarget[] = [];
 let exportTargetsLoaded = false;
+let exportTargetsLoading = false;
 const exportSelected = new Set<string>();
-let exportRange: 'all' | 'custom' = 'all';
-let exportSince = ''; let exportUntil = '';
+let exportIncludeText = true;
+let exportIncludeImages = true;
+let exportIncludeFiles = true;
 let exportBusy = false;
 let exportWizardOpen = false;
 
 function exportKey(item: ExportTarget): string { return `${item.kind}|${item.target}`; }
 
 async function loadExportTargets(): Promise<void> {
-  if (!isTauri()) return;
+  if (!isTauri() || exportTargetsLoaded || exportTargetsLoading) return;
+  exportTargetsLoading = true;
   try {
     exportTargets = await invoke<ExportTarget[]>('v1_list_export_targets');
     exportTargetsLoaded = true;
   } catch (error) { exportTargets = []; workspace.notify(displayError(error)); }
-  if (page === 'settings' && settingsTab === 'backup') render();
+  finally { exportTargetsLoading = false; }
+  if ((page === 'settings' && settingsTab === 'backup') || page === 'messages') render();
 }
 
 /// Runs the export wizard: one .qchat file per selected conversation in the
@@ -1073,12 +1081,7 @@ async function runExportWizard(): Promise<void> {
   const password = app.querySelector<HTMLInputElement>('#chat-archive-password')?.value ?? '';
   if (password.length < 8) { chatArchiveNotice = t('聊天记录密码至少 8 个字符'); render(); return; }
   if (!exportSelected.size) { chatArchiveNotice = t('请先选择要导出的会话'); render(); return; }
-  let since: number | null = null; let until: number | null = null;
-  if (exportRange === 'custom') {
-    if (exportSince) since = Math.floor(new Date(`${exportSince}T00:00:00`).getTime() / 1000);
-    if (exportUntil) until = Math.floor(new Date(`${exportUntil}T23:59:59`).getTime() / 1000);
-    if (since !== null && until !== null && since > until) { chatArchiveNotice = t('开始日期不能晚于结束日期'); render(); return; }
-  }
+  if (!exportIncludeText && !exportIncludeImages && !exportIncludeFiles) { chatArchiveNotice = t('至少选择一种导出内容'); render(); return; }
   const picked = await openFileDialog({ multiple: false, directory: true, title: t('选择导出目录') }).catch(() => null);
   if (!picked || typeof picked !== 'string') return;
   const selections = exportTargets.filter((item) => exportSelected.has(exportKey(item)))
@@ -1086,7 +1089,7 @@ async function runExportWizard(): Promise<void> {
   exportBusy = true; chatArchiveNotice = t('正在导出…'); render();
   try {
     const report = await invoke<{ exported: number; skipped: string[]; dir: string }>('v1_export_chat_archives',
-      { selections, password, dir: picked, since, until });
+      { selections, password, dir: picked, includeText: exportIncludeText, includeImages: exportIncludeImages, includeFiles: exportIncludeFiles });
     chatArchiveNotice = report.skipped.length
       ? `${t('已导出')} ${report.exported} ${t('个会话到')} ${report.dir}；${t('失败')} ${report.skipped.length} ${t('个')}：${report.skipped.join('；')}`
       : `${t('已导出')} ${report.exported} ${t('个会话到')} ${report.dir}。`;
@@ -1115,7 +1118,7 @@ function backupSettingsHtml(): string {
       <small>${t('pr.backupHint')}</small>
     </div>
     <div class="probe-box"><h3>${t('导出会话')}</h3>
-      <p>${t('按联系人（单聊/群聊/自聊）选择要导出的会话与时间范围，导出为加密的 .qchat 文件。')}</p>
+      <p>${t('按联系人（单聊/群聊/自聊）选择会话，导出全部聊天记录；每个会话分别生成加密的 .qchat 文件。')}</p>
       <label for="chat-archive-password">${t('pr.archivePassword')}</label>
       <input id="chat-archive-password" type="password" maxlength="256" autocomplete="new-password">
       <div class="probe-row">
@@ -1124,17 +1127,11 @@ function backupSettingsHtml(): string {
       ${exportWizardOpen ? `<div class="export-wizard">
         <div class="export-targets">${exportTargetsLoaded ? (targetRows || `<p>${t('暂无可导出的会话')}</p>`) : t('读取中…')}</div>
         <label class="export-target"><input type="checkbox" id="export-select-all"> ${t('全选')}</label>
-        <div class="probe-row">
-          <label for="export-range">${t('时间范围')}</label>
-          <select id="export-range">
-            <option value="all" ${exportRange === 'all' ? 'selected' : ''}>${t('全部时间')}</option>
-            <option value="custom" ${exportRange === 'custom' ? 'selected' : ''}>${t('自定义')}</option>
-          </select>
+        <div class="probe-row export-content-options">
+          <label><input type="checkbox" id="export-include-text" ${exportIncludeText ? 'checked' : ''}> ${t('文字消息')}</label>
+          <label><input type="checkbox" id="export-include-images" ${exportIncludeImages ? 'checked' : ''}> ${t('图片')}</label>
+          <label><input type="checkbox" id="export-include-files" ${exportIncludeFiles ? 'checked' : ''}> ${t('其他文件')}</label>
         </div>
-        ${exportRange === 'custom' ? `<div class="probe-row">
-          <label for="export-since">${t('开始')}</label><input id="export-since" type="date" value="${exportSince}">
-          <label for="export-until">${t('结束')}</label><input id="export-until" type="date" value="${exportUntil}">
-        </div>` : ''}
         <div class="probe-row"><button class="outline" data-action="export-chat-archives" ${exportBusy ? 'disabled' : ''}>${t('导出所选会话')}</button></div>
       </div>` : ''}
       <p id="chat-archive-notice" role="status">${chatArchiveNotice}</p>
@@ -1530,36 +1527,6 @@ async function saveQuota(): Promise<void> {
   }
 }
 
-function currentConversation(): { kind: 'direct' | 'group' | 'self'; target: string; name: string } | null {
-  if (groupChat.groupId) return { kind: 'group', target: groupChat.groupId, name: t('群聊') };
-  if (direct.peer) return { kind: 'direct', target: direct.peer, name: t('单聊') };
-  if (selfOpen) return { kind: 'self', target: 'self', name: t('自己') };
-  return null;
-}
-
-async function exportChatArchive(): Promise<void> {
-  if (!isTauri() || chatArchiveBusy) return;
-  const password = app.querySelector<HTMLInputElement>('#chat-archive-password')?.value ?? '';
-  if (password.length < 8) { chatArchiveNotice = t('聊天记录密码至少 8 个字符'); render(); return; }
-  const conversation = currentConversation();
-  if (!conversation) { chatArchiveNotice = t('请先打开一个单聊、群聊或自聊'); render(); return; }
-  const date = new Date();
-  const stamp = `${date.getFullYear()}${String(date.getMonth() + 1).padStart(2, '0')}${String(date.getDate()).padStart(2, '0')}`;
-  const target = await saveFileDialog({
-    title: t('导出加密聊天记录'),
-    defaultPath: `qbird-chat-${stamp}.qchat`,
-    filters: [{ name: 'Qbird 聊天记录', extensions: ['qchat'] }],
-  }).catch(() => null);
-  if (!target) return;
-  chatArchiveBusy = true; chatArchiveNotice = t('正在导出…'); render();
-  try {
-    const info = await invoke<{ kind: string; name: string; message_count: number }>('v1_export_chat_archive',
-      { kind: conversation.kind, target: conversation.target, password, path: target });
-    chatArchiveNotice = `已导出 ${info.message_count} 条消息（${info.name}），附件未包含。`;
-  } catch (error) { chatArchiveNotice = displayError(error); }
-  finally { chatArchiveBusy = false; if (page === 'settings') render(); }
-}
-
 async function importChatArchive(): Promise<void> {
   if (!isTauri() || chatArchiveBusy) return;
   const password = app.querySelector<HTMLInputElement>('#chat-archive-import-password')?.value ?? '';
@@ -1568,9 +1535,9 @@ async function importChatArchive(): Promise<void> {
   if (!picked || typeof picked !== 'string') return;
   chatArchiveBusy = true; chatArchiveNotice = t('正在导入…'); render();
   try {
-    const report = await invoke<{ kind: string; name: string; inserted: number; skipped: number; conflicts: number }>('v1_import_chat_archive',
+    const report = await invoke<{ kind: string; name: string; inserted: number; skipped: number; conflicts: number; restored_attachments: number }>('v1_import_chat_archive',
       { password, path: picked });
-    chatArchiveNotice = `已导入「${report.name}」：新增 ${report.inserted} 条，跳过重复 ${report.skipped} 条${report.conflicts ? `，冲突 ${report.conflicts} 条（未覆盖）` : ''}。`;
+    chatArchiveNotice = `已导入「${report.name}」：新增 ${report.inserted} 条，跳过重复 ${report.skipped} 条，恢复附件 ${report.restored_attachments} 个${report.conflicts ? `，冲突 ${report.conflicts} 条（未覆盖）` : ''}。`;
     if (groupChat.groupId) void groupChat.load(false, true);
     if (direct.peer) void direct.load(false, true);
   } catch (error) { chatArchiveNotice = displayError(error); }
@@ -3077,7 +3044,7 @@ function render(): void {
       <aside class="sidebar">
         <div class="team"><span class="team-mark">${teamLogoUrl ? `<img class="team-logo" src="${escapeText(teamLogoUrl)}" alt="${escapeText(t('团队 Logo'))}">` : icon('spark')}</span><div><strong>${team.name ? escapeText(team.name) : 'Qbird'}</strong><small>LOCAL NETWORK MESSENGER</small></div></div>
         <div class="side-heading"><div><span class="eyebrow">${current.eyebrow}</span><h1>${current.title()}</h1></div></div>
-        ${page === 'settings' || page === 'about' ? `<div class="settings-links">${SETTINGS_TABS.map((tab) => `<button data-settings-tab="${tab.id}" class="${page === 'settings' && settingsTab === tab.id ? 'selected' : ''}">${tab.label()}</button>`).join('')}<button data-page="about" class="${page === 'about' ? 'selected' : ''}">${t('menu.about')}</button></div>` : page === 'messages' ? `<div class="side-search"><input id="global-search" type="search" maxlength="200" placeholder="${t('side.searchAll')}" aria-label="${t('side.searchAll')}" value="${searchQuery.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;')}"></div><div id="search-results" class="search-hits" hidden></div><div id="conversation-list" class="conversation-list">${t('side.reading')}</div>` : page === 'contacts' ? contactSidebarView() : `<div class="side-empty">${t('side.empty')}</div>`}
+        ${page === 'settings' || page === 'about' ? `<div class="settings-links">${SETTINGS_TABS.map((tab) => `<button data-settings-tab="${tab.id}" class="${page === 'settings' && settingsTab === tab.id ? 'selected' : ''}">${tab.label()}</button>`).join('')}<button data-page="about" class="${page === 'about' ? 'selected' : ''}">${t('menu.about')}</button></div>` : page === 'messages' ? `<div class="side-search"><input id="global-search" type="search" maxlength="200" placeholder="${t('side.searchAll')}" aria-label="${t('side.searchAll')}" value="${searchQuery.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;')}"><select id="search-conversation" aria-label="${t('搜索范围')}">${searchScopeOptionsHtml()}</select></div><div id="search-results" class="search-hits" hidden></div><div id="conversation-list" class="conversation-list">${t('side.reading')}</div>` : page === 'contacts' ? contactSidebarView() : `<div class="side-empty">${t('side.empty')}</div>`}
         <div class="side-foot"><span class="dot"></span>${t('side.localDesktop')}</div>
       </aside>
       <main class="workspace">
@@ -3263,7 +3230,18 @@ async function saveLockIdle(): Promise<void> {
   finally { lockBusy = false; if (page === 'settings') render(); }
 }
 
+function searchScopeOptionsHtml(): string {
+  const options = exportTargets.map((item) => {
+    const key = `${item.kind}|${item.target}`;
+    const kindLabel = item.kind === 'self' ? t('自聊') : item.kind === 'direct' ? t('单聊') : t('群聊');
+    return `<option value="${escapeText(key)}" ${searchScopeKey === key ? 'selected' : ''}>${escapeText(kindLabel)} · ${escapeText(item.name)}</option>`;
+  }).join('');
+  return `<option value="all" ${searchScopeKey === 'all' ? 'selected' : ''}>${t('全部会话')}</option>${options}`;
+}
+
 function scheduleSearch(): void {
+  searchOffset = 0;
+  searchHasMore = false;
   paintSearchList();
   if (searchTimer !== null) window.clearTimeout(searchTimer);
   if (!searchQuery.trim()) { searchHits = []; searchBusy = false; searchError = ''; paintSearchList(); return; }
@@ -3276,9 +3254,15 @@ async function runSearch(): Promise<void> {
   if (!query) return;
   const sequence = ++searchSeq;
   searchBusy = true; searchError = ''; paintSearchList();
+  const [conversationKind, conversationId] = searchScopeKey === 'all' ? [null, null] : searchScopeKey.split('|');
   try {
-    const hits = await invoke<SearchHit[]>('v1_search_all', { query, category: 'all', limit: 100 });
-    if (sequence === searchSeq) searchHits = hits;
+    const hits = await invoke<SearchHit[]>('v1_search_all', {
+      query, category: 'all', conversationKind, conversationId, limit: searchPageSize + 1, offset: searchOffset,
+    });
+    if (sequence === searchSeq) {
+      searchHasMore = hits.length > searchPageSize;
+      searchHits = hits.slice(0, searchPageSize);
+    }
   } catch {
     if (sequence === searchSeq) { searchHits = []; searchError = t('搜索失败，请稍后重试'); }
   } finally {
@@ -3316,6 +3300,22 @@ function paintSearchList(): void {
     button.append(head, body, time);
     results.append(button);
   }
+  const pager = document.createElement('div');
+  pager.className = 'search-pagination';
+  const previous = document.createElement('button');
+  previous.className = 'outline';
+  previous.textContent = t('上一页');
+  previous.disabled = searchOffset <= 0 || searchBusy;
+  previous.addEventListener('click', () => { searchOffset = Math.max(0, searchOffset - searchPageSize); void runSearch(); });
+  const pageLabel = document.createElement('span');
+  pageLabel.textContent = t('side.searchPage', { n: Math.floor(searchOffset / searchPageSize) + 1 });
+  const next = document.createElement('button');
+  next.className = 'outline';
+  next.textContent = t('下一页');
+  next.disabled = !searchHasMore || searchBusy;
+  next.addEventListener('click', () => { searchOffset += searchPageSize; void runSearch(); });
+  pager.append(previous, pageLabel, next);
+  results.append(pager);
 }
 
 async function openSearchHit(kind: string, id: string, messageId: string, name: string): Promise<void> {
@@ -3341,39 +3341,12 @@ async function openSearchHit(kind: string, id: string, messageId: string, name: 
 
 async function jumpSelf(messageId: string): Promise<void> {
   const found = () => selfMessages.some(message => message.id === messageId);
-  for (let page = 0; page < 20 && !found() && selfHasOlder; page += 1) {
-    const before = selfMessages.length;
-    await loadSelfMessages(true);
-    if (selfMessages.length === before) break;
-  }
+  await loadUntilFound(found, () => selfHasOlder, () => selfMessages.length, () => loadSelfMessages(true));
   const node = app.querySelector<HTMLElement>(`#self-messages [data-id="${messageId}"]`);
   if (!node) { const status = app.querySelector<HTMLElement>('#self-error'); if (status) status.textContent = t('该消息暂不在本机记录中'); return; }
   node.scrollIntoView({ block: 'center' });
   node.classList.add('jump-target');
   window.setTimeout(() => node.classList.remove('jump-target'), 1600);
-}
-
-type ExportResult = { conversation_name: string; message_count: number; path: string };
-
-async function exportChat(kind: 'self' | 'direct' | 'group'): Promise<void> {
-  if (!isTauri()) return;
-  const id = kind === 'self' ? 'self' : kind === 'direct' ? direct.peer : groupChat.groupId;
-  const status = kind === 'self' ? '#self-error' : kind === 'direct' ? '#direct-file-status' : '#group-error';
-  if (!id) return;
-  if (!window.confirm(t('导出的纯文本未加密，任何能打开该文件的人都能读到内容。确认导出？'))) return;
-  const date = new Date();
-  const stamp = `${date.getFullYear()}${String(date.getMonth() + 1).padStart(2, '0')}${String(date.getDate()).padStart(2, '0')}`;
-  const target = await saveFileDialog({
-    title: t('导出聊天记录'),
-    defaultPath: `qbird-chat-${stamp}.txt`,
-    filters: [{ name: t('纯文本'), extensions: ['txt'] }],
-  }).catch(() => null);
-  if (!target) return;
-  const report = (value: string) => { const node = app.querySelector<HTMLElement>(status); if (node) node.textContent = value; };
-  try {
-    const result = await invoke<ExportResult>('v1_export_chat', { kind, id, path: target });
-    report(`已导出 ${result.message_count} 条消息到 ${result.path}`);
-  } catch (error) { report(trError(error, t('导出失败'))); }
 }
 
 function contactTooltip(): HTMLElement {
@@ -3480,7 +3453,12 @@ app.addEventListener('input', (event) => {
   if (target.id === 'ob-nickname') { onboardingDraft.nickname = target.value; paintOnboardingAvatar(); return; }
   if (target.id === 'ob-username') { onboardingDraft.username = target.value.trim(); paintUsernameState(); return; }
   if (target.id === 'ob-email') { onboardingDraft.email = target.value; return; }
-  if (target.id === 'global-search') { searchQuery = target.value; scheduleSearch(); return; }
+  if (target.id === 'global-search') {
+    searchQuery = target.value;
+    scheduleSearch();
+    if (!exportTargetsLoaded) void loadExportTargets();
+    return;
+  }
 });
 app.addEventListener('keydown', (event) => {
   const target = event.target;
@@ -3512,6 +3490,11 @@ async function respondToInvite(id: string, accept: boolean): Promise<void> {
 app.addEventListener('change', (event) => {
   const target = event.target;
   if (target instanceof HTMLSelectElement && target.id === 'app-language') { setLang(target.value as Lang); syncLangToBackend(getLang()); render(); return; }
+  if (target instanceof HTMLSelectElement && target.id === 'search-conversation') {
+    searchScopeKey = target.value;
+    scheduleSearch();
+    return;
+  }
   if (target instanceof HTMLInputElement && target.dataset.exportTarget) {
     const key = target.dataset.exportTarget;
     if (target.checked) exportSelected.add(key); else exportSelected.delete(key);
@@ -3523,13 +3506,16 @@ app.addEventListener('change', (event) => {
     render();
     return;
   }
-  if (target instanceof HTMLSelectElement && target.id === 'export-range') {
-    exportRange = target.value as 'all' | 'custom';
-    render();
+  if (target instanceof HTMLInputElement && target.id === 'export-include-text') {
+    exportIncludeText = target.checked;
     return;
   }
-  if (target instanceof HTMLInputElement && (target.id === 'export-since' || target.id === 'export-until')) {
-    if (target.id === 'export-since') exportSince = target.value; else exportUntil = target.value;
+  if (target instanceof HTMLInputElement && target.id === 'export-include-images') {
+    exportIncludeImages = target.checked;
+    return;
+  }
+  if (target instanceof HTMLInputElement && target.id === 'export-include-files') {
+    exportIncludeFiles = target.checked;
     return;
   }
   if (target instanceof HTMLInputElement && target.id === 'chat-show-seconds') {
@@ -3790,7 +3776,6 @@ app.addEventListener('click', (event) => {
   if (action?.dataset.action === 'save-image-open-mode') { void saveImageOpenMode(); return; }
   if (action?.dataset.action === 'save-file-open-mode') { void saveFileOpenMode(); return; }
   if (action?.dataset.action === 'group-preview-file' && action.dataset.id) { groupChat.openPreviewById(action.dataset.id); return; }
-  if (action?.dataset.action === 'export-chat-archive') { void exportChatArchive(); return; }
   if (action?.dataset.action === 'toggle-export-wizard') {
     exportWizardOpen = !exportWizardOpen;
     if (exportWizardOpen && !exportTargetsLoaded) void loadExportTargets();
@@ -3819,7 +3804,6 @@ app.addEventListener('click', (event) => {
   if (action?.dataset.action === 'unlock') { void unlockApp(); return; }
   if (action?.dataset.action === 'save-lock-password') { void saveLockPassword(); return; }
   if (action?.dataset.action === 'save-lock-idle') { void saveLockIdle(); return; }
-  if (action?.dataset.action === 'export-text' && action.dataset.kind) { void exportChat(action.dataset.kind as 'self' | 'direct' | 'group'); return; }
   if (action?.dataset.action === 'chat-menu') { openChatMenu(action as HTMLElement, event); return; }
   if (action?.dataset.action === 'open-hit' && action.dataset.kind && action.dataset.id && action.dataset.message) {
     void openSearchHit(action.dataset.kind, action.dataset.id, action.dataset.message, action.dataset.name || '');

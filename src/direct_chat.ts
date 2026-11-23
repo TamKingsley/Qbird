@@ -8,6 +8,7 @@ import { linkifiedText } from './linkify';
 import { showContextMenu } from './context_menu';
 import { t, trError } from './i18n';
 import { formatStamp } from './chat_prefs';
+import { loadUntilFound } from './search_navigation';
 
 type DirectMessage = {
   id: string; peer: string; sender: string; body: string; created_at: number; logical: number;
@@ -462,11 +463,7 @@ export class DirectChat {
   async jumpTo(messageId: string): Promise<void> {
     if (!messageId) return;
     const found = () => this.messages.find(item => item.id === messageId);
-    for (let page = 0; page < 20 && !found() && this.hasOlder; page += 1) {
-      const before = this.messages.length;
-      await this.load(true);
-      if (!isTauri() || this.messages.length === before) break;
-    }
+    await loadUntilFound(() => !!found(), () => this.hasOlder, () => this.messages.length, () => this.load(true));
     const node = this.root.querySelector<HTMLElement>(`#direct-messages [data-id="${messageId}"]`);
     if (!node) { this.status('#direct-error', t('该消息暂不在本机记录中')); return; }
     node.scrollIntoView({ block: 'center' });

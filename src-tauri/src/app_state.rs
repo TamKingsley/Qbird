@@ -722,24 +722,32 @@ pub struct ExportBatchReport { pub exported: u32, pub skipped: Vec<String>, pub 
 
 #[tauri::command]
 pub async fn v1_export_chat_archives(state: tauri::State<'_, AppState>, selections: Vec<ExportSelection>,
-    password: String, dir: String, since: Option<i64>, until: Option<i64>) -> Result<ExportBatchReport, String> {
+    password: String, dir: String, include_text: Option<bool>, include_images: Option<bool>, include_files: Option<bool>) -> Result<ExportBatchReport, String> {
     let store = Arc::clone(&state.store);
     let self_id = state.identity.fingerprint();
     tauri::async_runtime::spawn_blocking(move || {
         if dir.len() > 4096 || dir.contains('\0') { return Err("导出目录无效".to_owned()); }
+        if selections.is_empty() || selections.len() > 500 { return Err("请选择 1–500 个会话".to_owned()); }
+        let include_text = include_text.unwrap_or(true);
+        let include_images = include_images.unwrap_or(true);
+        let include_files = include_files.unwrap_or(true);
+        if !include_text && !include_images && !include_files { return Err("至少选择一种导出内容".to_owned()); }
         let guard = store.lock().map_err(|_| "本地存储不可用".to_owned())?;
         let root = std::path::Path::new(&dir);
         if !root.is_dir() { return Err("导出目录不存在".to_owned()); }
         // YYYY-MM-DD from the shared logger timestamp (no extra dependency).
         let today = crate::logging::timestamp();
         let stamp = format!("qbird-chat-{}", today.get(..10).unwrap_or_default().replace('-', ""));
+        let targets = guard.list_export_targets(&self_id).map_err(|_| "无法读取可导出的会话列表".to_owned())?;
         let mut exported = 0u32; let mut skipped = Vec::new();
         for selection in &selections {
-            let name = guard.archive_export(&selection.kind, &selection.target, &self_id, since.unwrap_or(0), until.unwrap_or(0))
-                .map(|export| export.name).unwrap_or_else(|_| selection.target.clone());
+            let name = targets.iter().find(|(kind, target, _)| kind == &selection.kind && target == &selection.target)
+                .map(|(_, _, name)| name.clone()).unwrap_or_else(|| selection.target.clone());
             let safe = sanitize_file_name(&name);
-            let path = root.join(format!("{stamp}-{safe}.qchat"));
-            match crate::chatfile::export(&selection.kind, &selection.target, &password, &guard, &self_id, &path, since.unwrap_or(0), until.unwrap_or(0)) {
+            let suffix = sanitize_file_name(&selection.target);
+            let path = root.join(format!("{stamp}-{}-{safe}-{suffix}.qchat", sanitize_file_name(&selection.kind)));
+            match crate::chatfile::export_with_options(&selection.kind, &selection.target, &password, &guard, &self_id, &path,
+                0, 0, None, include_text, include_images, include_files) {
                 Ok(_) => exported += 1,
                 Err(error) => skipped.push(format!("{name}: {error}")),
             }
@@ -1886,14 +1894,21 @@ pub fn v1_avatar(state: tauri::State<'_, AppState>) -> Result<Option<Vec<u8>>, S
 /// Replaces the avatar with a cropped square PNG produced by the front end.
 /// Encrypted per-conversation archive; attachments are not included.
 #[tauri::command]
-pub async fn v1_export_chat_archive(state: tauri::State<'_, AppState>, kind: String, target: String, password: String, path: String, since: Option<i64>, until: Option<i64>)
+pub async fn v1_export_chat_archive(state: tauri::State<'_, AppState>, kind: String, target: String, password: String, path: String,
+    since: Option<i64>, until: Option<i64>, message_ids: Option<Vec<String>>, include_text: Option<bool>,
+    include_images: Option<bool>, include_files: Option<bool>)
     -> Result<crate::chatfile::ChatArchiveInfo, String> {
     let store = Arc::clone(&state.store);
     let self_id = state.identity.fingerprint();
     tauri::async_runtime::spawn_blocking(move || {
         if path.len() > 4096 { return Err("导出路径无效".to_owned()); }
+        let include_text = include_text.unwrap_or(true);
+        let include_images = include_images.unwrap_or(true);
+        let include_files = include_files.unwrap_or(true);
+        if !include_text && !include_images && !include_files { return Err("至少选择一种导出内容".to_owned()); }
         let guard = store.lock().map_err(|_| "本地存储不可用".to_owned())?;
-        crate::chatfile::export(&kind, &target, &password, &guard, &self_id, std::path::Path::new(&path), since.unwrap_or(0), until.unwrap_or(0))
+        crate::chatfile::export_with_options(&kind, &target, &password, &guard, &self_id, std::path::Path::new(&path),
+            since.unwrap_or(0), until.unwrap_or(0), message_ids.as_deref(), include_text, include_images, include_files)
     }).await.map_err(|_| "聊天记录导出任务异常".to_owned())?
 }
 
@@ -2143,36 +2158,27 @@ pub fn v1_send_self(state: tauri::State<'_, AppState>, body: String) -> Result<c
 
 /// One row of the cross-conversation search.
 #[tauri::command]
-pub fn v1_search_all(state: tauri::State<'_, AppState>, query: String, category: String, limit: u32)
+pub fn v1_search_all(state: tauri::State<'_, AppState>, query: String, category: String,
+    conversation_kind: Option<String>, conversation_id: Option<String>, limit: u32, offset: u32)
     -> Result<Vec<crate::storage::SearchHit>, String> {
     state.store.lock().map_err(|_| "本地存储不可用".to_owned())?
-        .search_all(&state.identity.fingerprint(), &query, &category, limit)
+        .search_all(&state.identity.fingerprint(), &query, &category,
+            conversation_kind.as_deref(), conversation_id.as_deref(), limit, offset)
         .map_err(|_| "搜索条件无效".to_owned())
 }
 
-#[derive(serde::Serialize)]
-pub struct ExportResult {
-    pub conversation_name: String,
-    pub message_count: u64,
-    pub path: String,
-}
-
-/// Writes a plain-text transcript chosen by the user. The text is unencrypted,
-/// so the UI must ask before exporting and mention that in its confirmation.
+/// Searches one conversation in the standalone history window with date and content filters.
 #[tauri::command]
-pub fn v1_export_chat(state: tauri::State<'_, AppState>, kind: String, id: String, path: String)
-    -> Result<ExportResult, String> {
-    if path.is_empty() || path.len() > 4096 || path.contains('\0') {
-        return Err("导出路径无效".into());
+pub fn v1_search_chat_history(state: tauri::State<'_, AppState>, kind: String, target: String, query: String,
+    category: String, since: Option<i64>, until: Option<i64>, recalled_label: String, limit: u32, offset: u32)
+    -> Result<Vec<crate::storage::HistorySearchHit>, String> {
+    if recalled_label.chars().count() > 128 || recalled_label.chars().any(char::is_control) {
+        return Err("搜索条件无效".into());
     }
-    let export = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?
-        .export_conversation(&state.identity.fingerprint(), &kind, &id)
-        .map_err(|_| "会话不可导出：可能不存在、已退出该群或消息数量过多".to_owned())?;
-    if export.text.len() > 64 * 1024 * 1024 {
-        return Err("聊天记录过大，暂不支持一次导出".into());
-    }
-    std::fs::write(&path, export.text.as_bytes()).map_err(|_| "无法写入导出文件".to_owned())?;
-    Ok(ExportResult { conversation_name: export.conversation_name, message_count: export.message_count, path })
+    state.store.lock().map_err(|_| "本地存储不可用".to_owned())?
+        .search_chat_history(&kind, &target, &state.identity.fingerprint(), &query, &category,
+            since, until, &recalled_label, limit, offset)
+        .map_err(|_| "搜索条件无效，或会话当前不可访问".to_owned())
 }
 
 #[derive(serde::Serialize)]

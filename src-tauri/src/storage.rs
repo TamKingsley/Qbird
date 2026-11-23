@@ -89,16 +89,22 @@ pub struct SearchHit {
     pub body: String,
     pub created_at: i64,
     pub logical: i64,
-    /// "text" or "file" (self and group messages are text only for now).
+    /// "text" or "file"; self-chat messages are currently text-only.
     pub kind: String,
 }
 
-/// A plain-text conversation export. The file itself is written by the caller.
+/// One paginated record-window result after date, keyword, and content filters.
 #[derive(Debug, Serialize, PartialEq, Eq)]
-pub struct ChatExport {
-    pub conversation_name: String,
-    pub message_count: u64,
-    pub text: String,
+pub struct HistorySearchHit {
+    pub id: String,
+    pub sender: String,
+    pub sender_name: String,
+    pub body: String,
+    pub created_at: i64,
+    pub logical: i64,
+    pub kind: String,
+    pub file_name: Option<String>,
+    pub recalled_at: Option<i64>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -349,7 +355,10 @@ pub struct FileOfferRequest {
     pub group_id: Option<String>,
 }
 
-/// One text message inside a chat archive; attachments stay on the original device.
+fn default_archive_message_kind() -> String { "text".to_owned() }
+
+/// One text or file message inside a chat archive. Missing fields in legacy v1
+/// archives default to a text message with no attachment metadata.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ArchiveMessage {
     pub id: String,
@@ -357,6 +366,28 @@ pub struct ArchiveMessage {
     pub body: String,
     pub created_at: i64,
     pub logical: i64,
+    #[serde(default = "default_archive_message_kind")]
+    pub kind: String,
+    #[serde(default)]
+    pub file_name: Option<String>,
+    #[serde(default)]
+    pub file_size: Option<i64>,
+    #[serde(default)]
+    pub file_sha256: Option<String>,
+}
+
+/// Local-only source information for one attachment; paths must never enter an archive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveAttachmentSource {
+    pub message_id: String,
+    pub direction: Option<String>,
+    pub file_name: Option<String>,
+    pub file_size: Option<i64>,
+    pub file_sha256: Option<String>,
+    pub path: Option<String>,
+    pub status: Option<String>,
+    pub transferred: Option<i64>,
+    pub total: Option<i64>,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -366,6 +397,8 @@ pub struct ArchiveExport {
     pub name: String,
     pub owner: Option<String>,
     pub messages: Vec<ArchiveMessage>,
+    #[serde(skip)]
+    pub attachments: Vec<ArchiveAttachmentSource>,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -375,6 +408,7 @@ pub struct ArchiveImportReport {
     pub inserted: u64,
     pub skipped: u64,
     pub conflicts: u64,
+    pub restored_attachments: u64,
 }
 
 /// One installed preview plugin as recorded in the database.
@@ -2882,37 +2916,60 @@ impl Store {
     /// Cross-conversation substring search. Only conversations the user can see are
     /// included: the local self chat, direct chats with verified contacts, and groups
     /// where the local identity is an active member.
-    pub fn search_all(&self, self_id: &str, query: &str, category: &str, limit: u32) -> Result<Vec<SearchHit>> {
-        if !valid_fingerprint(self_id) || !valid_search(query, category, limit, 0) {
+    pub fn search_all(&self, self_id: &str, query: &str, category: &str, conversation_kind: Option<&str>,
+        conversation_id: Option<&str>, limit: u32, offset: u32) -> Result<Vec<SearchHit>> {
+        if !valid_fingerprint(self_id) || !valid_search(query, category, limit, offset) {
             return Err(rusqlite::Error::InvalidQuery);
+        }
+        match (conversation_kind, conversation_id) {
+            (None, None) | (Some("self"), Some("self")) => {}
+            (Some("direct"), Some(peer)) if valid_fingerprint(peer) && self.is_verified(peer)? => {}
+            (Some("group"), Some(group_id)) if valid_group_id(group_id) => {
+                let active: bool = self.connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM group_members WHERE group_id = ?1 AND member = ?2 AND active = 1)",
+                    params![group_id, self_id], |row| row.get(0))?;
+                if !active { return Err(rusqlite::Error::InvalidQuery); }
+            }
+            _ => return Err(rusqlite::Error::InvalidQuery),
         }
         let pattern = like_pattern(query);
         let mut statement = self.connection.prepare(
             "SELECT 'self' AS ck, 'self' AS cid, '自聊' AS cname, m.id, m.sender, '我', m.body, m.created_at, m.logical, 'text'
              FROM local_messages m
              WHERE m.conversation_id = 'self' AND ?3 IN ('all', 'text') AND (?1 = '' OR m.body LIKE ?2 ESCAPE '\\')
+               AND (?5 IS NULL OR (?5 = 'self' AND ?6 = 'self'))
              UNION ALL
              SELECT 'direct', m.peer, COALESCE(c.display_name, substr(m.peer, 1, 8)), m.id, m.sender,
                     CASE WHEN m.sender = ?4 THEN '我' ELSE COALESCE(c.display_name, substr(m.peer, 1, 8)) END,
                     m.body, m.created_at, m.logical, m.kind
              FROM direct_messages m JOIN contacts c ON c.fingerprint = m.peer AND c.trust_state = 'verified'
-             WHERE (?1 = '' OR m.body LIKE ?2 ESCAPE '\\' OR COALESCE(m.file_name, '') LIKE ?2 ESCAPE '\\')
+             WHERE m.recalled_at IS NULL AND (?1 = '' OR m.body LIKE ?2 ESCAPE '\\' OR COALESCE(m.file_name, '') LIKE ?2 ESCAPE '\\')
                AND ((?3 IN ('all', 'text') AND m.kind = 'text')
-                 OR (?3 = 'file' AND m.kind = 'file')
+                 OR (?3 IN ('all', 'file') AND m.kind = 'file')
                  OR (?3 = 'image' AND m.kind = 'file' AND (lower(m.file_name) LIKE '%.png' OR lower(m.file_name) LIKE '%.jpg'
                     OR lower(m.file_name) LIKE '%.jpeg' OR lower(m.file_name) LIKE '%.gif' OR lower(m.file_name) LIKE '%.webp'
                     OR lower(m.file_name) LIKE '%.bmp')))
+               AND (?5 IS NULL OR (?5 = 'direct' AND m.peer = ?6))
              UNION ALL
-             SELECT 'group', g.id, g.name, m.id, m.sender, COALESCE(c.display_name, substr(m.sender, 1, 8)),
-                    m.body, m.created_at, m.logical, 'text'
+             SELECT 'group', g.id, g.name, m.id, m.sender,
+                    CASE WHEN m.sender = ?4 THEN '我' ELSE COALESCE(c.display_name, substr(m.sender, 1, 8)) END,
+                    m.body, m.created_at, m.logical, m.kind
              FROM group_messages m
              JOIN groups g ON g.id = m.group_id
              JOIN group_members gm ON gm.group_id = g.id AND gm.member = ?4 AND gm.active = 1
              LEFT JOIN contacts c ON c.fingerprint = m.sender
-             WHERE ?3 IN ('all', 'text') AND (?1 = '' OR m.body LIKE ?2 ESCAPE '\\')
-             ORDER BY created_at DESC, logical DESC, id DESC LIMIT ?5"
+             WHERE m.recalled_at IS NULL
+               AND ((?3 IN ('all', 'text') AND m.kind = 'text' AND (?1 = '' OR m.body LIKE ?2 ESCAPE '\\'))
+                 OR (?3 IN ('all', 'file') AND m.kind = 'file'
+                     AND (?1 = '' OR m.body LIKE ?2 ESCAPE '\\' OR COALESCE(m.file_name, '') LIKE ?2 ESCAPE '\\'))
+                 OR (?3 = 'image' AND m.kind = 'file'
+                     AND (lower(m.file_name) LIKE '%.png' OR lower(m.file_name) LIKE '%.jpg' OR lower(m.file_name) LIKE '%.jpeg'
+                       OR lower(m.file_name) LIKE '%.gif' OR lower(m.file_name) LIKE '%.webp' OR lower(m.file_name) LIKE '%.bmp')
+                     AND (?1 = '' OR m.body LIKE ?2 ESCAPE '\\' OR COALESCE(m.file_name, '') LIKE ?2 ESCAPE '\\')))
+               AND (?5 IS NULL OR (?5 = 'group' AND g.id = ?6))
+             ORDER BY created_at DESC, logical DESC, id DESC, ck DESC, cid DESC LIMIT ?7 OFFSET ?8"
         )?;
-        let rows = statement.query_map(params![query, pattern, category, self_id, limit], |row| Ok(SearchHit {
+        let rows = statement.query_map(params![query, pattern, category, self_id, conversation_kind, conversation_id, limit, offset], |row| Ok(SearchHit {
             conversation_kind: row.get(0)?, conversation_id: row.get(1)?, conversation_name: row.get(2)?,
             message_id: row.get(3)?, sender: row.get(4)?, sender_name: row.get(5)?, body: row.get(6)?,
             created_at: row.get(7)?, logical: row.get(8)?, kind: row.get(9)?,
@@ -2920,66 +2977,92 @@ impl Store {
         rows.collect()
     }
 
-    /// Plain-text export of one visible conversation in logical order. Direct chats and
-    /// groups are refused unless the local user may still read them.
-    /// `kind` is "self", "direct" or "group"; `id` is the peer fingerprint or group id.
-    pub fn export_conversation(&self, self_id: &str, kind: &str, id: &str) -> Result<ChatExport> {
-        if !valid_fingerprint(self_id) { return Err(rusqlite::Error::InvalidQuery); }
-        const MAX_EXPORT_MESSAGES: usize = 50_000;
-        let (name, rows): (String, Vec<(String, String, String)>) = match kind {
-            "self" => {
-                let rows = self.connection.prepare(
-                    "SELECT COALESCE(datetime(created_at, 'unixepoch', 'localtime'), ''), '我', body
-                     FROM local_messages WHERE conversation_id = 'self'
-                     ORDER BY logical, id LIMIT 50001")?
-                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?.collect::<Result<Vec<_>>>()?;
-                ("自聊".to_owned(), rows)
+    /// Searches one chat-history window by date, keyword, and content type.
+    /// Direct peers must be verified; groups must still have an active local member.
+    pub fn search_chat_history(&self, kind: &str, target: &str, self_id: &str, query: &str, category: &str,
+        since: Option<i64>, until: Option<i64>, recalled_label: &str, limit: u32, offset: u32)
+        -> Result<Vec<HistorySearchHit>> {
+        if !valid_fingerprint(self_id) || !valid_search(query, category, limit, offset)
+            || since.is_some_and(|value| value < 0) || until.is_some_and(|value| value < 0)
+            || since.zip(until).is_some_and(|(start, end)| start > end) {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        let pattern = like_pattern(query);
+        let rows = match kind {
+            "self" if target == "self" => {
+                let mut statement = self.connection.prepare(
+                    "SELECT id, sender, '我', body, created_at, logical, 'text', NULL, NULL
+                     FROM local_messages
+                     WHERE conversation_id = 'self' AND ?1 IN ('all', 'text')
+                       AND (?2 = '' OR body LIKE ?3 ESCAPE '\\')
+                       AND (?4 IS NULL OR created_at >= ?4) AND (?5 IS NULL OR created_at <= ?5)
+                     ORDER BY created_at DESC, logical DESC, id DESC LIMIT ?6 OFFSET ?7"
+                )?;
+                let rows = statement.query_map(params![category, query, pattern, since, until, limit, offset], |row| Ok(HistorySearchHit {
+                    id: row.get(0)?, sender: row.get(1)?, sender_name: row.get(2)?, body: row.get(3)?,
+                    created_at: row.get(4)?, logical: row.get(5)?, kind: row.get(6)?, file_name: row.get(7)?, recalled_at: row.get(8)?,
+                }))?;
+                rows.collect::<Result<Vec<_>>>()?
             }
-            "direct" => {
-                if !valid_fingerprint(id) { return Err(rusqlite::Error::InvalidQuery); }
-                let name: Option<String> = self.connection.query_row(
-                    "SELECT display_name FROM contacts WHERE fingerprint = ?1 AND trust_state = 'verified'",
-                    [id], |row| row.get(0)).optional()?;
-                let Some(name) = name else { return Err(rusqlite::Error::InvalidQuery); };
-                let rows = self.connection.prepare(
-                    "SELECT COALESCE(datetime(created_at, 'unixepoch', 'localtime'), ''),
-                            CASE WHEN sender = ?3 THEN '我' ELSE ?2 END,
-                            CASE WHEN kind = 'file' AND file_name IS NOT NULL THEN '[文件] ' || file_name ELSE body END
-                     FROM direct_messages WHERE peer = ?1
-                     ORDER BY logical, sender, id LIMIT 50001")?
-                    .query_map(params![id, name, self_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?.collect::<Result<Vec<_>>>()?;
-                (name, rows)
-            }
-            "group" => {
-                if !valid_group_id(id) { return Err(rusqlite::Error::InvalidQuery); }
-                let name: Option<String> = self.connection.query_row(
-                    "SELECT g.name FROM groups g JOIN group_members gm ON gm.group_id = g.id
-                     WHERE g.id = ?1 AND gm.member = ?2 AND gm.active = 1",
-                    params![id, self_id], |row| row.get(0)).optional()?;
-                let Some(name) = name else { return Err(rusqlite::Error::InvalidQuery); };
-                let rows = self.connection.prepare(
-                    "SELECT COALESCE(datetime(m.created_at, 'unixepoch', 'localtime'), ''),
+            "direct" if valid_fingerprint(target) && self.is_verified(target)? => {
+                let category_filter = match category {
+                    "text" => "COALESCE(m.kind, 'text') = 'text'",
+                    "file" => "m.kind = 'file'",
+                    "image" => "m.kind = 'file' AND (lower(m.file_name) LIKE '%.avif' OR lower(m.file_name) LIKE '%.bmp' OR lower(m.file_name) LIKE '%.gif' OR lower(m.file_name) LIKE '%.heic' OR lower(m.file_name) LIKE '%.heif' OR lower(m.file_name) LIKE '%.jpeg' OR lower(m.file_name) LIKE '%.jpg' OR lower(m.file_name) LIKE '%.png' OR lower(m.file_name) LIKE '%.tif' OR lower(m.file_name) LIKE '%.tiff' OR lower(m.file_name) LIKE '%.webp')",
+                    _ => "1 = 1",
+                };
+                let sql = format!(
+                    "SELECT m.id, m.sender,
                             CASE WHEN m.sender = ?2 THEN '我' ELSE COALESCE(c.display_name, substr(m.sender, 1, 8)) END,
-                            m.body
-                     FROM group_messages m LEFT JOIN contacts c ON c.fingerprint = m.sender
-                     WHERE m.group_id = ?1
-                     ORDER BY m.logical, m.sender, m.id LIMIT 50001")?
-                    .query_map(params![id, self_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?.collect::<Result<Vec<_>>>()?;
-                (name, rows)
+                            m.body, m.created_at, m.logical, COALESCE(m.kind, 'text'), m.file_name, m.recalled_at
+                     FROM direct_messages m JOIN contacts c ON c.fingerprint = m.peer AND c.trust_state = 'verified'
+                     WHERE m.peer = ?1 AND {category_filter}
+                       AND (?4 = '' OR (m.recalled_at IS NULL AND (m.body LIKE ?5 ESCAPE '\\' OR COALESCE(m.file_name, '') LIKE ?5 ESCAPE '\\'))
+                         OR (m.recalled_at IS NOT NULL AND ?6 LIKE ?5 ESCAPE '\\'))
+                       AND (?7 IS NULL OR m.created_at >= ?7) AND (?8 IS NULL OR m.created_at <= ?8)
+                     ORDER BY m.created_at DESC, m.logical DESC, m.id DESC LIMIT ?9 OFFSET ?10"
+                );
+                let mut statement = self.connection.prepare(&sql)?;
+                let rows = statement.query_map(params![target, self_id, category, query, pattern, recalled_label, since, until, limit, offset], |row| Ok(HistorySearchHit {
+                    id: row.get(0)?, sender: row.get(1)?, sender_name: row.get(2)?, body: row.get(3)?,
+                    created_at: row.get(4)?, logical: row.get(5)?, kind: row.get(6)?, file_name: row.get(7)?, recalled_at: row.get(8)?,
+                }))?;
+                rows.collect::<Result<Vec<_>>>()?
+            }
+            "group" if valid_group_id(target) => {
+                let active: bool = self.connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM group_members WHERE group_id = ?1 AND member = ?2 AND active = 1)",
+                    params![target, self_id], |row| row.get(0))?;
+                if !active { return Err(rusqlite::Error::InvalidQuery); }
+                let category_filter = match category {
+                    "text" => "COALESCE(m.kind, 'text') = 'text'",
+                    "file" => "m.kind = 'file'",
+                    "image" => "m.kind = 'file' AND (lower(m.file_name) LIKE '%.avif' OR lower(m.file_name) LIKE '%.bmp' OR lower(m.file_name) LIKE '%.gif' OR lower(m.file_name) LIKE '%.heic' OR lower(m.file_name) LIKE '%.heif' OR lower(m.file_name) LIKE '%.jpeg' OR lower(m.file_name) LIKE '%.jpg' OR lower(m.file_name) LIKE '%.png' OR lower(m.file_name) LIKE '%.tif' OR lower(m.file_name) LIKE '%.tiff' OR lower(m.file_name) LIKE '%.webp')",
+                    _ => "1 = 1",
+                };
+                let sql = format!(
+                    "SELECT m.id, m.sender,
+                            CASE WHEN m.sender = ?2 THEN '我' ELSE COALESCE(c.display_name, substr(m.sender, 1, 8)) END,
+                            m.body, m.created_at, m.logical, COALESCE(m.kind, 'text'), m.file_name, m.recalled_at
+                     FROM group_messages m JOIN groups g ON g.id = m.group_id
+                     JOIN group_members gm ON gm.group_id = g.id AND gm.member = ?2 AND gm.active = 1
+                     LEFT JOIN contacts c ON c.fingerprint = m.sender
+                     WHERE m.group_id = ?1 AND {category_filter}
+                       AND (?4 = '' OR (m.recalled_at IS NULL AND (m.body LIKE ?5 ESCAPE '\\' OR COALESCE(m.file_name, '') LIKE ?5 ESCAPE '\\'))
+                         OR (m.recalled_at IS NOT NULL AND ?6 LIKE ?5 ESCAPE '\\'))
+                       AND (?7 IS NULL OR m.created_at >= ?7) AND (?8 IS NULL OR m.created_at <= ?8)
+                     ORDER BY m.created_at DESC, m.logical DESC, m.id DESC LIMIT ?9 OFFSET ?10"
+                );
+                let mut statement = self.connection.prepare(&sql)?;
+                let rows = statement.query_map(params![target, self_id, category, query, pattern, recalled_label, since, until, limit, offset], |row| Ok(HistorySearchHit {
+                    id: row.get(0)?, sender: row.get(1)?, sender_name: row.get(2)?, body: row.get(3)?,
+                    created_at: row.get(4)?, logical: row.get(5)?, kind: row.get(6)?, file_name: row.get(7)?, recalled_at: row.get(8)?,
+                }))?;
+                rows.collect::<Result<Vec<_>>>()?
             }
             _ => return Err(rusqlite::Error::InvalidQuery),
         };
-        if rows.len() > MAX_EXPORT_MESSAGES { return Err(rusqlite::Error::InvalidQuery); }
-        let exported_at: String = self.connection.query_row(
-            "SELECT COALESCE(datetime('now', 'localtime'), '')", [], |row| row.get(0))?;
-        let kind_label = match kind { "self" => "自聊", "direct" => "单聊", _ => "群聊" };
-        let mut text = format!(
-            "Qbird 青鸟聊天记录\n会话：{name}（{kind_label}）\n导出时间：{exported_at}\n消息数：{}\n说明：纯文本导出未加密，请妥善保管。\n\n",
-            rows.len());
-        for (time, sender, body) in &rows {
-            text.push_str(&format!("[{time}] {sender}：{body}\n"));
-        }
-        Ok(ChatExport { conversation_name: name, message_count: rows.len() as u64, text })
+        Ok(rows)
     }
 
     /// Generic settings access used by small, explicit key/value features.
@@ -3420,7 +3503,29 @@ impl Store {
     /// `since`/`until` bound `created_at` (0 = unbounded). Permissions mirror the
     /// UI: only verified direct peers and active groups.
     pub fn archive_export(&self, kind: &str, target: &str, self_id: &str, since: i64, until: i64) -> Result<ArchiveExport> {
-        if !valid_fingerprint(self_id) { return Err(rusqlite::Error::InvalidQuery); }
+        self.archive_export_with_options(kind, target, self_id, since, until, None, true, true, true)
+    }
+
+    /// Exports a full conversation or a selected message set with independent
+    /// text, image, and other-file inclusion options.
+    pub fn archive_export_with_options(&self, kind: &str, target: &str, self_id: &str, since: i64, until: i64,
+        message_ids: Option<&[String]>, include_text: bool, include_images: bool, include_files: bool) -> Result<ArchiveExport> {
+        if !valid_fingerprint(self_id) || since < 0 || until < 0 || (since > 0 && until > 0 && since > until)
+            || message_ids.is_some_and(|ids| ids.len() > 50_000 || ids.iter().any(|id| !valid_message_id(id))) {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        let selected: Option<std::collections::HashSet<&str>> = message_ids.map(|ids| ids.iter().map(String::as_str).collect());
+        if message_ids.is_some_and(|ids| selected.as_ref().is_some_and(|set| set.len() != ids.len())) {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        let mut found_selected = std::collections::HashSet::new();
+        let include_kind = |message_kind: &str, file_name: Option<&str>| match message_kind {
+            "text" => include_text,
+            "file" if is_image_file(file_name.unwrap_or_default()) => include_images,
+            "file" => include_files,
+            _ => false,
+        };
+        let id_selected = |id: &str| selected.as_ref().is_none_or(|ids| ids.contains(id));
         fn time_clause(since: i64, until: i64) -> String {
             // Placeholders are numbered after ?1 (the peer/group id). Values bind as
             // strings; INTEGER affinity converts them back to numbers for comparison.
@@ -3436,18 +3541,74 @@ impl Store {
             if until > 0 { params.push(until.to_string()); }
             params
         }
-        fn named(kind: &str, target: &str, name: String, owner: Option<String>, messages: Vec<ArchiveMessage>) -> ArchiveExport {
-            ArchiveExport { kind: kind.to_owned(), target: target.to_owned(), name, owner, messages }
+        fn named(kind: &str, target: &str, name: String, owner: Option<String>, messages: Vec<ArchiveMessage>,
+            attachments: Vec<ArchiveAttachmentSource>) -> ArchiveExport {
+            ArchiveExport { kind: kind.to_owned(), target: target.to_owned(), name, owner, messages, attachments }
+        }
+        fn collect_rows<I>(rows: I, id_selected: &dyn Fn(&str) -> bool, include_kind: &dyn Fn(&str, Option<&str>) -> bool,
+            selected: Option<&std::collections::HashSet<&str>>, found_selected: &mut std::collections::HashSet<String>)
+            -> Result<(Vec<ArchiveMessage>, Vec<ArchiveAttachmentSource>)>
+        where I: IntoIterator<Item = rusqlite::Result<(ArchiveMessage, ArchiveAttachmentSource)>> {
+            let mut messages = Vec::new();
+            let mut attachments = Vec::new();
+            for row in rows {
+                let (message, attachment) = row?;
+                if !id_selected(&message.id) { continue; }
+                found_selected.insert(message.id.clone());
+                if !include_kind(&message.kind, message.file_name.as_deref()) { continue; }
+                if message.kind == "file" {
+                    if attachment.status.as_deref() != Some("completed")
+                        || attachment.transferred != attachment.total
+                        || attachment.path.as_deref().is_none_or(str::is_empty)
+                        || attachment.file_size != message.file_size
+                        || attachment.file_sha256 != message.file_sha256 {
+                        return Err(rusqlite::Error::InvalidQuery);
+                    }
+                    attachments.push(attachment);
+                }
+                if messages.len() >= 50_000 { return Err(rusqlite::Error::InvalidQuery); }
+                messages.push(message);
+            }
+            if selected.is_some_and(|ids| ids.len() != found_selected.len()) {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            Ok((messages, attachments))
+        }
+        fn row_archive_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<(ArchiveMessage, ArchiveAttachmentSource)> {
+            let id: String = row.get(0)?;
+            let direction: Option<String> = row.get(9)?;
+            let source_path: Option<String> = row.get(10)?;
+            let target_path: Option<String> = row.get(11)?;
+            let attachment = ArchiveAttachmentSource {
+                message_id: id.clone(),
+                path: match direction.as_deref() {
+                    Some("outgoing") => source_path,
+                    Some("incoming") => target_path,
+                    _ => None,
+                },
+                direction,
+                file_name: row.get(6)?,
+                file_size: row.get(7)?,
+                file_sha256: row.get(8)?,
+                status: row.get(12)?,
+                transferred: row.get(13)?,
+                total: row.get(14)?,
+            };
+            Ok((ArchiveMessage {
+                id, sender: row.get(1)?, body: row.get(2)?, created_at: row.get(3)?, logical: row.get(4)?,
+                kind: row.get(5)?, file_name: row.get(6)?, file_size: row.get(7)?, file_sha256: row.get(8)?,
+            }, attachment))
         }
         match kind {
             "self" => {
                 let sql = format!(
-                    "SELECT id, sender, body, created_at, logical FROM local_messages
-                     WHERE conversation_id = 'self'{} ORDER BY logical, sender, id LIMIT 50000", time_clause(since, until));
+                    "SELECT id, sender, body, created_at, logical, 'text', NULL, NULL, NULL,
+                            NULL, NULL, NULL, NULL, NULL, NULL FROM local_messages
+                     WHERE conversation_id = 'self'{} ORDER BY logical, sender, id", time_clause(since, until));
                 let mut statement = self.connection.prepare(&sql)?;
-                let rows = statement.query_map(rusqlite::params_from_iter(time_params(since, until)), row_message)?;
-                let messages = rows.collect::<Result<Vec<_>>>()?;
-                Ok(named("self", "self", "自己".into(), None, messages))
+                let rows = statement.query_map(rusqlite::params_from_iter(time_params(since, until)), row_archive_message)?;
+                let (messages, attachments) = collect_rows(rows, &id_selected, &include_kind, selected.as_ref(), &mut found_selected)?;
+                Ok(named("self", "self", "自己".into(), None, messages, attachments))
             }
             "direct" => {
                 if !valid_fingerprint(target) { return Err(rusqlite::Error::InvalidQuery); }
@@ -3459,13 +3620,16 @@ impl Store {
                     "SELECT COALESCE(NULLIF(trim(COALESCE(remark, '')), ''), display_name) FROM contacts WHERE fingerprint = ?1",
                     [target], |row| row.get(0))?;
                 let sql = format!(
-                    "SELECT id, sender, body, created_at, logical FROM direct_messages
-                     WHERE peer = ?1 AND kind = 'text'{} ORDER BY logical, sender, id LIMIT 50000", time_clause(since, until));
+                    "SELECT m.id, m.sender, m.body, m.created_at, m.logical, COALESCE(m.kind, 'text'),
+                            m.file_name, m.file_size, m.file_sha256, t.direction, t.source_path, t.target_path,
+                            t.status, t.transferred, t.total
+                     FROM direct_messages m LEFT JOIN file_transfers t ON t.message_id = m.id
+                     WHERE m.peer = ?1{} ORDER BY m.logical, m.sender, m.id", time_clause(since, until));
                 let mut statement = self.connection.prepare(&sql)?;
                 let bound = [target.to_string()].into_iter().chain(time_params(since, until)).collect::<Vec<_>>();
-                let rows = statement.query_map(rusqlite::params_from_iter(bound.iter()), row_message)?;
-                let messages = rows.collect::<Result<Vec<_>>>()?;
-                Ok(named("direct", target, name, None, messages))
+                let rows = statement.query_map(rusqlite::params_from_iter(bound.iter()), row_archive_message)?;
+                let (messages, attachments) = collect_rows(rows, &id_selected, &include_kind, selected.as_ref(), &mut found_selected)?;
+                Ok(named("direct", target, name, None, messages, attachments))
             }
             "group" => {
                 if !valid_group_id(target) { return Err(rusqlite::Error::InvalidQuery); }
@@ -3475,13 +3639,16 @@ impl Store {
                     |row| Ok((row.get(0)?, row.get(1)?))).optional()?;
                 let Some((name, owner)) = info else { return Err(rusqlite::Error::InvalidQuery); };
                 let sql = format!(
-                    "SELECT id, sender, body, created_at, logical FROM group_messages
-                     WHERE group_id = ?1 AND kind = 'text'{} ORDER BY logical, sender, id LIMIT 50000", time_clause(since, until));
+                    "SELECT m.id, m.sender, m.body, m.created_at, m.logical, COALESCE(m.kind, 'text'),
+                            m.file_name, m.file_size, m.file_sha256, t.direction, t.source_path, t.target_path,
+                            t.status, t.transferred, t.total
+                     FROM group_messages m LEFT JOIN group_file_transfers t ON t.message_id = m.id
+                     WHERE m.group_id = ?1{} ORDER BY m.logical, m.sender, m.id", time_clause(since, until));
                 let mut statement = self.connection.prepare(&sql)?;
                 let bound = [target.to_string()].into_iter().chain(time_params(since, until)).collect::<Vec<_>>();
-                let rows = statement.query_map(rusqlite::params_from_iter(bound.iter()), row_message)?;
-                let messages = rows.collect::<Result<Vec<_>>>()?;
-                Ok(named("group", target, name, Some(owner), messages))
+                let rows = statement.query_map(rusqlite::params_from_iter(bound.iter()), row_archive_message)?;
+                let (messages, attachments) = collect_rows(rows, &id_selected, &include_kind, selected.as_ref(), &mut found_selected)?;
+                Ok(named("group", target, name, Some(owner), messages, attachments))
             }
             _ => Err(rusqlite::Error::InvalidQuery),
         }
@@ -3511,102 +3678,249 @@ impl Store {
     }
 
 
-    /// Merges archived text messages into the local history. Existing ids are compared
-    /// so identical rows are skipped and different content is reported, never overwritten.
+    /// Imports a legacy text-only archive. Format-2 archives use the attachment-aware entry point.
     pub fn archive_import(&self, kind: &str, target: &str, self_id: &str, messages: &[ArchiveMessage], now: i64) -> Result<ArchiveImportReport> {
-        if !valid_fingerprint(self_id) || messages.len() > 50_000 { return Err(rusqlite::Error::InvalidQuery); }
+        self.archive_import_with_attachments(kind, target, self_id, messages, &[], now)
+    }
+
+    /// Merges a chat archive without overwriting conflicting message ids. File bytes are
+    /// verified before any message is applied and stored under the managed attachment directory.
+    pub fn archive_import_with_attachments(&self, kind: &str, target: &str, self_id: &str, messages: &[ArchiveMessage],
+        attachment_data: &[(String, Vec<u8>)], now: i64) -> Result<ArchiveImportReport> {
+        if !valid_fingerprint(self_id) || messages.len() > 50_000 || attachment_data.len() > 50_000 {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        let attachments: std::collections::HashMap<&str, &[u8]> = attachment_data.iter()
+            .map(|(id, bytes)| (id.as_str(), bytes.as_slice())).collect();
+        if attachments.len() != attachment_data.len() { return Err(rusqlite::Error::InvalidQuery); }
+        let mut seen_messages = std::collections::HashSet::new();
+        let mut expected_attachments = std::collections::HashSet::new();
+        let mut total_attachment_bytes = 0u64;
         for message in messages {
             if !valid_message_id(&message.id) || !valid_fingerprint(&message.sender)
-                || message.body.is_empty() || message.body.len() > 32768 || message.logical <= 0 {
+                || message.body.is_empty() || message.body.len() > 32768 || message.logical <= 0
+                || !seen_messages.insert(message.id.as_str()) {
                 return Err(rusqlite::Error::InvalidQuery);
             }
+            match message.kind.as_str() {
+                "text" if message.file_name.is_none() && message.file_size.is_none() && message.file_sha256.is_none() => {
+                    if attachments.contains_key(message.id.as_str()) { return Err(rusqlite::Error::InvalidQuery); }
+                }
+                "file" if kind != "self" => {
+                    let name = message.file_name.as_deref().ok_or(rusqlite::Error::InvalidQuery)?;
+                    if crate::files::sanitize_name(name).as_deref() != Some(name) { return Err(rusqlite::Error::InvalidQuery); }
+                    let size = message.file_size.filter(|size| *size > 0 && *size as u64 <= crate::protocol::MAX_FILE_BYTES)
+                        .ok_or(rusqlite::Error::InvalidQuery)? as u64;
+                    let hash = message.file_sha256.as_deref().filter(|hash| valid_sha256(hash))
+                        .ok_or(rusqlite::Error::InvalidQuery)?;
+                    let bytes = attachments.get(message.id.as_str()).ok_or(rusqlite::Error::InvalidQuery)?;
+                    if bytes.len() as u64 != size || !archive_sha256_matches(bytes, hash) { return Err(rusqlite::Error::InvalidQuery); }
+                    total_attachment_bytes = total_attachment_bytes.saturating_add(size);
+                    if total_attachment_bytes > 512 * 1024 * 1024 { return Err(rusqlite::Error::InvalidQuery); }
+                    expected_attachments.insert(message.id.as_str());
+                }
+                _ => return Err(rusqlite::Error::InvalidQuery),
+            }
         }
-        let mut report = ArchiveImportReport { kind: kind.to_owned(), name: String::new(), inserted: 0, skipped: 0, conflicts: 0 };
-        let tx = self.connection.unchecked_transaction()?;
-        let mut max_logical: i64 = 0;
-        match kind {
-            "self" => {
-                let exists: bool = tx.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM conversations WHERE id = 'self')", [], |row| row.get(0))?;
-                if !exists { return Err(rusqlite::Error::InvalidQuery); }
-                report.name = "自己".into();
-                for message in messages {
-                    match existing_text(&tx, "local_messages", &message.id)? {
-                        Some(existing) if existing == (message.body.clone(), message.sender.clone(), message.logical) => {
-                            report.skipped += 1; continue;
-                        }
-                        Some(_) => { report.conflicts += 1; continue; }
-                        None => {}
-                    }
-                    tx.execute(
-                        "INSERT INTO local_messages(id, conversation_id, sender, body, created_at, logical)
-                         VALUES (?1, 'self', ?2, ?3, ?4, ?5)",
-                        params![message.id, message.sender, message.body, message.created_at, message.logical])?;
-                    report.inserted += 1;
-                    max_logical = max_logical.max(message.logical);
-                }
-            }
-            "direct" => {
-                if !valid_fingerprint(target) { return Err(rusqlite::Error::InvalidQuery); }
-                let verified: bool = tx.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM contacts WHERE fingerprint = ?1 AND trust_state = 'verified')",
-                    [target], |row| row.get(0))?;
-                if !verified { return Err(rusqlite::Error::InvalidQuery); }
-                report.name = tx.query_row(
-                    "SELECT COALESCE(NULLIF(trim(COALESCE(remark, '')), ''), display_name) FROM contacts WHERE fingerprint = ?1",
-                    [target], |row| row.get(0))?;
-                tx.execute("INSERT INTO direct_conversations(peer, hidden) VALUES (?1, 0) ON CONFLICT(peer) DO NOTHING", [target])?;
-                for message in messages {
-                    match existing_text(&tx, "direct_messages", &message.id)? {
-                        Some(existing) if existing == (message.body.clone(), message.sender.clone(), message.logical) => {
-                            report.skipped += 1; continue;
-                        }
-                        Some(_) => { report.conflicts += 1; continue; }
-                        None => {}
-                    }
-                    let status = if message.sender == self_id { "delivered" } else { "received" };
-                    tx.execute(
-                        "INSERT INTO direct_messages(id, peer, sender, body, created_at, logical, status, kind)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'text')",
-                        params![message.id, target, message.sender, message.body, message.created_at, message.logical, status])?;
-                    report.inserted += 1;
-                    max_logical = max_logical.max(message.logical);
-                }
-            }
-            "group" => {
-                if !valid_group_id(target) { return Err(rusqlite::Error::InvalidQuery); }
-                let info: Option<String> = tx.query_row(
-                    "SELECT g.name FROM groups g JOIN group_members m ON m.group_id = g.id
-                     WHERE g.id = ?1 AND m.member = ?2 AND m.active = 1", params![target, self_id],
-                    |row| row.get(0)).optional()?;
-                let Some(name) = info else { return Err(rusqlite::Error::InvalidQuery); };
-                report.name = name;
-                for message in messages {
-                    match existing_text(&tx, "group_messages", &message.id)? {
-                        Some(existing) if existing == (message.body.clone(), message.sender.clone(), message.logical) => {
-                            report.skipped += 1; continue;
-                        }
-                        Some(_) => { report.conflicts += 1; continue; }
-                        None => {}
-                    }
-                    tx.execute(
-                        "INSERT INTO group_messages(id, group_id, sender, body, created_at, logical, mentions, kind)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, '[]', 'text')",
-                        params![message.id, target, message.sender, message.body, message.created_at, message.logical])?;
-                    report.inserted += 1;
-                    max_logical = max_logical.max(message.logical);
-                }
-                tx.execute("UPDATE group_members SET hidden = 0 WHERE group_id = ?1 AND member = ?2", params![target, self_id])?;
-            }
-            _ => return Err(rusqlite::Error::InvalidQuery),
+        if expected_attachments.len() != attachments.len() || attachments.keys().any(|id| !expected_attachments.contains(id)) {
+            return Err(rusqlite::Error::InvalidQuery);
         }
-        if max_logical > 0 {
+
+        let mut created_files = Vec::new();
+        let outcome = (|| -> Result<ArchiveImportReport> {
+            let tx = self.connection.unchecked_transaction()?;
+            let mut report = ArchiveImportReport {
+                kind: kind.to_owned(), name: String::new(), inserted: 0, skipped: 0, conflicts: 0, restored_attachments: 0,
+            };
+            let mut max_logical: i64 = 0;
+            match kind {
+                "self" => {
+                    let exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM conversations WHERE id = 'self')", [], |row| row.get(0))?;
+                    if !exists { return Err(rusqlite::Error::InvalidQuery); }
+                    report.name = "自己".into();
+                    for message in messages {
+                        match existing_text(&tx, "local_messages", &message.id)? {
+                            Some(existing) if existing == (message.body.clone(), message.sender.clone(), message.logical) => {
+                                report.skipped += 1; continue;
+                            }
+                            Some(_) => { report.conflicts += 1; continue; }
+                            None => {}
+                        }
+                        tx.execute(
+                            "INSERT INTO local_messages(id, conversation_id, sender, body, created_at, logical)
+                             VALUES (?1, 'self', ?2, ?3, ?4, ?5)",
+                            params![message.id, message.sender, message.body, message.created_at, message.logical])?;
+                        report.inserted += 1;
+                        max_logical = max_logical.max(message.logical);
+                    }
+                }
+                "direct" => {
+                    if !valid_fingerprint(target) { return Err(rusqlite::Error::InvalidQuery); }
+                    let verified: bool = tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM contacts WHERE fingerprint = ?1 AND trust_state = 'verified')",
+                        [target], |row| row.get(0))?;
+                    if !verified { return Err(rusqlite::Error::InvalidQuery); }
+                    report.name = tx.query_row(
+                        "SELECT COALESCE(NULLIF(trim(COALESCE(remark, '')), ''), display_name) FROM contacts WHERE fingerprint = ?1",
+                        [target], |row| row.get(0))?;
+                    tx.execute("INSERT INTO direct_conversations(peer, hidden) VALUES (?1, 0) ON CONFLICT(peer) DO NOTHING", [target])?;
+                    for message in messages {
+                        let existing = existing_archive_message(&tx, "direct_messages", &message.id)?;
+                        if let Some(old) = existing {
+                            let same = old.0 == message.body && old.1 == message.sender && old.2 == message.logical
+                                && old.3 == message.kind && old.4 == message.file_name && old.5 == message.file_size && old.6 == message.file_sha256;
+                            if !same { report.conflicts += 1; continue; }
+                            if message.kind == "file" && !self.archive_attachment_is_valid(&tx, "direct", &message.id,
+                                message.file_size.unwrap_or_default(), message.file_sha256.as_deref().unwrap_or_default())? {
+                                let path = self.persist_archive_attachment(&message.id, message.file_name.as_deref().unwrap_or("file"),
+                                    attachments[message.id.as_str()], &mut created_files)?;
+                                self.upsert_archive_transfer(&tx, "direct", target, message, &path, self_id, now)?;
+                                report.restored_attachments += 1;
+                            }
+                            report.skipped += 1;
+                            continue;
+                        }
+                        let status = if message.sender == self_id { "delivered" } else { "received" };
+                        if message.kind == "file" {
+                            let path = self.persist_archive_attachment(&message.id, message.file_name.as_deref().unwrap_or("file"),
+                                attachments[message.id.as_str()], &mut created_files)?;
+                            tx.execute(
+                                "INSERT INTO direct_messages(id, peer, sender, body, created_at, logical, status, kind, file_name, file_size, file_sha256)
+                                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'file', ?8, ?9, ?10)",
+                                params![message.id, target, message.sender, message.body, message.created_at, message.logical, status,
+                                    message.file_name, message.file_size, message.file_sha256])?;
+                            self.upsert_archive_transfer(&tx, "direct", target, message, &path, self_id, now)?;
+                            report.restored_attachments += 1;
+                        } else {
+                            tx.execute(
+                                "INSERT INTO direct_messages(id, peer, sender, body, created_at, logical, status, kind)
+                                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'text')",
+                                params![message.id, target, message.sender, message.body, message.created_at, message.logical, status])?;
+                        }
+                        report.inserted += 1;
+                        max_logical = max_logical.max(message.logical);
+                    }
+                }
+                "group" => {
+                    if !valid_group_id(target) { return Err(rusqlite::Error::InvalidQuery); }
+                    let info: Option<String> = tx.query_row(
+                        "SELECT g.name FROM groups g JOIN group_members m ON m.group_id = g.id
+                         WHERE g.id = ?1 AND m.member = ?2 AND m.active = 1", params![target, self_id], |row| row.get(0)).optional()?;
+                    let Some(name) = info else { return Err(rusqlite::Error::InvalidQuery); };
+                    report.name = name;
+                    for message in messages {
+                        let existing = existing_archive_message(&tx, "group_messages", &message.id)?;
+                        if let Some(old) = existing {
+                            let same = old.0 == message.body && old.1 == message.sender && old.2 == message.logical
+                                && old.3 == message.kind && old.4 == message.file_name && old.5 == message.file_size && old.6 == message.file_sha256;
+                            if !same { report.conflicts += 1; continue; }
+                            if message.kind == "file" && !self.archive_attachment_is_valid(&tx, "group", &message.id,
+                                message.file_size.unwrap_or_default(), message.file_sha256.as_deref().unwrap_or_default())? {
+                                let path = self.persist_archive_attachment(&message.id, message.file_name.as_deref().unwrap_or("file"),
+                                    attachments[message.id.as_str()], &mut created_files)?;
+                                self.upsert_archive_transfer(&tx, "group", target, message, &path, self_id, now)?;
+                                report.restored_attachments += 1;
+                            }
+                            report.skipped += 1;
+                            continue;
+                        }
+                        if message.kind == "file" {
+                            let path = self.persist_archive_attachment(&message.id, message.file_name.as_deref().unwrap_or("file"),
+                                attachments[message.id.as_str()], &mut created_files)?;
+                            tx.execute(
+                                "INSERT INTO group_messages(id, group_id, sender, body, created_at, logical, mentions, kind, file_name, file_size, file_sha256)
+                                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, '[]', 'file', ?7, ?8, ?9)",
+                                params![message.id, target, message.sender, message.body, message.created_at, message.logical,
+                                    message.file_name, message.file_size, message.file_sha256])?;
+                            self.upsert_archive_transfer(&tx, "group", target, message, &path, self_id, now)?;
+                            report.restored_attachments += 1;
+                        } else {
+                            tx.execute(
+                                "INSERT INTO group_messages(id, group_id, sender, body, created_at, logical, mentions, kind)
+                                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, '[]', 'text')",
+                                params![message.id, target, message.sender, message.body, message.created_at, message.logical])?;
+                        }
+                        report.inserted += 1;
+                        max_logical = max_logical.max(message.logical);
+                    }
+                    tx.execute("UPDATE group_members SET hidden = 0 WHERE group_id = ?1 AND member = ?2", params![target, self_id])?;
+                }
+                _ => return Err(rusqlite::Error::InvalidQuery),
+            }
+            if max_logical > 0 {
+                tx.execute("UPDATE logical_clock SET value = ?2 WHERE singleton = 1 AND value < ?2", params![now.min(0), max_logical])?;
+            }
+            tx.commit()?;
+            Ok(report)
+        })();
+        if outcome.is_err() {
+            for path in created_files { let _ = std::fs::remove_file(path); }
+        }
+        outcome
+    }
+
+    fn archive_attachment_is_valid(&self, tx: &rusqlite::Transaction<'_>, kind: &str, id: &str, size: i64, hash: &str) -> Result<bool> {
+        let transfer: Option<(String, Option<String>, Option<String>, String, i64, i64)> = match kind {
+            "direct" => tx.query_row("SELECT direction, source_path, target_path, status, transferred, total FROM file_transfers WHERE message_id = ?1",
+                [id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?))).optional()?,
+            "group" => tx.query_row("SELECT direction, source_path, target_path, status, transferred, total FROM group_file_transfers WHERE message_id = ?1",
+                [id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?))).optional()?,
+            _ => return Ok(false),
+        };
+        let Some((direction, source, target, status, transferred, total)) = transfer else { return Ok(false); };
+        if status != "completed" || transferred != total || total != size { return Ok(false); }
+        let path = match direction.as_str() { "outgoing" => source, "incoming" => target, _ => None };
+        let Some(path) = path else { return Ok(false); };
+        let Ok(data) = std::fs::read(path) else { return Ok(false); };
+        Ok(data.len() as i64 == size && archive_sha256_matches(&data, hash))
+    }
+
+    fn persist_archive_attachment(&self, id: &str, name: &str, data: &[u8], created: &mut Vec<PathBuf>) -> Result<String> {
+        use std::io::Write;
+        let clean = crate::files::sanitize_name(name).ok_or(rusqlite::Error::InvalidQuery)?;
+        let directory = self.attachments_dir().join("chat-archives");
+        std::fs::create_dir_all(&directory).map_err(|_| rusqlite::Error::InvalidQuery)?;
+        for suffix in 0..1000u32 {
+            let path = directory.join(format!("{id}-{suffix}-{clean}"));
+            let file = std::fs::OpenOptions::new().write(true).create_new(true).open(&path);
+            match file {
+                Ok(mut file) => {
+                    created.push(path.clone());
+                    file.write_all(data).map_err(|_| rusqlite::Error::InvalidQuery)?;
+                    return Ok(path.to_string_lossy().into_owned());
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(_) => return Err(rusqlite::Error::InvalidQuery),
+            }
+        }
+        Err(rusqlite::Error::InvalidQuery)
+    }
+
+    fn upsert_archive_transfer(&self, tx: &rusqlite::Transaction<'_>, kind: &str, conversation_id: &str,
+        message: &ArchiveMessage, path: &str, self_id: &str, now: i64) -> Result<()> {
+        let size = message.file_size.ok_or(rusqlite::Error::InvalidQuery)?;
+        if kind == "direct" {
+            let direction = if message.sender == self_id { "outgoing" } else { "incoming" };
             tx.execute(
-                "UPDATE logical_clock SET value = ?2 WHERE singleton = 1 AND value < ?2",
-                params![now.min(0), max_logical])?;
-        }
-        tx.commit()?;
-        Ok(report)
+                "INSERT INTO file_transfers(message_id, peer, direction, source_path, target_path, total, transferred, status, error, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, 'completed', NULL, ?7)
+                 ON CONFLICT(message_id) DO UPDATE SET peer=excluded.peer, direction=excluded.direction,
+                    source_path=excluded.source_path, target_path=excluded.target_path, total=excluded.total,
+                    transferred=excluded.transferred, status='completed', error=NULL, updated_at=excluded.updated_at",
+                params![message.id, conversation_id, direction, if direction == "outgoing" { Some(path) } else { None },
+                    if direction == "incoming" { Some(path) } else { None }, size, now])?;
+        } else if kind == "group" {
+            let direction = if message.sender == self_id { "outgoing" } else { "incoming" };
+            tx.execute(
+                "INSERT INTO group_file_transfers(message_id, group_id, peer, direction, source_path, target_path, total, transferred, status, error, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, 'completed', NULL, ?8)
+                 ON CONFLICT(message_id) DO UPDATE SET group_id=excluded.group_id, peer=excluded.peer, direction=excluded.direction,
+                    source_path=excluded.source_path, target_path=excluded.target_path, total=excluded.total,
+                    transferred=excluded.transferred, status='completed', error=NULL, updated_at=excluded.updated_at",
+                params![message.id, conversation_id, message.sender, direction, if direction == "outgoing" { Some(path) } else { None },
+                    if direction == "incoming" { Some(path) } else { None }, size, now])?;
+        } else { return Err(rusqlite::Error::InvalidQuery); }
+        Ok(())
     }
 
     pub fn register_plugin(&self, id: &str, name: &str, version: &str, now: i64) -> Result<()> {
@@ -4291,14 +4605,22 @@ fn parse_mentions(value: &str) -> Vec<String> {
     serde_json::from_str::<Vec<String>>(value).unwrap_or_default()
 }
 
-fn row_message(row: &rusqlite::Row<'_>) -> Result<ArchiveMessage> {
-    Ok(ArchiveMessage { id: row.get(0)?, sender: row.get(1)?, body: row.get(2)?, created_at: row.get(3)?, logical: row.get(4)? })
-}
-
 /// Body/sender/logical of an existing message id, used to detect identical archived rows.
 fn existing_text(tx: &rusqlite::Transaction<'_>, table: &str, id: &str) -> Result<Option<(String, String, i64)>> {
     let sql = format!("SELECT body, sender, logical FROM {table} WHERE id = ?1");
     tx.query_row(&sql, [id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).optional()
+}
+
+fn existing_archive_message(tx: &rusqlite::Transaction<'_>, table: &str, id: &str)
+    -> Result<Option<(String, String, i64, String, Option<String>, Option<i64>, Option<String>)>> {
+    let sql = format!("SELECT body, sender, logical, COALESCE(kind, 'text'), file_name, file_size, file_sha256 FROM {table} WHERE id = ?1");
+    tx.query_row(&sql, [id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?))).optional()
+}
+
+fn archive_sha256_matches(data: &[u8], expected: &str) -> bool {
+    use sha2::Digest;
+    let actual = sha2::Sha256::digest(data).iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+    actual == expected
 }
 
 /// LIKE pattern with the escape character protected, so `%` and `_` stay literal.
@@ -4331,6 +4653,12 @@ fn map_message(row: &rusqlite::Row<'_>) -> Result<DirectMessage> {
 
 fn valid_sha256(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+fn is_image_file(name: &str) -> bool {
+    Path::new(name).extension().and_then(|extension| extension.to_str())
+        .is_some_and(|extension| matches!(extension.to_ascii_lowercase().as_str(),
+            "avif" | "bmp" | "gif" | "heic" | "heif" | "jpeg" | "jpg" | "png" | "tif" | "tiff" | "webp"))
 }
 
 fn valid_message_id(value: &str) -> bool {
@@ -4381,6 +4709,53 @@ mod tests {
 
     fn memory_store() -> Store {
         Store::initialize(Connection::open_in_memory().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn archive_export_filters_text_images_and_other_files_and_validates_selection() {
+        let store = memory_store();
+        let self_id = "a".repeat(64);
+        let peer = "b".repeat(64);
+        store.add_candidate(&peer, "Bob").unwrap();
+        store.confirm_candidate(&peer).unwrap();
+        assert!(store.save_outgoing("text-1", &peer, "hello", 1).unwrap());
+        let image = store.queue_direct_file(&self_id, &peer, "photo.PNG", 3, &"c".repeat(64), Path::new("photo.png"), 2).unwrap();
+        let document = store.queue_direct_file(&self_id, &peer, "notes.txt", 4, &"d".repeat(64), Path::new("notes.txt"), 3).unwrap();
+        store.complete_file_transfer(&image.id, 4).unwrap();
+        store.complete_file_transfer(&document.id, 5).unwrap();
+
+        let text_and_documents = store.archive_export_with_options("direct", &peer, &self_id, 0, 0, None, true, false, true).unwrap();
+        assert_eq!(text_and_documents.messages.iter().map(|message| message.id.as_str()).collect::<Vec<_>>(), vec!["text-1", document.id.as_str()]);
+        assert_eq!(text_and_documents.attachments.len(), 1);
+        assert_eq!(text_and_documents.attachments[0].message_id, document.id);
+
+        let images_only = store.archive_export_with_options("direct", &peer, &self_id, 0, 0, None, false, true, false).unwrap();
+        assert_eq!(images_only.messages.len(), 1);
+        assert_eq!(images_only.messages[0].id, image.id);
+        assert_eq!(images_only.attachments[0].file_name.as_deref(), Some("photo.PNG"));
+
+        let selected = vec!["text-1".to_owned()];
+        let selected_export = store.archive_export_with_options("direct", &peer, &self_id, 0, 0, Some(&selected), true, true, true).unwrap();
+        assert_eq!(selected_export.messages.len(), 1);
+        assert_eq!(selected_export.messages[0].id, "text-1");
+        assert!(selected_export.attachments.is_empty());
+
+        let unknown = vec!["missing-message".to_owned()];
+        assert!(store.archive_export_with_options("direct", &peer, &self_id, 0, 0, Some(&unknown), true, true, true).is_err());
+        let duplicate = vec!["text-1".to_owned(), "text-1".to_owned()];
+        assert!(store.archive_export_with_options("direct", &peer, &self_id, 0, 0, Some(&duplicate), true, true, true).is_err());
+    }
+
+    #[test]
+    fn archive_export_refuses_selected_incomplete_attachments() {
+        let store = memory_store();
+        let self_id = "a".repeat(64);
+        let peer = "b".repeat(64);
+        store.add_candidate(&peer, "Bob").unwrap();
+        store.confirm_candidate(&peer).unwrap();
+        let file = store.queue_direct_file(&self_id, &peer, "pending.bin", 4, &"e".repeat(64), Path::new("pending.bin"), 1).unwrap();
+        let selected = vec![file.id];
+        assert!(store.archive_export_with_options("direct", &peer, &self_id, 0, 0, Some(&selected), true, true, true).is_err());
     }
 
     #[test]
@@ -5570,30 +5945,98 @@ mod tests {
         let (group_id, _, _) = group_with_two_members(&store, &me);
         store.queue_group(&me, &group_id, "群聊 里程碑", None, &[], 13).unwrap();
 
-        let hits = store.search_all(&me, "里程碑", "all", 100).unwrap();
+        let hits = store.search_all(&me, "里程碑", "all", None, None, 100, 0).unwrap();
         assert_eq!(hits.len(), 4);
         assert!(hits.iter().any(|hit| hit.conversation_kind == "self"));
         assert!(hits.iter().any(|hit| hit.conversation_kind == "direct" && hit.conversation_name == "Bob"));
         assert!(hits.iter().any(|hit| hit.conversation_kind == "group" && hit.conversation_name == "Team"));
         assert_eq!(hits[0].created_at, 13);
-        assert!(store.search_all(&me, "里程碑", "file", 100).unwrap().is_empty());
-        assert!(store.search_all(&me, "missing", "all", 100).unwrap().is_empty());
-        assert!(store.search_all(&me, "", "text", 100).unwrap().len() >= 4);
-        assert!(store.search_all(&me, "x", "all", 0).is_err());
-        assert!(store.search_all("bad", "x", "all", 10).is_err());
+        assert!(store.search_all(&me, "里程碑", "file", None, None, 100, 0).unwrap().is_empty());
+        assert!(store.search_all(&me, "missing", "all", None, None, 100, 0).unwrap().is_empty());
+        assert!(store.search_all(&me, "", "text", None, None, 100, 0).unwrap().len() >= 4);
+        assert!(store.search_all(&me, "x", "all", None, None, 0, 0).is_err());
+        assert!(store.search_all("bad", "x", "all", None, None, 10, 0).is_err());
 
-        let direct = store.export_conversation(&me, "direct", &peer).unwrap();
-        assert_eq!(direct.conversation_name, "Bob");
-        assert_eq!(direct.message_count, 2);
-        assert!(direct.text.contains("里程碑") && direct.text.contains("我：单聊 里程碑"));
-        let own = store.export_conversation(&me, "self", "self").unwrap();
-        assert_eq!(own.message_count, 1);
-        let group = store.export_conversation(&me, "group", &group_id).unwrap();
-        assert_eq!(group.conversation_name, "Team");
-        assert_eq!(group.message_count, 1);
-        assert!(store.export_conversation(&me, "group", &"f".repeat(32)).is_err());
-        assert!(store.export_conversation(&me, "direct", &"d".repeat(64)).is_err());
-        assert!(store.export_conversation(&me, "unknown", "self").is_err());
+    }
+
+    #[test]
+    fn global_search_filters_conversations_and_paginates_without_duplicates() {
+        let store = memory_store();
+        let me = "a".repeat(64);
+        let peer = "b".repeat(64);
+        let other = "c".repeat(64);
+        for (fingerprint, name) in [(&peer, "Bob"), (&other, "Cara")] {
+            store.add_candidate(fingerprint, name).unwrap();
+            store.confirm_candidate(fingerprint).unwrap();
+        }
+        store.queue_direct(&me, &peer, "scope-mark one", 1).unwrap();
+        store.queue_direct(&me, &peer, "scope-mark two", 2).unwrap();
+        store.queue_direct(&me, &other, "scope-mark other", 3).unwrap();
+        store.send_self(&me, "scope-mark self", 4).unwrap();
+        let (group_id, _, _) = group_with_two_members(&store, &me);
+        store.queue_group(&me, &group_id, "scope-mark group", None, &[], 5).unwrap();
+
+        let first = store.search_all(&me, "scope-mark", "all", None, None, 2, 0).unwrap();
+        let second = store.search_all(&me, "scope-mark", "all", None, None, 2, 2).unwrap();
+        let third = store.search_all(&me, "scope-mark", "all", None, None, 2, 4).unwrap();
+        let ids: std::collections::HashSet<_> = first.iter().chain(&second).chain(&third)
+            .map(|hit| hit.message_id.as_str()).collect();
+        assert_eq!((first.len(), second.len(), third.len(), ids.len()), (2, 2, 1, 5));
+
+        let direct = store.search_all(&me, "scope-mark", "all", Some("direct"), Some(&peer), 100, 0).unwrap();
+        assert_eq!(direct.len(), 2);
+        assert!(direct.iter().all(|hit| hit.conversation_id == peer));
+        let other_direct = store.search_all(&me, "scope-mark", "all", Some("direct"), Some(&other), 100, 0).unwrap();
+        assert_eq!(other_direct.len(), 1);
+        let own = store.search_all(&me, "scope-mark", "all", Some("self"), Some("self"), 100, 0).unwrap();
+        assert_eq!(own.len(), 1);
+        let group = store.search_all(&me, "scope-mark", "all", Some("group"), Some(&group_id), 100, 0).unwrap();
+        assert_eq!(group.len(), 1);
+        assert!(store.search_all(&me, "scope-mark", "all", Some("direct"), Some(&"d".repeat(64)), 100, 0).is_err());
+        assert!(store.search_all(&me, "scope-mark", "all", Some("self"), Some(&peer), 100, 0).is_err());
+        assert!(store.search_all(&me, "scope-mark", "all", None, None, 2, 100_001).is_err());
+    }
+
+    #[test]
+    fn record_history_search_filters_dates_types_and_paginates_with_access_checks() {
+        let store = memory_store();
+        let me = "a".repeat(64);
+        let peer = "b".repeat(64);
+        store.add_candidate(&peer, "Bob").unwrap();
+        store.confirm_candidate(&peer).unwrap();
+        store.queue_direct(&me, &peer, "window direct one", 10).unwrap();
+        store.queue_direct(&me, &peer, "window direct two", 20).unwrap();
+        store.queue_direct(&me, &peer, "window direct three", 30).unwrap();
+        store.queue_direct_file(&me, &peer, "photo.PNG", 3, &"c".repeat(64), Path::new("photo.png"), 40).unwrap();
+        store.queue_direct_file(&me, &peer, "notes.txt", 4, &"d".repeat(64), Path::new("notes.txt"), 50).unwrap();
+
+        let first = store.search_chat_history("direct", &peer, &me, "window", "all", None, None, "[recalled]", 2, 0).unwrap();
+        let second = store.search_chat_history("direct", &peer, &me, "window", "all", None, None, "[recalled]", 2, 2).unwrap();
+        assert_eq!(first.iter().map(|hit| hit.created_at).collect::<Vec<_>>(), vec![30, 20]);
+        assert_eq!(second.iter().map(|hit| hit.created_at).collect::<Vec<_>>(), vec![10]);
+        let dated = store.search_chat_history("direct", &peer, &me, "window", "text", Some(20), Some(20), "[recalled]", 10, 0).unwrap();
+        assert_eq!(dated.len(), 1);
+        assert_eq!(dated[0].created_at, 20);
+        let images = store.search_chat_history("direct", &peer, &me, "", "image", None, None, "[recalled]", 10, 0).unwrap();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].file_name.as_deref(), Some("photo.PNG"));
+        let files = store.search_chat_history("direct", &peer, &me, "", "file", None, None, "[recalled]", 10, 0).unwrap();
+        assert_eq!(files.len(), 2);
+
+        store.send_self(&me, "window self", 60).unwrap();
+        let self_hits = store.search_chat_history("self", "self", &me, "window", "all", Some(60), Some(60), "[recalled]", 10, 0).unwrap();
+        assert_eq!(self_hits.len(), 1);
+        let (group_id, _, _) = group_with_two_members(&store, &me);
+        store.queue_group(&me, &group_id, "window group", None, &[], 70).unwrap();
+        let group_hits = store.search_chat_history("group", &group_id, &me, "window", "all", None, None, "[recalled]", 10, 0).unwrap();
+        assert_eq!(group_hits.len(), 1);
+
+        let pending_peer = "e".repeat(64);
+        store.add_candidate(&pending_peer, "Pending").unwrap();
+        assert!(store.search_chat_history("direct", &pending_peer, &me, "", "all", None, None, "[recalled]", 10, 0).is_err());
+        store.connection.execute("UPDATE group_members SET active = 0 WHERE group_id = ?1 AND member = ?2", params![group_id, me]).unwrap();
+        assert!(store.search_chat_history("group", &group_id, &me, "", "all", None, None, "[recalled]", 10, 0).is_err());
+        assert!(store.search_chat_history("direct", &peer, &me, "", "all", Some(30), Some(20), "[recalled]", 10, 0).is_err());
     }
 
     #[test]
