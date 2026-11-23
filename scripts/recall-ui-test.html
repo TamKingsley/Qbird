@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>Qbird recall UI regression (mock data)</title>
+  <link rel="stylesheet" href="/src/style.css">
+  <style>
+    body { margin: 16px; background: #f6f4ef; }
+    .test-tools { margin-bottom: 12px; }
+    .test-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; height: 620px; }
+    .test-panel { min-width: 0; border: 1px solid #ded8ce; background: white; }
+    .test-panel .self-chat { height: 100%; }
+    #result { font-weight: bold; }
+  </style>
+</head>
+<body>
+  <div class="test-tools">
+    <h1>Recall UI regression — mock data</h1>
+    <p>Messages, identities and timestamps are generated solely for this test.</p>
+    <button id="apply-recall">Simulate remote recall</button>
+    <span id="result">Preparing…</span>
+  </div>
+  <div class="test-grid"><div id="direct" class="test-panel"></div><div id="group" class="test-panel"></div></div>
+  <script type="module">
+    globalThis.isTauri = true;
+    const now = Math.floor(Date.now() / 1000);
+    const me = 'a'.repeat(64), peer = 'b'.repeat(64), groupId = 'c'.repeat(32);
+    const common = { kind: 'text', file_name: null, file_size: null, file_sha256: null, file_status: null, file_transferred: null, file_error: null, recalled_at: null };
+    let directRows = [
+      { ...common, id: 'd-later', peer, sender: peer, body: 'Direct later', created_at: now - 60, logical: 2, status: 'received' },
+      { ...common, id: 'd-earlier', peer, sender: peer, body: 'Direct earlier', created_at: now, logical: 1, status: 'received' },
+    ];
+    let groupRows = [
+      { ...common, id: 'g-own', group_id: groupId, sender: me, sender_name: 'Me', body: 'My group message', created_at: now - 60, logical: 2, pending: 0, reply_to: null, reply_sender: null, reply_preview: null, mentions: [] },
+      { ...common, id: 'g-peer', group_id: groupId, sender: peer, sender_name: 'Bob', body: 'Group peer message', created_at: now, logical: 1, pending: 0, reply_to: null, reply_sender: null, reply_preview: null, mentions: [] },
+    ];
+    window.__TAURI_INTERNALS__ = { invoke: async (command) => {
+      if (command === 'identity_fingerprint') return me;
+      if (command === 'v1_list_direct') return structuredClone(directRows);
+      if (command === 'v1_list_group') return structuredClone(groupRows);
+      if (command === 'v1_list_group_members') return [
+        { group_id: groupId, member: me, display_name: 'Me', role: 'owner', joined_at: now, active: true },
+        { group_id: groupId, member: peer, display_name: 'Bob', role: 'member', joined_at: now, active: true },
+      ];
+      if (['v1_list_contacts', 'v1_image_batches', 'v1_file_offer_requests', 'v1_group_file_offer_requests'].includes(command)) return [];
+      if (['v1_contact_address', 'v1_group_avatar', 'v1_group_notice'].includes(command)) return null;
+      return true;
+    } };
+    const { DirectChat } = await import('/src/direct_chat.ts');
+    const { GroupChat } = await import('/src/group_chat.ts');
+    const { getLang, setLang } = await import('/src/i18n.ts');
+    const originalLang = getLang();
+    setLang('zh-CN');
+    const directRoot = document.querySelector('#direct'), groupRoot = document.querySelector('#group');
+    const direct = new DirectChat(directRoot, () => {}), group = new GroupChat(groupRoot, () => {});
+    directRoot.innerHTML = direct.view(); groupRoot.innerHTML = group.view();
+    const result = document.querySelector('#result');
+    const assert = (condition, message) => { if (!condition) throw new Error(message); };
+    try {
+      await direct.open(peer, 'Bob');
+      await group.open(groupId, 'Test group');
+      const ids = (selector) => [...document.querySelectorAll(selector)].map((el) => el.dataset.id).join(',');
+      assert(ids('#direct-messages > .message-row') === 'd-earlier,d-later', 'direct logical order');
+      assert(ids('#group-messages > .message-row') === 'g-peer,g-own', 'group logical order');
+      const menuFor = (id) => {
+        document.querySelector(`#group-messages [data-id="${id}"] .message-bubble`).dispatchEvent(new MouseEvent('contextmenu', { bubbles: true }));
+        return [...document.querySelectorAll('[role="menu"] button')];
+      };
+      assert(menuFor('g-own').some(item => item.textContent === '撤回' && !item.disabled), 'own message should be recallable');
+      assert(!menuFor('g-peer').some(item => item.textContent === '撤回' && !item.disabled), 'peer message must not be recallable');
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }));
+      result.textContent = 'PASS: ordering and group recall permissions';
+      document.querySelector('#apply-recall').addEventListener('click', async () => {
+        try {
+          setLang('en');
+          directRows = directRows.map((row) => row.id === 'd-earlier' ? { ...row, body: ' ', recalled_at: now } : row);
+          groupRows = groupRows.map((row) => row.id === 'g-peer' ? { ...row, body: ' ', recalled_at: now } : row);
+          await direct.load(); await group.load();
+          assert(document.querySelector('#direct-messages [data-id="d-earlier"] .recalled'), 'direct recall not repainted');
+          assert(document.querySelector('#group-messages [data-id="g-peer"] .recalled'), 'group recall not repainted');
+          assert(document.querySelector('#direct-messages [data-id="d-earlier"] .recalled').textContent === 'Bob recalled a message', 'direct English recall text');
+          assert(document.querySelector('#group-messages [data-id="g-peer"] .recalled').textContent === 'Bob recalled a message', 'group English recall text');
+          assert(ids('#direct-messages > .message-row') === 'd-earlier,d-later', 'direct order changed');
+          assert(ids('#group-messages > .message-row') === 'g-peer,g-own', 'group order changed');
+          result.textContent = 'PASS: ordering, permissions and remote recall refresh';
+        } catch (error) { result.textContent = `FAIL: ${error.message}`; }
+        finally { setLang(originalLang); }
+      });
+    } catch (error) { result.textContent = `FAIL: ${error.message}`; }
+  </script>
+</body>
+</html>

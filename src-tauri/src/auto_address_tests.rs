@@ -47,6 +47,35 @@ fn only_proven_verified_fingerprint_updates_address() {
 }
 
 #[test]
+fn group_member_probe_is_not_a_friend_and_stops_after_leaving() {
+    let client = Identity::load_or_create(&test_path("group-client")).unwrap();
+    let server_path = test_path("group-member");
+    let server = Identity::load_or_create(&server_path).unwrap();
+    let peer = server.fingerprint();
+    let me = client.fingerprint();
+    let owner = "a".repeat(64);
+    let group = "b".repeat(32);
+    let store = Mutex::new(Store::open(&test_path("group.sqlite")).unwrap());
+    {
+        let db = store.lock().unwrap();
+        db.add_candidate(&owner, "owner").unwrap();
+        db.confirm_candidate(&owner).unwrap();
+        db.set_auto_join_groups(true).unwrap();
+        let payload = serde_json::json!({"name":"Team", "owner":owner, "members":[owner, me, peer]}).to_string();
+        db.receive_group_control(&me, &owner, "invite", &group, &payload, 1).unwrap();
+    }
+    let stop = AtomicBool::new(false);
+    let (saved, address) = probe_one(&client, server, &store, true, &stop);
+    assert!(saved);
+    assert_eq!(store.lock().unwrap().avatar_address(&me, &peer).unwrap().as_deref(), Some(address.as_str()));
+    assert!(!store.lock().unwrap().is_verified(&peer).unwrap());
+    store.lock().unwrap().receive_group_control(&me, &owner, "remove", &group, "{}", 2).unwrap();
+    let server = Identity::load_or_create(&server_path).unwrap();
+    assert!(!probe_one(&client, server, &store, true, &stop).0);
+    assert_eq!(store.lock().unwrap().avatar_address(&me, &peer).unwrap(), None);
+}
+
+#[test]
 fn removed_candidate_and_stopping_service_do_not_write_address() {
     let client = Identity::load_or_create(&test_path("client")).unwrap();
     let server_path = test_path("server");

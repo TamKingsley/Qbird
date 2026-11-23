@@ -10,6 +10,59 @@ struct Side {
     db: std::path::PathBuf,
 }
 
+#[test]
+fn offline_recall_survives_restart_and_retries_without_sending_original() {
+    let mut alice = side("alice-offline-recall");
+    let bob = side("bob-offline-recall");
+    trust(&alice, &bob);
+    trust(&bob, &alice);
+    let (alice_id, bob_id) = (alice.identity.fingerprint(), bob.identity.fingerprint());
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let message = {
+        let store = alice.store.lock().unwrap();
+        store.set_contact_address(&bob_id, &address.to_string()).unwrap();
+        let message = store.queue_direct(&alice_id, &bob_id, "never deliver this secret", 100).unwrap();
+        assert_eq!(store.recall_direct(&alice_id, &message.id, 101).unwrap(), crate::storage::RecallResult::Recalled { delivered: false });
+        message
+    };
+    // Simulate a failed connection before the application is restarted.
+    let failed = thread::spawn(move || { let (_socket, _) = listener.accept().unwrap(); });
+    let queue = RetryQueue::start(Arc::clone(&alice.identity), Arc::clone(&alice.store), Arc::new(AtomicBool::new(false))).unwrap();
+    failed.join().unwrap();
+    drop(queue);
+    assert!(alice.store.lock().unwrap().next_pending_recall(None).unwrap().is_some());
+    assert_eq!(alice.store.lock().unwrap().delete_messages("direct", &bob_id, &[message.id.clone()]).unwrap(), 1);
+    drop(alice.store);
+    alice.store = Arc::new(Mutex::new(Store::open(&alice.db).unwrap()));
+    let listener = TcpListener::bind(address).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let (identity, store) = (Arc::clone(&bob.identity), Arc::clone(&bob.store));
+    let worker = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(12);
+        loop {
+            match listener.accept() {
+                Ok((socket, _)) => return chat_transport::accept_one(&identity, &store, socket).is_ok(),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
+                _ => return false,
+            }
+        }
+    });
+    let queue = RetryQueue::start(Arc::clone(&alice.identity), Arc::clone(&alice.store), Arc::new(AtomicBool::new(false))).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(12);
+    while alice.store.lock().unwrap().next_pending_recall(None).unwrap().is_some() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(worker.join().unwrap());
+    assert!(alice.store.lock().unwrap().next_pending_recall(None).unwrap().is_none());
+    let received = bob.store.lock().unwrap().list_direct(&alice_id, 10, None).unwrap();
+    assert_eq!(received.len(), 1);
+    assert_eq!((&received[0].id, received[0].created_at, received[0].logical), (&message.id, message.created_at, message.logical));
+    assert!(received[0].recalled_at.is_some());
+    assert_ne!(received[0].body, "never deliver this secret");
+    drop(queue);
+}
+
 fn side(label: &str) -> Side {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("retry-tests")
         .join(format!("{label}-{}-{}-{}", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(), NEXT.fetch_add(1, Ordering::Relaxed)));

@@ -5,9 +5,10 @@ import { showImage } from './image_viewer';
 import { base64ToBytes } from './plugin_view';
 import { workspace, type LoadedTab } from './workspace';
 import { linkifiedText } from './linkify';
-import { showContextMenu } from './context_menu';
+import { recallItems, showContextMenu } from './context_menu';
 import { t, trError } from './i18n';
 import { formatStamp } from './chat_prefs';
+import { groupedMessage, messageAvatar } from './message_avatar';
 
 type DirectMessage = {
   id: string; peer: string; sender: string; body: string; created_at: number; logical: number;
@@ -317,10 +318,7 @@ export class DirectChat {
 
   /// Text bubble menu: withdraw inside the two-minute window, copy otherwise.
   private textMenu(event: MouseEvent, message: DirectMessage): void {
-    const items = [];
-    if (this.canRecall(message)) {
-      items.push({ label: t('撤回'), danger: true, run: () => { void this.recall(message); } });
-    }
+    const items = recallItems(message.sender !== this.peer, this.canRecall(message), () => { void this.recall(message); });
     items.push({ label: t('复制文字'), run: () => { void navigator.clipboard?.writeText(message.body).catch(() => {}); } });
     items.push({ label: t('删除'), danger: true, run: () => { void this.deleteLocal(message.id); } });
     showContextMenu(event, items);
@@ -600,17 +598,21 @@ export class DirectChat {
     const previousTop = history.scrollTop, previousHeight = history.scrollHeight;
     list.replaceChildren();
     this.renderedBatches.clear();
+    let previous: DirectMessage | null = null;
     for (const message of this.messages) {
       const incoming = message.sender === this.peer;
       const row = document.createElement('div'); row.className = `message-row${incoming ? ' incoming' : ''}`; row.dataset.id = message.id;
+      if (groupedMessage(previous, message)) row.classList.add('grouped');
       const column = document.createElement('div'); column.className = 'message-column';
+      const avatar = messageAvatar(incoming ? message.sender : 'self', incoming ? this.name : t('我'));
       if (message.recalled_at) {
         const note = document.createElement('div');
         note.className = 'message-bubble recalled';
         note.textContent = incoming ? `${this.name || t('对方')}${t('撤回了一条消息')}` : t('你撤回了一条消息');
         column.append(note);
-        row.append(column);
+        row.append(avatar, column);
         list.append(row);
+        previous = message;
         continue;
       }
       const batch = this.batches.get(message.id);
@@ -672,13 +674,14 @@ export class DirectChat {
       }
       const time = document.createElement('small'); time.className = 'message-time';
       time.textContent = formatStamp(message.created_at);
-      column.append(time);
+      column.prepend(time);
       if (!incoming) {
         const status = document.createElement('small'); status.className = 'message-status';
         status.textContent = message.kind === 'file' ? '' : message.status === 'delivered' ? t('已送达') : t('待发送');
         if (status.textContent) column.append(status);
       }
-      row.append(column); list.append(row);
+      row.append(avatar, column); list.append(row);
+      previous = message;
     }
     older.hidden = !this.hasOlder;
     if (mode === 'bottom' || (mode === 'auto' && atBottom)) history.scrollTop = history.scrollHeight;
@@ -790,7 +793,7 @@ function sameMessages(a: DirectMessage[], b: DirectMessage[]): boolean {
   if (a.length !== b.length) return false;
   return a.every((item, index) => {
     const other = b[index];
-    return other && item.id === other.id && item.status === other.status
+    return other && item.id === other.id && item.status === other.status && item.recalled_at === other.recalled_at
       && item.file_status === other.file_status && item.file_transferred === other.file_transferred;
   });
 }

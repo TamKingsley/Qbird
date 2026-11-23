@@ -14,7 +14,12 @@ fn try_candidate(identity: &Identity, store: &Mutex<Store>, view: &CandidateView
     view.while_current(name, address, || {
         if stopping.load(Ordering::Acquire) { return false; }
         match store.lock() {
-            Ok(store) if !stopping.load(Ordering::Acquire) => store.set_discovered_address(&peer, address, revision).unwrap_or(false),
+            Ok(store) if !stopping.load(Ordering::Acquire) => {
+                if store.address_revision() != revision { return false; }
+                let contact = store.set_discovered_address(&peer, address, revision).unwrap_or(false);
+                let avatar = store.set_avatar_address(&identity.fingerprint(), &peer, address).unwrap_or(false);
+                contact || avatar
+            }
             _ => false,
         }
     }).unwrap_or(false)
