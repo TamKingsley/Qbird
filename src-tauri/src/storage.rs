@@ -4718,14 +4718,14 @@ mod tests {
         let peer = "b".repeat(64);
         store.add_candidate(&peer, "Bob").unwrap();
         store.confirm_candidate(&peer).unwrap();
-        assert!(store.save_outgoing("text-1", &peer, "hello", 1).unwrap());
+        let text = store.queue_direct(&self_id, &peer, "hello", 1).unwrap();
         let image = store.queue_direct_file(&self_id, &peer, "photo.PNG", 3, &"c".repeat(64), Path::new("photo.png"), 2).unwrap();
         let document = store.queue_direct_file(&self_id, &peer, "notes.txt", 4, &"d".repeat(64), Path::new("notes.txt"), 3).unwrap();
         store.complete_file_transfer(&image.id, 4).unwrap();
         store.complete_file_transfer(&document.id, 5).unwrap();
 
         let text_and_documents = store.archive_export_with_options("direct", &peer, &self_id, 0, 0, None, true, false, true).unwrap();
-        assert_eq!(text_and_documents.messages.iter().map(|message| message.id.as_str()).collect::<Vec<_>>(), vec!["text-1", document.id.as_str()]);
+        assert_eq!(text_and_documents.messages.iter().map(|message| message.id.as_str()).collect::<Vec<_>>(), vec![text.id.as_str(), document.id.as_str()]);
         assert_eq!(text_and_documents.attachments.len(), 1);
         assert_eq!(text_and_documents.attachments[0].message_id, document.id);
 
@@ -4734,10 +4734,10 @@ mod tests {
         assert_eq!(images_only.messages[0].id, image.id);
         assert_eq!(images_only.attachments[0].file_name.as_deref(), Some("photo.PNG"));
 
-        let selected = vec!["text-1".to_owned()];
+        let selected = vec![text.id.clone()];
         let selected_export = store.archive_export_with_options("direct", &peer, &self_id, 0, 0, Some(&selected), true, true, true).unwrap();
         assert_eq!(selected_export.messages.len(), 1);
-        assert_eq!(selected_export.messages[0].id, "text-1");
+        assert_eq!(selected_export.messages[0].id, text.id);
         assert!(selected_export.attachments.is_empty());
 
         let unknown = vec!["missing-message".to_owned()];

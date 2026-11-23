@@ -276,7 +276,7 @@ mod tests {
         target.confirm_candidate(&peer).unwrap();
         let imported = import("password123", &archive_path, &target, &me).unwrap();
         assert_eq!((imported.inserted, imported.restored_attachments), (1, 1));
-        let messages = target.list_messages(&peer, 10, 0).unwrap();
+        let messages = target.list_direct(&peer, 10, None).unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].body, "report.bin");
         let transfer = target.file_transfer(&file_message.id).unwrap().unwrap();
@@ -311,7 +311,7 @@ mod tests {
         std::fs::write(&archive_path, crate::backup::encrypt_with(MAGIC, "password123", legacy.as_bytes()).unwrap()).unwrap();
         let report = import("password123", &archive_path, &target, &me).unwrap();
         assert_eq!((report.inserted, report.restored_attachments), (1, 0));
-        let imported = target.list_messages(&peer, 10, 0).unwrap();
+        let imported = target.list_direct(&peer, 10, None).unwrap();
         assert_eq!(imported[0].body, "old text");
         assert!(target.search_all(&me, "old text", "text", Some("direct"), Some(&peer), 100, 0).unwrap().len() == 1);
         let _ = std::fs::remove_file(&archive_path);
