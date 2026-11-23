@@ -8,6 +8,7 @@ import { workspace, type LoadedTab } from './workspace';
 import { linkifiedText } from './linkify';
 import { t, trError } from './i18n';
 import { formatStamp } from './chat_prefs';
+import { loadUntilFound } from './search_navigation';
 import { groupedMessage, invalidatePeerAvatars, messageAvatar } from './message_avatar';
 
 type TextPreview = { name: string; kind: string; text: string };
@@ -655,11 +656,7 @@ export class GroupChat {
   async jumpTo(messageId: string): Promise<void> {
     if (!messageId) return;
     const found = () => this.messages.find(item => item.id === messageId);
-    for (let page = 0; page < 20 && !found() && this.hasOlder; page += 1) {
-      const before = this.messages.length;
-      await this.load(true);
-      if (!isTauri() || this.messages.length === before) break;
-    }
+    await loadUntilFound(() => !!found(), () => this.hasOlder, () => this.messages.length, () => this.load(true));
     const node = this.root.querySelector<HTMLElement>(`#group-messages [data-id="${messageId}"]`);
     if (!node) { this.status('#group-error', t('原消息不在当前记录中，可能尚未同步')); return; }
     node.scrollIntoView({ block: 'center' });

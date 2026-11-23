@@ -388,7 +388,7 @@ pub fn run() {
             app_state::v1_search_direct,
             app_state::v1_search_group,
             app_state::v1_search_all,
-            app_state::v1_export_chat,
+            app_state::v1_search_chat_history,
             app_state::v1_system_idle_seconds,
             app_state::v1_lock_status,
             app_state::v1_lock_now,
