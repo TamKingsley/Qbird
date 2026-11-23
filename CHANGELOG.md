@@ -5,6 +5,21 @@ All notable changes to Qbird are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.16] - 2026-11-23
+
+### Added
+
+- Encrypted chat export: select conversations (direct/group/self) and a time range, then export each as an encrypted `.qchat` file from the chat-records window.
+- Full-history search in the chat-records window, with search navigation across matching messages.
+- Avatars now appear beside chat bubbles in direct and group chats.
+
+### Fixed
+
+- Offline message recalls are re-delivered and applied when the peer reconnects, and the original message shows a recall notice; chat avatars stay in sync across peers.
+- LAN contact requests are repaired: presence probing and request handling now complete reliably instead of failing silently.
+- The chat-records window keeps its window controls usable when a load fails, and surfaces the failure message.
+- The unfinished "user backup" and "user restore" placeholders are hidden from the More menu in all locales; chat backup/restore behavior is unchanged.
+
 ## [0.1.15] - 2026-11-22
 
 ### Fixed
