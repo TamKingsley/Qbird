@@ -1,7 +1,7 @@
 //! Locally stored profile avatar.
 //!
-//! The avatar is a single square PNG living next to the database. It is local
-//! only in this stage and never sent to peers; the bytes are checked for a PNG
+//! The avatar is a single square PNG stored next to the database and may be
+//! shared with authorized peers; the bytes are checked for a PNG
 //! signature, square dimensions and a bounded size before replacing the file.
 //! Only the header is inspected, so this is a sanity check rather than a full
 //! decoder: the image is produced by the app's own canvas crop.

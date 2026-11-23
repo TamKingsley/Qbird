@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Chat bubble regression</title>
+<link rel="stylesheet" href="/src/style.css"><style>body{margin:16px}#chat{height:620px;border:1px solid #ddd}</style></head>
+<body><h1>Chat bubble regression</h1><p id="result">Running…</p><div id="chat"></div>
+<script type="module">
+window.isTauri = true;
+const peer = 'b'.repeat(64), self = 'a'.repeat(64), other = 'c'.repeat(64), groupId = 'd'.repeat(32);
+const now = Math.floor(Date.now()/1000), calls = [];
+const png = Array.from(Uint8Array.from(atob('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/aZkAAAAASUVORK5CYII='), c => c.charCodeAt(0)));
+let authorized = true;
+const d = (id, sender, delta, recalled = null) => ({id, peer, sender, body:id, created_at:now+delta, logical:delta+1000, status:sender===peer?'received':'pending', kind:'text', file_name:null, file_size:null, file_sha256:null, file_status:null, file_transferred:null, file_error:null, recalled_at:recalled});
+const directs = [d('d1',peer,-200),d('d2',peer,-111),d('d3',peer,-21),d('d4',self,-10),d('d5',self,-5,now)];
+const g = (id,sender,delta) => ({id,group_id:groupId,sender,sender_name:sender===self?'Self':sender===peer?'Alice':'Bob',body:id,created_at:now+delta,logical:delta+1000,pending:0,reply_to:null,reply_sender:null,reply_preview:null,mentions:[],kind:'text',file_name:null,file_size:null,file_sha256:null,file_status:null,file_transferred:null,file_error:null,recalled_at:null});
+const groups = [g('g1',peer,-100),g('g2',peer,-11),g('g3',other,-10),g('g4',self,-5),{...g('g5',self,-3),kind:'file',file_name:'test.txt',file_size:10,file_status:'completed'}];
+window.__TAURI_INTERNALS__ = {invoke: async (command,args) => {
+  calls.push([command,args]);
+  switch(command){
+    case 'identity_fingerprint': return self;
+    case 'v1_list_direct': return structuredClone(directs);
+    case 'v1_list_group': return structuredClone(groups);
+    case 'v1_list_group_members': return [self,peer,other].map(member=>({group_id:groupId,member,display_name:member,role:'member',joined_at:now,active:true}));
+    case 'v1_list_contacts': case 'v1_image_batches': case 'v1_file_offer_requests': case 'v1_group_file_offer_requests': return [];
+    case 'v1_avatar': return png;
+    case 'v1_peer_avatar': return authorized ? png : null;
+    case 'v1_fetch_peer_avatar': return false;
+    case 'v1_group_avatar': case 'v1_group_notice': case 'v1_contact_address': return null;
+    case 'v1_recall_message': return 'recalled';
+    default: return true;
+  }
+}};
+const assert = (ok,msg) => {if(!ok) throw Error(msg)};
+const until = async (fn) => {for(let i=0;i<100;i++){if(fn()) return; await new Promise(r=>setTimeout(r,10));} throw Error('timeout waiting for asynchronous avatar');};
+const menu = node => node.dispatchEvent(new MouseEvent('contextmenu',{bubbles:true,cancelable:true,clientX:100,clientY:100}));
+try {
+  const {DirectChat} = await import('/src/direct_chat.ts');
+  const {GroupChat} = await import('/src/group_chat.ts');
+  const {invalidatePeerAvatars} = await import('/src/message_avatar.ts');
+  const root=document.querySelector('#chat');
+  const direct=new DirectChat(root,()=>direct.render()); root.innerHTML=direct.view(); await direct.open(peer,'Alice');
+  assert(root.querySelector('[data-id="d2"]').classList.contains('grouped'),'89-second direct grouping');
+  assert(!root.querySelector('[data-id="d3"]').classList.contains('grouped'),'90-second direct boundary');
+  assert(!root.querySelector('[data-id="d4"]').classList.contains('grouped'),'different sender must not group');
+  assert(!root.querySelector('[data-id="d5"]').classList.contains('grouped'),'recalled message must not group');
+  const row=root.querySelector('[data-id="d4"]');
+  assert(row.querySelector('.message-column').firstElementChild.classList.contains('message-time'),'time above direct bubble');
+  assert(getComputedStyle(row).flexDirection==='row-reverse' && getComputedStyle(root.querySelector('[data-id="d1"]')).flexDirection==='row','avatars on correct sides');
+  menu(row.querySelector('.message-bubble')); assert([...document.querySelectorAll('.context-menu button')].some(x=>x.textContent==='撤回'),'own direct recall menu');
+  document.querySelector('.context-menu button').click(); await until(()=>root.querySelector('[data-id="d4"] .recalled'));
+  assert(calls.some(([c,a])=>c==='v1_recall_message'&&a.kind==='direct'&&a.id==='d4'),'direct recall reaches backend');
+  await until(()=>!!root.querySelector('[data-id="d1"] .message-avatar img'));
+  authorized=false; invalidatePeerAvatars();
+  assert(!root.querySelector('[data-id="d1"] .message-avatar img'),'revoked cache disappears immediately');
+  direct.clear();
+  authorized=true;
+  const group=new GroupChat(root,()=>group.render(),()=> 'My Nickname'); root.innerHTML=group.view(); await group.open(groupId,'Group');
+  assert(root.querySelector('[data-id="g2"]').classList.contains('grouped'),'89-second group grouping');
+  assert(!root.querySelector('[data-id="g3"]').classList.contains('grouped'),'different group sender must not group');
+  assert(root.querySelector('[data-id="g1"] .message-column').firstElementChild.classList.contains('message-time'),'time above group bubble');
+  assert(root.querySelector('[data-id="g4"] .message-sender').textContent==='My Nickname','own group nickname');
+  assert(root.querySelector('[data-id="g4"] .message-avatar').dataset.initial==='M','own avatar fallback uses nickname');
+  const avatar=root.querySelector('[data-id="g1"] .message-avatar'); avatar.dispatchEvent(new MouseEvent('dblclick',{bubbles:true}));
+  assert(root.querySelector('#group-messages').classList.contains('messages-hide-names'),'double click hides names');
+  avatar.dispatchEvent(new MouseEvent('dblclick',{bubbles:true})); assert(!root.querySelector('#group-messages').classList.contains('messages-hide-names'),'double click restores names');
+  menu(root.querySelector('[data-id="g5"] .file-card'));
+  assert([...document.querySelectorAll('.context-menu button')].some(x=>x.textContent.includes('打开所在目录')),'nested file menu is not overwritten by text menu');
+  document.querySelector('#result').textContent='PASS: grouping, time, avatar sides, cache revocation, recall, group name toggle and file context menu';
+} catch(error) { document.querySelector('#result').textContent='FAIL: '+error.message; console.error(error); }
+</script></body></html>

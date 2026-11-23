@@ -3,12 +3,13 @@ import { open } from '@tauri-apps/plugin-dialog';
 import { composerTools } from './ui_icons';
 import { showImage } from './image_viewer';
 import { base64ToBytes } from './plugin_view';
-import { showContextMenu } from './context_menu';
+import { recallItems, showContextMenu } from './context_menu';
 import { workspace, type LoadedTab } from './workspace';
 import { linkifiedText } from './linkify';
 import { t, trError } from './i18n';
 import { formatStamp } from './chat_prefs';
 import { loadUntilFound } from './search_navigation';
+import { groupedMessage, invalidatePeerAvatars, messageAvatar } from './message_avatar';
 
 type TextPreview = { name: string; kind: string; text: string };
 
@@ -54,6 +55,7 @@ export class GroupChat {
   private drafts = new Map<string, string>();
   private refreshBefore: Cursor | null = null;
   private membersOpen = false;
+  private hideNames = false;
   private quoted: Quoted | null = null;
   private mentionQuery: string | null = null;
   private mentioned = new Map<string, string>();
@@ -81,7 +83,7 @@ export class GroupChat {
   /// What clicking a file card does; the workspace previews it or the system app opens it.
   fileOpenMode: 'workspace' | 'system' = 'workspace';
 
-  constructor(private root: HTMLElement, private onChange: () => void) {}
+  constructor(private root: HTMLElement, private onChange: () => void, private selfName: () => string = () => '') {}
 
   view(): string {
     return `<section class="self-chat" aria-label="${t('群聊')}">
@@ -115,6 +117,7 @@ export class GroupChat {
   }
 
   clear(): void {
+    if (this.groupId) invalidatePeerAvatars();
     this.groupId = ''; this.readOnly = false; this.generation++; this.membersOpen = false; this.notice = ''; this.noticeOpen = false; this.quoted = null;
     this.setGroupAvatar(null);
     this.thumbs.clear(); this.thumbPending.clear(); this.offers = [];
@@ -140,6 +143,7 @@ export class GroupChat {
       await invoke('v1_open_group', { groupId });
     }
     if (generation !== this.generation) return;
+    invalidatePeerAvatars();
     this.readOnly = readOnly;
     this.dissolved = dissolved;
     this.groupId = groupId; this.name = name; this.messages = []; this.hasOlder = false;
@@ -174,6 +178,7 @@ export class GroupChat {
       for (const message of [...batch, ...historical]) merged.set(message.id, message);
       const next = [...merged.values()].sort(compare);
       const changed = next.length !== this.messages.length || next.some((item, i) => item.id !== this.messages[i]?.id
+        || item.recalled_at !== this.messages[i]?.recalled_at
         || item.pending !== this.messages[i]?.pending
         || item.file_status !== this.messages[i]?.file_status
         || item.file_transferred !== this.messages[i]?.file_transferred);
@@ -194,6 +199,9 @@ export class GroupChat {
         invoke<Contact[]>('v1_list_contacts'),
       ]);
       if (generation !== this.generation) return;
+      if (this.members.some(old => old.active && !members.some(member => member.member === old.member && member.active))) {
+        invalidatePeerAvatars();
+      }
       this.members = members;
       this.contacts = contacts.filter(contact => contact.trust_state === 'verified');
       if (members.length) { this.owner = members.find(member => member.role === 'owner')?.member ?? this.owner; this.isOwner = this.owner === this.self; }
@@ -881,15 +889,12 @@ export class GroupChat {
   }
 
   private canRecall(message: GroupMessage): boolean {
-    if (message.sender === this.self || message.recalled_at) return false;
+    if (message.sender !== this.self || message.recalled_at) return false;
     return Date.now() / 1000 - message.created_at <= 120;
   }
 
   private textMenu(event: MouseEvent, message: GroupMessage): void {
-    const items = [];
-    if (this.canRecall(message)) {
-      items.push({ label: t('撤回'), danger: true, run: () => { void this.recall(message); } });
-    }
+    const items = recallItems(message.sender === this.self, this.canRecall(message), () => { void this.recall(message); });
     items.push({ label: t('复制文字'), run: () => { void navigator.clipboard?.writeText(message.body).catch(() => {}); } });
     items.push({ label: t('删除'), danger: true, run: () => { void this.deleteLocal(message.id); } });
     showContextMenu(event, items);
@@ -959,21 +964,32 @@ export class GroupChat {
     const previousTop = history.scrollTop, previousHeight = history.scrollHeight;
     list.replaceChildren();
     this.renderedBatches.clear();
+    let previous: GroupMessage | null = null;
     for (const message of this.messages) {
       const incoming = message.sender !== this.self;
       const row = document.createElement('div'); row.className = `message-row${incoming ? ' incoming' : ''}`; row.dataset.id = message.id;
+      if (groupedMessage(previous, message)) row.classList.add('grouped');
       if (incoming && message.mentions.includes(this.self)) row.classList.add('mentioned-row');
+      const senderName = incoming ? message.sender_name : this.selfName() || t('我');
+      const avatar = messageAvatar(incoming ? message.sender : 'self', senderName);
+      avatar.title = t('双击头像显示或隐藏群成员昵称');
+      avatar.addEventListener('dblclick', () => {
+        this.hideNames = !this.hideNames;
+        list.classList.toggle('messages-hide-names', this.hideNames);
+      });
       const column = document.createElement('div'); column.className = 'message-column';
-      if (incoming) {
-        const who = document.createElement('small'); who.className = 'message-sender';
-        who.textContent = message.sender_name; column.append(who);
-      }
       if (message.recalled_at) {
         const note = document.createElement('div'); note.className = 'message-bubble recalled';
         note.textContent = incoming ? `${message.sender_name}${t('撤回了一条消息')}` : t('你撤回了一条消息');
-        column.append(note); row.append(column); list.append(row);
+        column.append(note); row.append(avatar, column); list.append(row);
+        previous = message;
         continue;
       }
+      const time = document.createElement('small'); time.className = 'message-time';
+      time.textContent = formatStamp(message.created_at);
+      const who = document.createElement('small'); who.className = 'message-sender';
+      who.textContent = senderName;
+      column.append(time, who);
       const bubble = document.createElement('div'); bubble.className = 'message-bubble';
       bubble.addEventListener('contextmenu', (event) => this.textMenu(event, message));
       if (message.reply_preview) {
@@ -1060,9 +1076,6 @@ export class GroupChat {
         bubble.append(badge);
       }
       column.append(bubble);
-      const time = document.createElement('small'); time.className = 'message-time';
-      time.textContent = formatStamp(message.created_at);
-      column.append(time);
       const tools = document.createElement('div'); tools.className = 'message-tools';
       const reply = document.createElement('button');
       reply.className = 'linkish'; reply.textContent = t('引用');
@@ -1074,8 +1087,10 @@ export class GroupChat {
         tools.append(status);
       }
       column.append(tools);
-      row.append(column); list.append(row);
+      row.append(avatar, column); list.append(row);
+      previous = message;
     }
+    list.classList.toggle('messages-hide-names', this.hideNames);
     older.hidden = !this.hasOlder;
     if (mode === 'bottom' || (mode === 'auto' && atBottom)) history.scrollTop = history.scrollHeight;
     else {

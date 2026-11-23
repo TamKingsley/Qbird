@@ -91,8 +91,17 @@ mod tests;
 
 /// Handle all messages of one incoming authenticated session, including files.
 pub fn accept_one(identity: &Identity, store: &Mutex<Store>, socket: TcpStream) -> ChatResult<()> {
-    let trusted = store.lock().map_err(|_| invalid("store unavailable"))?.list_contacts()?
-        .into_iter().filter(|contact| contact.trust_state == "verified").map(|contact| contact.fingerprint).collect();
+    let self_id = identity.fingerprint();
+    let trusted = {
+        let db = store.lock().map_err(|_| invalid("store unavailable"))?;
+        let mut trusted: std::collections::BTreeSet<String> = db.list_contacts()?.into_iter()
+            .filter(|contact| contact.trust_state == "verified").map(|contact| contact.fingerprint).collect();
+        for member in db.avatar_group_peers(&self_id)? {
+            if trusted.len() >= 65_536 { break; }
+            trusted.insert(member);
+        }
+        trusted.into_iter().collect()
+    };
     let config = Arc::new(tls::server_config(identity, trusted)?);
     let mut socket = DeadlineStream::new(socket)?;
     let mut preface = vec![0; CHAT_PREFACE.len()];
@@ -103,7 +112,6 @@ pub fn accept_one(identity: &Identity, store: &Mutex<Store>, socket: TcpStream) 
     let chain = stream.conn.peer_certificates().ok_or_else(|| invalid("missing client certificate"))?;
     if chain.len() != 1 { return Err(invalid("invalid certificate chain").into()); }
     let peer = certificate::fingerprint(chain[0].as_ref()).map_err(invalid)?;
-    let self_id = identity.fingerprint();
     let mut gate = exchange_ready(&mut stream)?;
     loop {
         stream.sock.touch();
@@ -114,6 +122,10 @@ pub fn accept_one(identity: &Identity, store: &Mutex<Store>, socket: TcpStream) 
             Err(error) => return Err(error.into()),
         };
         gate.inbound(&incoming)?;
+        if !matches!(incoming, Payload::ProfileAvatarRequest { .. })
+            && !store.lock().map_err(|_| invalid("store unavailable"))?.is_verified(&peer)? {
+            return Err(invalid("unverified chat peer").into());
+        }
         match incoming {
             Payload::Text { id, body, created_at, logical } => {
                 let result = store.lock().map_err(|_| invalid("store unavailable"))?.receive_direct(&peer, &id, &body, created_at, logical)?;
@@ -218,6 +230,24 @@ pub fn accept_one(identity: &Identity, store: &Mutex<Store>, socket: TcpStream) 
                 }
                 acknowledge(&mut stream, &mut gate, &id)?;
             }
+            Payload::RecallDirectPlaceholder { id, message_id, created_at, logical } => {
+                let result = store.lock().map_err(|_| invalid("store unavailable"))?
+                    .receive_direct_placeholder(&self_id, &peer, &message_id, created_at, logical, unix_now())?;
+                if !matches!(result, IncomingResult::Inserted | IncomingResult::Duplicate) {
+                    return Err(invalid("recall placeholder rejected").into());
+                }
+                acknowledge(&mut stream, &mut gate, &id)?;
+            }
+            Payload::RecallGroupPlaceholder { id, group_id, message_id, created_at, logical } => {
+                let result = store.lock().map_err(|_| invalid("store unavailable"))?
+                    .receive_group_placeholder(&self_id, &peer, &group_id, &message_id, created_at, logical, unix_now())?;
+                // A pending invitation can make a legitimate recipient not yet a member.
+                // Do not acknowledge until they accept and the placeholder is stored.
+                if !matches!(result, IncomingResult::Inserted | IncomingResult::Duplicate) {
+                    return Err(invalid("group recall placeholder rejected").into());
+                }
+                acknowledge(&mut stream, &mut gate, &id)?;
+            }
             // Search replies are acknowledged by the caller; a stray ack is harmless.
             Payload::Ack { .. } => {}
             Payload::GroupSearch { id, query } => {
@@ -237,6 +267,17 @@ pub fn accept_one(identity: &Identity, store: &Mutex<Store>, socket: TcpStream) 
                     gate.outbound(&again)?;
                     protocol::write_frame(&mut stream, &again)?;
                 }
+            }
+            Payload::ProfileAvatarRequest { id } => {
+                let db = store.lock().map_err(|_| invalid("store unavailable"))?;
+                if !db.avatar_authorized(&self_id, &peer)? { return Err(invalid("avatar access denied").into()); }
+                let png = crate::avatar::load(db.data_dir()).map_err(|_| invalid("avatar unavailable"))?.unwrap_or_default();
+                let reply = Payload::ProfileAvatarResponse { id, size: png.len() as u32 };
+                gate.outbound(&reply)?;
+                protocol::write_frame(&mut stream, &reply)?;
+                for chunk in png.chunks(CHUNK_SIZE) { write_chunk(&mut stream, chunk)?; }
+                write_chunk(&mut stream, &[])?;
+                return Ok(());
             }
             Payload::GroupAvatarRequest { id, group_id } => {
                 let png = store.lock().map_err(|_| invalid("store unavailable"))?
@@ -386,12 +427,15 @@ fn receive_file(stream: &mut StreamOwned<ServerConnection, DeadlineStream>, gate
             return Err(invalid("file checksum mismatch").into());
         }
     }
-    if file.is_some() {
-        if target.exists() { files::remove_quietly(&target); }
-        fs::rename(&partial, &target)?;
-    }
     {
         let store = store.lock().map_err(|_| invalid("store unavailable"))?;
+        if store.file_transfer(&id)?.is_some_and(|transfer| transfer.error.as_deref() == Some("recalled")) {
+            return Err(invalid("file recalled").into());
+        }
+        if file.is_some() {
+            if target.exists() { files::remove_quietly(&target); }
+            fs::rename(&partial, &target)?;
+        }
         store.complete_file_transfer(&id, unix_now())?;
     }
     let complete = Payload::FileComplete { id };
@@ -509,12 +553,15 @@ fn receive_group_file(stream: &mut StreamOwned<ServerConnection, DeadlineStream>
             return Err(invalid("file checksum mismatch").into());
         }
     }
-    if file.is_some() {
-        if target.exists() { files::remove_quietly(&target); }
-        fs::rename(&partial, &target)?;
-    }
     {
         let store = store.lock().map_err(|_| invalid("store unavailable"))?;
+        if store.group_file_transfer(&id)?.is_some_and(|transfer| transfer.error.as_deref() == Some("recalled")) {
+            return Err(invalid("group file recalled").into());
+        }
+        if file.is_some() {
+            if target.exists() { files::remove_quietly(&target); }
+            fs::rename(&partial, &target)?;
+        }
         store.complete_group_file_transfer(&id, unix_now())?;
     }
     let complete = Payload::FileComplete { id };
@@ -553,7 +600,11 @@ fn send_group_file(identity: &Identity, store: &Mutex<Store>, member: &str, addr
             batch_id, caption,
         };
         gate.outbound(&offer)?;
-        protocol::write_frame(&mut stream, &offer)?;
+        {
+            let current = store.lock().map_err(|_| invalid("store unavailable"))?;
+            if !current.group_delivery_pending(member, &message_id)? { return Err(invalid("group delivery cancelled").into()); }
+            protocol::write_frame(&mut stream, &offer)?;
+        }
         let reply = protocol::read_frame(&mut stream)?;
         gate.inbound(&reply)?;
         let offset = match reply {
@@ -580,7 +631,11 @@ fn send_group_file(identity: &Identity, store: &Mutex<Store>, member: &str, addr
             let read = file.read(&mut buffer[..wanted])?;
             if read == 0 { return Err(invalid("source file ended early").into()); }
             stream.sock.touch_chunk();
-            write_chunk(&mut stream, &buffer[..read])?;
+            {
+                let current = store.lock().map_err(|_| invalid("store unavailable"))?;
+                if !current.group_delivery_pending(member, &message_id)? { return Err(invalid("group delivery cancelled").into()); }
+                write_chunk(&mut stream, &buffer[..read])?;
+            }
             sent += read as u64;
             if sent - reported >= PROGRESS_STEP {
                 reported = sent;
@@ -588,7 +643,11 @@ fn send_group_file(identity: &Identity, store: &Mutex<Store>, member: &str, addr
             }
         }
         stream.sock.touch_chunk();
-        write_chunk(&mut stream, &[])?;
+        {
+            let current = store.lock().map_err(|_| invalid("store unavailable"))?;
+            if !current.group_delivery_pending(member, &message_id)? { return Err(invalid("group delivery cancelled").into()); }
+            write_chunk(&mut stream, &[])?;
+        }
         let reply = protocol::read_frame(&mut stream)?;
         gate.inbound(&reply)?;
         if reply != (Payload::FileComplete { id: message_id.clone() }) { return Err(invalid("file not confirmed").into()); }
@@ -631,7 +690,11 @@ pub fn send_group_one(identity: &Identity, store: &Mutex<Store>, member: &str, a
         reply_preview: dispatch.reply_preview, mentions: dispatch.mentions,
     };
     gate.outbound(&text)?;
-    protocol::write_frame(&mut stream, &text)?;
+    {
+        let current = store.lock().map_err(|_| invalid("store unavailable"))?;
+        if !current.group_delivery_pending(member, &dispatch.message_id)? { return Err(invalid("group delivery cancelled").into()); }
+        protocol::write_frame(&mut stream, &text)?;
+    }
     let reply = protocol::read_frame(&mut stream)?;
     gate.inbound(&reply)?;
     if reply != (Payload::Ack { id: dispatch.message_id.clone() }) { return Err(invalid("invalid group acknowledgement").into()); }
@@ -674,7 +737,13 @@ pub fn send_control_one(identity: &Identity, store: &Mutex<Store>, target: &str,
             let value: serde_json::Value = serde_json::from_str(&task.payload)?;
             let message_id = value.get("message_id").and_then(|v| v.as_str())
                 .ok_or_else(|| invalid("invalid control payload"))?.to_owned();
-            Payload::RecallGroup { id: task.id.clone(), group_id: task.group_id.clone(), message_id }
+            match (value.get("created_at").and_then(|v| v.as_i64()), value.get("logical").and_then(|v| v.as_i64())) {
+                (Some(created_at), Some(logical)) => Payload::RecallGroupPlaceholder {
+                    id: task.id.clone(), group_id: task.group_id.clone(), message_id, created_at, logical,
+                },
+                (None, None) => Payload::RecallGroup { id: task.id.clone(), group_id: task.group_id.clone(), message_id },
+                _ => return Err(invalid("incomplete recall metadata").into()),
+            }
         }
         "remove" => Payload::GroupRemove { id: task.id.clone(), group_id: task.group_id.clone() },
         "join" => {
@@ -715,9 +784,15 @@ pub fn send_control_one(identity: &Identity, store: &Mutex<Store>, target: &str,
 
 /// Sends one queued direct recall notice and marks it delivered on success.
 pub fn send_recall_one(identity: &Identity, store: &Mutex<Store>, peer: &str, address: SocketAddr,
-    recall_id: &str, message_id: &str) -> ChatResult<()> {
+    recall_id: &str, message_id: &str, created_at: Option<i64>, logical: Option<i64>) -> ChatResult<()> {
     if address.port() == 0 || !crate::address::is_unicast(address.ip()) { return Err(invalid("invalid address").into()); }
-    let payload = Payload::RecallDirect { id: recall_id.to_owned(), message_id: message_id.to_owned() };
+    let payload = match (created_at, logical) {
+        (Some(created_at), Some(logical)) => Payload::RecallDirectPlaceholder {
+            id: recall_id.to_owned(), message_id: message_id.to_owned(), created_at, logical,
+        },
+        (None, None) => Payload::RecallDirect { id: recall_id.to_owned(), message_id: message_id.to_owned() },
+        _ => return Err(invalid("incomplete recall metadata").into()),
+    };
     let (mut stream, mut gate) = connect(identity, peer, address)?;
     gate.outbound(&payload)?;
     protocol::write_frame(&mut stream, &payload)?;
@@ -750,6 +825,40 @@ pub fn fetch_group_avatar(identity: &Identity, owner: &str, address: SocketAddr,
     protocol::write_frame(&mut stream, &ack)?;
     let bytes = crate::base64::decode(&encoded).ok_or_else(|| invalid("invalid avatar encoding"))?;
     Ok(if bytes.is_empty() { None } else { Some(bytes) })
+}
+
+/// Unsupported peers or interrupted transfers leave the existing cache untouched.
+pub fn fetch_profile_avatar(identity: &Identity, store: &Mutex<Store>, peer: &str, address: SocketAddr) -> ChatResult<()> {
+    if address.port() == 0 || !crate::address::is_unicast(address.ip()) { return Err(invalid("invalid address").into()); }
+    let self_id = identity.fingerprint();
+    if !store.lock().map_err(|_| invalid("store unavailable"))?.avatar_authorized(&self_id, peer)? {
+        return Err(invalid("avatar access denied").into());
+    }
+    let id = format!("profile-avatar-{}", std::process::id());
+    let request = Payload::ProfileAvatarRequest { id: id.clone() };
+    let (mut stream, mut gate) = connect(identity, peer, address)?;
+    gate.outbound(&request)?;
+    protocol::write_frame(&mut stream, &request)?;
+    let reply = protocol::read_frame(&mut stream)?;
+    gate.inbound(&reply)?;
+    let size = match reply {
+        Payload::ProfileAvatarResponse { id: echoed, size } if echoed == id => size as usize,
+        _ => return Err(invalid("invalid avatar reply").into()),
+    };
+    let mut png = Vec::with_capacity(size);
+    let mut chunk = vec![0u8; CHUNK_SIZE];
+    loop {
+        let count = read_chunk(&mut stream, &mut chunk)?;
+        if count == 0 { break; }
+        if png.len() + count > size { return Err(invalid("avatar exceeds declared size").into()); }
+        png.extend_from_slice(&chunk[..count]);
+    }
+    if png.len() != size { return Err(invalid("incomplete avatar").into()); }
+    let value = if png.is_empty() { None } else { Some(png.as_slice()) };
+    if !store.lock().map_err(|_| invalid("store unavailable"))?.set_peer_avatar(&self_id, peer, value)? {
+        return Err(invalid("avatar access revoked").into());
+    }
+    Ok(())
 }
 
 /// Ask each confirmed contact which of its groups match `query`. Best effort: a peer
@@ -811,7 +920,11 @@ fn send_text(identity: &Identity, store: &Mutex<Store>, peer: &str, address: Soc
     let (mut stream, mut gate) = connect(identity, peer, address)?;
     let text = Payload::Text { id: message.id.clone(), body: message.body.clone(), created_at: message.created_at, logical: message.logical };
     gate.outbound(&text)?;
-    protocol::write_frame(&mut stream, &text)?;
+    {
+        let current = store.lock().map_err(|_| invalid("store unavailable"))?;
+        if current.pending_direct_by_id(peer, &message.id)?.is_none() { return Err(invalid("delivery cancelled").into()); }
+        protocol::write_frame(&mut stream, &text)?;
+    }
     let reply = protocol::read_frame(&mut stream)?;
     gate.inbound(&reply)?;
     if reply != (Payload::Ack { id: message.id.clone() }) { return Err(invalid("invalid acknowledgement").into()); }
@@ -857,7 +970,11 @@ fn send_file(identity: &Identity, store: &Mutex<Store>, peer: &str, address: Soc
             batch_id, caption,
         };
         gate.outbound(&offer)?;
-        protocol::write_frame(&mut stream, &offer)?;
+        {
+            let current = store.lock().map_err(|_| invalid("store unavailable"))?;
+            if current.pending_direct_by_id(peer, &message.id)?.is_none() { return Err(invalid("delivery cancelled").into()); }
+            protocol::write_frame(&mut stream, &offer)?;
+        }
         let reply = protocol::read_frame(&mut stream)?;
         gate.inbound(&reply)?;
         let offset = match reply {
@@ -884,7 +1001,11 @@ fn send_file(identity: &Identity, store: &Mutex<Store>, peer: &str, address: Soc
             let read = file.read(&mut buffer[..wanted])?;
             if read == 0 { return Err(invalid("source file ended early").into()); }
             stream.sock.touch_chunk();
-            write_chunk(&mut stream, &buffer[..read])?;
+            {
+                let current = store.lock().map_err(|_| invalid("store unavailable"))?;
+                if current.pending_direct_by_id(peer, &message.id)?.is_none() { return Err(invalid("delivery cancelled").into()); }
+                write_chunk(&mut stream, &buffer[..read])?;
+            }
             sent += read as u64;
             if sent - reported >= PROGRESS_STEP {
                 reported = sent;
@@ -892,7 +1013,11 @@ fn send_file(identity: &Identity, store: &Mutex<Store>, peer: &str, address: Soc
             }
         }
         stream.sock.touch_chunk();
-        write_chunk(&mut stream, &[])?;
+        {
+            let current = store.lock().map_err(|_| invalid("store unavailable"))?;
+            if current.pending_direct_by_id(peer, &message.id)?.is_none() { return Err(invalid("delivery cancelled").into()); }
+            write_chunk(&mut stream, &[])?;
+        }
         let reply = protocol::read_frame(&mut stream)?;
         gate.inbound(&reply)?;
         if reply != (Payload::FileComplete { id: message.id.clone() }) { return Err(invalid("file not confirmed").into()); }

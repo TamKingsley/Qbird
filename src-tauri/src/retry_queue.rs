@@ -134,7 +134,7 @@ impl RetryQueue {
                     if ready(&backoff, &key) && !busy.swap(true, Ordering::AcqRel) {
                         let _gate = Gate(Arc::clone(&busy));
                         let success = address::parse_manual_address(&item.address).is_ok_and(|address| {
-                            chat_transport::send_recall_one(&identity, &store, &item.peer, address, &item.id, &item.message_id).is_ok()
+                            chat_transport::send_recall_one(&identity, &store, &item.peer, address, &item.id, &item.message_id, item.created_at, item.logical).is_ok()
                         });
                         record(&mut backoff, key, success);
                         worked = true;

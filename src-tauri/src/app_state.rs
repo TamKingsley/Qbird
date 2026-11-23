@@ -1891,6 +1891,26 @@ pub fn v1_avatar(state: tauri::State<'_, AppState>) -> Result<Option<Vec<u8>>, S
     crate::avatar::load(&state.data_dir)
 }
 
+#[tauri::command]
+pub fn v1_peer_avatar(state: tauri::State<'_, AppState>, peer: String) -> Result<Option<Vec<u8>>, String> {
+    let self_id = state.identity.fingerprint();
+    state.store.lock().map_err(|_| "本地存储不可用".to_owned())?
+        .peer_avatar(&self_id, &peer).map_err(|_| "无法读取联系人头像".to_owned())
+}
+
+#[tauri::command]
+pub async fn v1_fetch_peer_avatar(state: tauri::State<'_, AppState>, peer: String) -> Result<bool, String> {
+    let self_id = state.identity.fingerprint();
+    let address = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?
+        .avatar_address(&self_id, &peer).map_err(|_| "无法读取头像地址".to_owned())?;
+    let Some(address) = address.and_then(|value| crate::address::parse_manual_address(&value).ok()) else { return Ok(false); };
+    let identity = Arc::clone(&state.identity);
+    let store = Arc::clone(&state.store);
+    tauri::async_runtime::spawn_blocking(move || {
+        Ok(crate::chat_transport::fetch_profile_avatar(&identity, &store, &peer, address).is_ok())
+    }).await.map_err(|_| "头像同步任务异常".to_owned())?
+}
+
 /// Replaces the avatar with a cropped square PNG produced by the front end.
 /// Encrypted per-conversation archive; attachments are not included.
 #[tauri::command]
@@ -2884,6 +2904,7 @@ pub fn v1_recall_message(state: tauri::State<'_, AppState>, kind: String, id: St
     let now = unix_now()?;
     let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
     let result = match kind.as_str() {
+        "self" => store.recall_self(&me, &id, now),
         "direct" => store.recall_direct(&me, &id, now),
         "group" => {
             let Some(group_id) = group_id else { return Err("缺少群标识".into()); };

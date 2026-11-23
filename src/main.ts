@@ -8,12 +8,13 @@ import { listen } from '@tauri-apps/api/event';
 import { version as appVersion } from '../package.json';
 import { DirectChat } from './direct_chat';
 import { GroupChat } from './group_chat';
+import { groupedMessage, messageAvatar } from './message_avatar';
 import { composerTools, toolIcon } from './ui_icons';
 import { showClosePrompt } from './close_prompt';
 import { cropAvatarInteractively } from './avatar_crop';
 import { workspace } from './workspace';
 import { linkifiedText } from './linkify';
-import { showContextMenu, type ContextItem } from './context_menu';
+import { recallItems, showContextMenu, type ContextItem } from './context_menu';
 import { t, trError, getLang, setLang, syncLangToBackend, LANG_LABEL, type Lang } from './i18n';
 import { loadUntilFound } from './search_navigation';
 
@@ -172,7 +173,7 @@ const demoConversationList: Conversation[] = [
   { id: 'a'.repeat(64), last_body: t('晚点把接口文档发你'), last_logical: 35, kind: 'direct', unread: 3, muted: false },
   { id: 'd'.repeat(32), last_body: t('周隐：明天十点评审'), last_logical: 30, kind: 'group', unread: 12, muted: true },
 ];
-type LocalMessage = { id: string; body: string; logical: number; created_at: number };
+type LocalMessage = { id: string; sender: string; body: string; logical: number; created_at: number; recalled_at: number | null };
 let selfOpen = false;
 let selfMessages: LocalMessage[] = [];
 let selfHasOlder = false;
@@ -229,7 +230,7 @@ let lockBusy = false;
 let lockInitialized = false;
 let lastActivity = Date.now();
 const direct = new DirectChat(app, () => { groupChat.clear(); selfOpen = false; page = 'messages'; menuOpen = false; render(); });
-const groupChat = new GroupChat(app, () => { direct.clear(); selfOpen = false; page = 'messages'; menuOpen = false; render(); });
+const groupChat = new GroupChat(app, () => { direct.clear(); selfOpen = false; page = 'messages'; menuOpen = false; render(); }, () => myNickname);
 
 // The workspace stores only serializable sources; chat modules resolve them back into
 // preview content, so the same path works for live opens and restored tabs.
@@ -488,21 +489,42 @@ function paintSelfMessages(scroll: 'bottom' | 'preserve'): void {
   if (!history || !list || !older) return;
   const previousHeight = history.scrollHeight, previousTop = history.scrollTop;
   list.replaceChildren();
+  let previous: LocalMessage | null = null;
   for (const message of selfMessages) {
     const row = document.createElement('div'); row.className = 'message-row'; row.dataset.id = message.id;
-    const body = document.createElement('div'); body.className = 'message-bubble'; body.append(linkifiedText(message.body));
+    if (groupedMessage(previous, message)) row.classList.add('grouped');
+    const avatar = messageAvatar('self', myNickname || t('我'));
+    const column = document.createElement('div'); column.className = 'message-column';
+    const body = document.createElement('div'); body.className = 'message-bubble';
+    if (message.recalled_at) {
+      body.classList.add('recalled'); body.textContent = t('你撤回了一条消息');
+      column.append(body); row.append(avatar, column); list.append(row); previous = message;
+      continue;
+    }
+    body.append(linkifiedText(message.body));
     const time = document.createElement('small'); time.className = 'message-time'; time.textContent = formatStamp(message.created_at);
     body.addEventListener('contextmenu', (event) => {
-      event.preventDefault();
-      showContextMenu(event, [
+      const items = recallItems(true, Date.now() / 1000 - message.created_at <= 120, () => { void recallSelfMessage(message); });
+      items.push(
         { label: t('复制文字'), run: () => { void navigator.clipboard?.writeText(message.body).catch(() => {}); } },
         { label: t('删除'), danger: true, run: () => { void deleteSelfMessage(message.id); } },
-      ]);
+      );
+      showContextMenu(event, items);
     });
-    row.append(body, time); list.append(row);
+    column.append(time, body); row.append(avatar, column); list.append(row); previous = message;
   }
   older.hidden = !selfHasOlder;
   history.scrollTop = scroll === 'bottom' ? history.scrollHeight : previousTop + history.scrollHeight - previousHeight;
+}
+
+async function recallSelfMessage(message: LocalMessage): Promise<void> {
+  try {
+    const result = await invoke<string>('v1_recall_message', { kind: 'self', id: message.id, groupId: null });
+    if (result === 'recalled' || result === 'already') {
+      message.recalled_at = Math.floor(Date.now() / 1000); message.body = '';
+      paintSelfMessages('preserve'); void refreshConversations();
+    } else workspace.notify(result === 'too_late' ? t('超过 2 分钟，不能再撤回') : t('撤回失败'));
+  } catch (error) { workspace.notify(trError(error, t('撤回失败'))); }
 }
 
 async function deleteSelfMessage(messageId: string): Promise<void> {
@@ -562,7 +584,7 @@ function profileView(): string {
       <div class="avatar-actions">
         <button class="outline" data-action="choose-avatar" ${avatarBusy ? 'disabled' : ''}>${avatarUrl ? t('更换头像…') : t('选择头像…')}</button>
         <button class="outline" data-action="clear-avatar" ${avatarUrl && !avatarBusy ? '' : 'disabled'}>移除头像</button>
-        <small>选择图片后可预览、拖动与缩放，确认后保存为正方形（最大 512 像素）；头像只保存在本机，尚未随消息发送。</small>
+        <small>选择图片后可预览、拖动与缩放，确认后保存为正方形（最大 512 像素）；已验证好友和共同群成员可通过加密连接获取头像。</small>
       </div>
     </div>
     <label for="profile-nickname">昵称</label>
@@ -718,7 +740,7 @@ async function chooseAvatar(): Promise<void> {
     if (!cropped) { avatarNotice = t('已取消，头像未修改。'); return; }
     await invoke('v1_set_avatar', { bytes: Array.from(cropped) });
     setAvatarImage(cropped);
-    avatarNotice = t('头像已保存，仅本机可见。');
+    avatarNotice = t('头像已保存，已验证好友和共同群成员可获取。');
   } catch (error) { avatarNotice = displayError(error); }
   finally { avatarBusy = false; if (page === 'profile') render(); }
 }
