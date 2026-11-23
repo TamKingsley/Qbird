@@ -17,6 +17,7 @@ import { linkifiedText } from './linkify';
 import { recallItems, showContextMenu, type ContextItem } from './context_menu';
 import { t, trError, getLang, setLang, syncLangToBackend, LANG_LABEL, type Lang } from './i18n';
 import { loadUntilFound } from './search_navigation';
+import { moreMenuHtml } from './more_menu';
 
 type Page = 'messages' | 'contacts' | 'discover' | 'settings' | 'about' | 'profile';
 const root = document.querySelector<HTMLDivElement>('#app');
@@ -3062,7 +3063,7 @@ function render(): void {
         <button class="rail-bottom" data-action="lock-now" aria-label="${t('nav.lock')}" title="${t('nav.lock')}">${icon('lock')}</button>
         <button class="rail-bottom" data-action="menu" aria-label="${t('nav.more')}" aria-expanded="${menuOpen}" title="${t('nav.more')}">${icon('menu')}</button>
       </aside>
-      ${menuOpen ? `<div class="menu" role="menu"><button data-page="settings" role="menuitem">${t('menu.settings')}</button><button data-page="settings" data-settings-tab="privacy" role="menuitem">${t('menu.chatBackup')}</button><span>${t('menu.userBackupTodo')}</span><span>${t('menu.userRestoreTodo')}</span><button data-page="settings" data-settings-tab="privacy" role="menuitem">${t('menu.chatRestore')}</button><button data-page="about" role="menuitem">${t('menu.about')}</button></div>` : ''}
+      ${menuOpen ? `<div class="menu" role="menu">${moreMenuHtml(t)}</div>` : ''}
       <aside class="sidebar">
         <div class="team"><span class="team-mark">${teamLogoUrl ? `<img class="team-logo" src="${escapeText(teamLogoUrl)}" alt="${escapeText(t('团队 Logo'))}">` : icon('spark')}</span><div><strong>${team.name ? escapeText(team.name) : 'Qbird'}</strong><small>LOCAL NETWORK MESSENGER</small></div></div>
         <div class="side-heading"><div><span class="eyebrow">${current.eyebrow}</span><h1>${current.title()}</h1></div></div>
