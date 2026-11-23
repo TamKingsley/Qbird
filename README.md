@@ -8,13 +8,24 @@ English · [简体中文](README_CN.md)
 
 Qbird is a Windows desktop app for discovering nearby Qbird users and communicating directly between devices. It has no hosted relay or account service; chat history and identity data are stored locally.
 
-> **0.1.15 · Windows x64 preview.** Qbird has not received an independent security audit. The local SQLite database is not encrypted, and App Lock only hides the interface. Do not use this preview for sensitive information or production communication. LAN discovery advertises the nickname and username configured in the app.
+> **Windows x64 preview.** Qbird has not received an independent security audit. The local SQLite database is not encrypted, and App Lock only hides the interface. Do not use this preview for sensitive information or production communication. LAN discovery advertises the nickname and username configured in the app.
 
 ## Preview
 
-![Qbird 0.1.15 message screen](docs/assets/qbird-demo.png)
+![Qbird message screen](docs/assets/qbird-demo.png)
 
-_The screenshot shows the current build with an isolated local profile and no personal data._
+_The screenshots show the current build with an isolated local profile and no personal data._
+
+## Highlights
+
+A quick map of what Qbird does across its core areas.
+
+| Area                    | What you get                                                                                             |
+| ----------------------- | -------------------------------------------------------------------------------------------------------- |
+| **Direct & group chat** | LAN discovery, verified identities, direct/group/self chats with local history, replies and @ mentions.  |
+| **Files & media**       | Local file and image transfer with retry/resume, configurable receive folders and storage quotas.        |
+| **Records & privacy**   | Full-history search, encrypted password-protected export/backup, app lock and tray controls.             |
+| **Extensibility**       | A tabbed workspace with built-in read-only previews; richer previews and AI bots are planned as plugins. |
 
 ## Features
 
@@ -27,6 +38,15 @@ _The screenshot shows the current build with an isolated local profile and no pe
 - Simplified Chinese, Traditional Chinese, and English options for the app frame and selected surfaces. Chat screens and some backend messages are not fully translated yet.
 
 Qbird is built with Tauri, Rust, TypeScript, Vite, and SQLite. Peer communication does not use a hosted relay. See [known limitations](docs/PLUGIN.md) for the preview-plugin boundary.
+
+## Vision
+
+Qbird stays deliberately small: the core keeps only what a trustworthy local network messenger needs — identity, discovery, chat, basic file exchange and local data. Everything else is meant to grow through **plugins** rather than by bloating the core.
+
+- **Local-first, no relay.** Your data stays on your machine; there is no account server and no hosted message relay.
+- **Plugin ecosystem.** Richer sidebar file previews, AI bots and agent conversations are planned as optional plugins behind a stable, permission-bounded interface. The plugin marketplace is not part of the current scope.
+- **Cross-platform.** Windows ships first, with Linux and macOS planned; the architecture is designed for portability and light resource use from the start.
+- **Security as a direction, not a claim.** Privacy and safety guide the design, but this preview has not passed an independent security audit and is not presented as production-grade.
 
 ## Architecture
 
@@ -83,4 +103,4 @@ Focused pull requests and issue reports are welcome. Please discuss identity, cr
 
 ## Development assistance
 
-Development assistance: MuseWork and Lingxi.
+Qbird is an open-source, non-commercial project. Its development is assisted by **MuseWork** and **Lingxi** (WPS AI agents).

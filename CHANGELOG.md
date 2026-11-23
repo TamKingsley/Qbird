@@ -3,22 +3,32 @@
 All notable changes to Qbird are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/); versions are tagged `vX.Y.Z`.
 
+Entries are bilingual: each English bullet is followed by its Chinese
+translation. Release notes are taken from the matching `## [X.Y.Z]` section.
+
 ## [Unreleased]
 
 ## [0.1.16] - 2026-11-23
 
-### Added
+### Added / 新增
 
 - Encrypted chat export: select conversations (direct/group/self) and a time range, then export each as an encrypted `.qchat` file from the chat-records window.
+- 加密聊天导出：在聊天记录窗口选择会话（单聊/群聊/自聊）和时间范围，将每个会话导出为加密的 `.qchat` 文件。
 - Full-history search in the chat-records window, with search navigation across matching messages.
+- 聊天记录窗口支持全历史搜索，可在匹配的消息之间跳转导航。
 - Avatars now appear beside chat bubbles in direct and group chats.
+- 单聊和群聊的消息气泡旁现在显示头像。
 
-### Fixed
+### Fixed / 修复
 
 - Offline message recalls are re-delivered and applied when the peer reconnects, and the original message shows a recall notice; chat avatars stay in sync across peers.
+- 离线撤回会在对端重新上线后补发并生效，原消息显示撤回提示；聊天头像在对端之间保持同步。
 - LAN contact requests are repaired: presence probing and request handling now complete reliably instead of failing silently.
+- 修复局域网联系人请求：在线探测与请求处理现在可靠完成，不再静默失败。
 - The chat-records window keeps its window controls usable when a load fails, and surfaces the failure message.
+- 聊天记录窗口在加载失败时仍保留可用的窗口控件，并显示失败原因。
 - The unfinished "user backup" and "user restore" placeholders are hidden from the More menu in all locales; chat backup/restore behavior is unchanged.
+- 在所有语言的“更多”菜单中隐藏尚未完成的“用户备份”和“用户还原”占位项；聊天备份/还原行为不变。
 
 ## [0.1.15] - 2026-11-22
 
