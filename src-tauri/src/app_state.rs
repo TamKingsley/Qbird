@@ -85,19 +85,21 @@ pub async fn v1_flush_direct(state: tauri::State<'_, AppState>, peer: String) ->
 
 /// Tells a contact we added it, so a single add can become mutual. Best effort: the peer
 /// may be offline, may have automatic acceptance off, or may already know us.
-fn notify_contact_async(identity: Arc<Identity>, store: Arc<Mutex<Store>>, peer: &str, address: Option<String>) {
+fn notify_contact_async(identity: Arc<Identity>, store: Arc<Mutex<Store>>, peer: &str, address: Option<String>, profile_override: Option<(String, Option<String>)>) {
     let address = address.or_else(|| store.lock().ok().and_then(|store| store.contact_address(peer).ok().flatten()));
     let Some(parsed) = address.and_then(|value| crate::address::parse_manual_address(&value).ok()) else { return };
     let announce = store.lock().ok().and_then(|store| store.get_profile().ok())
         .map(|profile| crate::probe::ContactAnnounce {
-            nickname: profile.nickname,
-            username: Some(profile.username).filter(|value| !value.is_empty()),
+            nickname: profile_override.as_ref().map(|value| value.0.clone()).unwrap_or(profile.nickname),
+            username: profile_override.and_then(|value| value.1).or_else(|| Some(profile.username).filter(|value| !value.is_empty())),
             kind: None,
             address: None,
             reason: None,
+            request_id: None,
         });
     if let Some(announce) = announce {
-        std::thread::spawn(move || { let _ = crate::probe::announce_contact(&identity, parsed, &announce); });
+        let peer = peer.to_owned();
+        std::thread::spawn(move || { let _ = crate::probe::announce_contact_pinned(&identity, parsed, &announce, &peer); });
     }
 }
 
@@ -106,13 +108,13 @@ pub fn v1_open_direct(state: tauri::State<'_, AppState>, peer: String) -> Result
     let opened = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?.open_direct(&peer).map_err(|_| "无法打开会话".to_owned())?;
     if !opened { return Err("联系人尚未确认".into()); }
     // Retry the mutual-add notice when the chat is opened; it is idempotent.
-    notify_contact_async(Arc::clone(&state.identity), Arc::clone(&state.store), &peer, None);
+    notify_contact_async(Arc::clone(&state.identity), Arc::clone(&state.store), &peer, None, None);
     Ok(())
 }
 
 #[tauri::command]
 pub fn v1_announce_contact(state: tauri::State<'_, AppState>, peer: String) -> Result<(), String> {
-    notify_contact_async(Arc::clone(&state.identity), Arc::clone(&state.store), &peer, None);
+    notify_contact_async(Arc::clone(&state.identity), Arc::clone(&state.store), &peer, None, None);
     Ok(())
 }
 
@@ -1038,7 +1040,7 @@ pub async fn v1_lan_people(state: tauri::State<'_, AppState>) -> Result<Vec<LanP
             qbird_id: qbird_id(&fingerprint),
             nickname: existing.map(|contact| contact.display_name.clone()).or(candidate.nickname),
             username: existing.and_then(|contact| contact.username.clone()).or(candidate.username),
-            known: existing.is_some(),
+            known: existing.is_some_and(|contact| contact.trust_state == "verified"),
             verified: existing.is_some_and(|contact| contact.trust_state == "verified"),
             fingerprint,
         }
@@ -1050,44 +1052,71 @@ pub async fn v1_lan_people(state: tauri::State<'_, AppState>) -> Result<Vec<LanP
 #[tauri::command]
 pub async fn v1_add_contact(
     state: tauri::State<'_, AppState>, address: String, fingerprint: String, display_name: String, username: Option<String>,
-) -> Result<(), String> {
+    sender_nickname: Option<String>, sender_username: Option<String>, reason: Option<String>,
+) -> Result<String, String> {
     let address = crate::address::parse_manual_address(&address).map_err(str::to_owned)?;
     if !crate::storage::valid_fingerprint_public(&fingerprint) { return Err("身份标识格式不正确".into()); }
     if fingerprint == state.identity.fingerprint() { return Err("不能添加本机身份".into()); }
-    let name = display_name.trim();
+    let name = display_name.trim().to_owned();
     if name.is_empty() || name.chars().count() > 64 { return Err("联系人名称须为 1–64 个字符".into()); }
     let username = username.map(|value| value.trim().to_owned()).filter(|value| !value.is_empty());
     if let Some(value) = username.as_deref() {
         if !crate::storage::valid_username_public(value) { return Err("对方用户名格式不正确".into()); }
     }
+    let profile_override = match sender_nickname.map(|value| value.trim().to_owned()).filter(|value| !value.is_empty()) {
+        Some(nickname) => {
+            if nickname.chars().count() > 64 || nickname.chars().any(char::is_control) { return Err("本机昵称格式不正确".into()); }
+            let sender_username = sender_username.map(|value| value.trim().to_owned()).filter(|value| !value.is_empty());
+            if sender_username.as_deref().is_some_and(|value| !crate::storage::valid_username_public(value)) { return Err("本机用户名格式不正确".into()); }
+            Some((nickname, sender_username))
+        }
+        None => None,
+    };
+    let reason = reason.map(|value| value.trim().to_owned()).filter(|value| !value.is_empty());
+    if reason.as_deref().is_some_and(|value| value.len() > 600 || value.chars().any(char::is_control)) { return Err("验证信息过长或包含无效字符".into()); }
+    let (nickname, sender_username) = {
+        let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+        if store.is_verified(&fingerprint).map_err(|_| "无法读取联系人".to_owned())? { return Ok("accepted".into()); }
+        let profile = store.get_profile().map_err(|_| "无法读取个人资料".to_owned())?;
+        profile_override.unwrap_or((profile.nickname, Some(profile.username).filter(|value| !value.is_empty())))
+    };
+    if nickname.trim().is_empty() { return Err("请先填写自己的昵称".into()); }
+    let local_address = local_contact_address(&state);
     if state.outbound_probe.swap(true, Ordering::AcqRel) { return Err("已有身份探测正在进行，请稍后重试".into()); }
     let guard = ProbeGuard(Arc::clone(&state.outbound_probe));
     let identity = Arc::clone(&state.identity);
     let expected = fingerprint.clone();
-    let probed = tauri::async_runtime::spawn_blocking(move || {
+    let store = Arc::clone(&state.store);
+    tauri::async_runtime::spawn_blocking(move || {
         let _guard = guard;
-        crate::probe::connect(&identity, address)
-    }).await.map_err(|_| "身份探测不可用".to_owned())?
-      .map_err(|_| "无法连接对方：对方可能离线、端口错误或网络受阻".to_owned())?;
-    if probed != expected { return Err("该地址当前的用户与列表不一致，请刷新后重试".into()); }
-    {
-        let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
-        store.add_candidate_with_username(&fingerprint, name, username.as_deref()).map_err(|_| "无法保存联系人".to_owned())?;
-        if !store.is_verified(&fingerprint).map_err(|_| "无法读取联系人".to_owned())? {
-            if !store.confirm_candidate(&fingerprint).map_err(|_| "无法确认联系人".to_owned())? {
-                return Err("无法确认联系人".into());
+        use crate::probe::{ContactAnnounce, ContactReply};
+        let mut message = ContactAnnounce { nickname, username: sender_username, kind: Some("policy".into()), address: local_address, reason: None, request_id: None };
+        let policy = crate::probe::contact_exchange(&identity, address, &message, &expected)
+            .map_err(|_| "无法安全连接对方：请确认对方在线，且双方都已升级到支持加密好友添加的版本".to_owned())?;
+        if policy == ContactReply::Unavailable { return Err("对方当前不接受添加请求".into()); }
+        if policy == ContactReply::VerifyRequired && reason.is_none() { return Ok("verify_required".into()); }
+        if !matches!(policy, ContactReply::Accepted | ContactReply::VerifyRequired) { return Err("对方返回了无效状态".into()); }
+        let request_id = {
+            let store = store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+            store.create_contact_request("out", &expected, &name, username.as_deref(), Some(&address.to_string()), unix_now()?)
+                .map_err(|_| "无法保存好友申请".to_owned())?.ok_or("无法保存好友申请".to_owned())?.id
+        };
+        message.kind = Some("request".into());
+        message.reason = reason;
+        message.request_id = Some(request_id.clone());
+        match crate::probe::contact_exchange(&identity, address, &message, &expected)
+            .map_err(|_| "申请发送未确认，请检查网络后重试".to_owned())? {
+            ContactReply::Accepted => {
+                let store = store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+                if store.resolve_contact_request(&request_id, true, unix_now()?).map_err(|_| "无法保存联系人".to_owned())?.is_none()
+                    && !store.is_verified(&expected).unwrap_or(false) { return Err("无法保存联系人".into()); }
+                Ok("accepted".into())
             }
+            ContactReply::Pending => Ok("pending".into()),
+            ContactReply::VerifyRequired => Ok("verify_required".into()),
+            _ => Err("对方未接受添加请求".into()),
         }
-    }
-    // Keep the probed address: without it a cross-subnet contact can never be
-    // reached again and queued messages would stay pending forever.
-    if let Ok(store) = state.store.lock() {
-        let _ = store.set_contact_address(&fingerprint, &address.to_string());
-    }
-    // Tell the peer to add us back. Failure is expected when it is offline or has
-    // automatic acceptance disabled; the local contact stays saved either way.
-    notify_contact_async(Arc::clone(&state.identity), Arc::clone(&state.store), &fingerprint, Some(address.to_string()));
-    Ok(())
+    }).await.map_err(|_| "好友添加任务异常".to_owned())?
 }
 
 #[derive(serde::Serialize)]
@@ -2729,8 +2758,8 @@ fn local_contact_address(state: &AppState) -> Option<String> {
 }
 
 fn announce_status(identity: Arc<Identity>, store: Arc<Mutex<Store>>, peer: &str, address: String,
-    kind: &'static str, reason: Option<String>) {
-    let _ = peer;
+    kind: &'static str, request_id: Option<String>) {
+    let peer = peer.to_owned();
     let Some(parsed) = crate::address::parse_manual_address(&address).ok() else { return };
     let announce = store.lock().ok().and_then(|store| store.get_profile().ok())
         .map(|profile| crate::probe::ContactAnnounce {
@@ -2738,62 +2767,67 @@ fn announce_status(identity: Arc<Identity>, store: Arc<Mutex<Store>>, peer: &str
             username: Some(profile.username).filter(|value| !value.is_empty()),
             kind: Some(kind.to_owned()),
             address: None,
-            reason,
+            reason: None,
+            request_id,
         });
     if let Some(announce) = announce {
-        std::thread::spawn(move || { let _ = crate::probe::announce_contact(&identity, parsed, &announce); });
+        std::thread::spawn(move || { let _ = crate::probe::contact_exchange(&identity, parsed, &announce, &peer); });
     }
 }
 
-/// Files a friend request and sends it; `accepted` means the peer auto-accepted.
-#[tauri::command]
-pub fn v1_request_contact(state: tauri::State<'_, AppState>, peer: String) -> Result<String, String> {
-    let store = Arc::clone(&state.store);
-    let profile = store.lock().map_err(|_| "本地存储不可用".to_owned())?
-        .get_profile().map_err(|_| "无法读取资料".to_owned())?;
-    let now = unix_now()?;
-    let address = store.lock().map_err(|_| "本地存储不可用".to_owned())?
-        .contact_address(&peer).map_err(|_| "无法读取地址".to_owned())?;
-    let Some(address) = address else { return Err("还没有对方地址，请先探测该用户".into()); };
-    {
-        let store = store.lock().map_err(|_| "本地存储不可用".to_owned())?;
-        if store.is_verified(&peer).map_err(|_| "本地存储不可用".to_owned())? {
-            return Ok("verified".into());
-        }
-        store.create_contact_request("out", &peer, &profile.nickname,
-            Some(profile.username.as_str()).filter(|value| !value.is_empty()),
-            Some(address.as_str()), now).map_err(|_| "无法保存申请".to_owned())?;
-    }
-    let local = local_contact_address(&state);
-    let identity = Arc::clone(&state.identity);
-    let target = address.clone();
-    let nickname = profile.nickname.clone();
-    let username = profile.username.clone();
-    let accepted = std::thread::spawn(move || {
-        let announce = crate::probe::ContactAnnounce {
-            nickname,
-            username: Some(username).filter(|value| !value.is_empty()),
-            kind: Some("request".into()),
-            address: local,
-            reason: None,
-        };
-        crate::address::parse_manual_address(&target).ok()
-            .and_then(|parsed| crate::probe::announce_contact(&identity, parsed, &announce).ok())
-            .unwrap_or(false)
-    }).join().unwrap_or(false);
-    if accepted {
-        store.lock().map_err(|_| "本地存储不可用".to_owned())?
-            .resolve_contact_request_by_peer(&peer, "out", true, now).map_err(|_| "无法更新申请".to_owned())?;
-        return Ok("accepted".into());
-    }
-    Ok("pending".into())
+#[derive(serde::Serialize)]
+pub struct ContactRequestView {
+    #[serde(flatten)]
+    request: crate::storage::ContactRequest,
+    reason: Option<String>,
 }
 
 #[tauri::command]
 pub fn v1_contact_requests(state: tauri::State<'_, AppState>, direction: String)
-    -> Result<Vec<crate::storage::ContactRequest>, String> {
-    state.store.lock().map_err(|_| "本地存储不可用".to_owned())?
-        .list_contact_requests(&direction).map_err(|_| "无法读取好友申请".to_owned())
+    -> Result<Vec<ContactRequestView>, String> {
+    let store = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+    let requests = store.list_contact_requests(&direction).map_err(|_| "无法读取好友申请".to_owned())?;
+    requests.into_iter().map(|request| {
+        let reason = store.get_setting(&format!("contact_reason_{}", request.id)).map_err(|_| "无法读取验证信息".to_owned())?;
+        Ok(ContactRequestView { request, reason })
+    }).collect()
+}
+
+/// Poll a small rotating batch so an answer received while offline is not lost.
+#[tauri::command]
+pub async fn v1_sync_contact_requests(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+    let store = Arc::clone(&state.store);
+    let identity = Arc::clone(&state.identity);
+    tauri::async_runtime::spawn_blocking(move || {
+        let (requests, profile) = {
+            let store = store.lock().map_err(|_| "本地存储不可用".to_owned())?;
+            (store.list_contact_requests("out").map_err(|_| "无法读取好友申请".to_owned())?
+                .into_iter().filter(|r| r.status == "pending").collect::<Vec<_>>(),
+             store.get_profile().map_err(|_| "无法读取资料".to_owned())?)
+        };
+        if requests.is_empty() { return Ok(false); }
+        let start = (unix_now()? as usize / 4 * 4) % requests.len();
+        let mut message = crate::probe::ContactAnnounce {
+            nickname: profile.nickname, username: Some(profile.username).filter(|s| !s.is_empty()),
+            address: None, reason: None, kind: Some("status".into()), request_id: None,
+        };
+        let mut changed = false;
+        for offset in 0..requests.len().min(4) {
+            let request = &requests[(start + offset) % requests.len()];
+            message.request_id = Some(request.id.clone());
+            let Some(address) = request.address.as_deref().and_then(|a| crate::address::parse_manual_address(a).ok()) else { continue };
+            let reply = crate::probe::contact_exchange(&identity, address, &message, &request.peer);
+            let accept = match reply {
+                Ok(crate::probe::ContactReply::Accepted) => true,
+                Ok(crate::probe::ContactReply::Rejected) => false,
+                _ => continue,
+            };
+            changed |= store.lock().map_err(|_| "本地存储不可用".to_owned())?
+                .resolve_contact_request(&request.id, accept, unix_now()?)
+                .map_err(|_| "无法更新好友申请".to_owned())?.is_some();
+        }
+        Ok(changed)
+    }).await.map_err(|_| "好友申请同步任务异常".to_owned())?
 }
 
 #[tauri::command]
@@ -2805,9 +2839,11 @@ pub fn v1_respond_contact_request(state: tauri::State<'_, AppState>, id: String,
     };
     if let Some(request) = request {
         if let Some(address) = request.address.clone() {
+            let request_id = state.store.lock().map_err(|_| "本地存储不可用".to_owned())?
+                .get_setting(&format!("contact_token_{}", request.id)).map_err(|_| "无法读取申请编号".to_owned())?;
             announce_status(Arc::clone(&state.identity), Arc::clone(&state.store), &request.peer, address,
                 if accept { "accept" } else { "reject" },
-                if accept { None } else { Some("rejected".into()) });
+                request_id);
         }
     }
     Ok(())

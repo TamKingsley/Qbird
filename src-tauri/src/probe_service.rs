@@ -89,6 +89,99 @@ mod tests {
     }
 
     #[test]
+    fn direct_add_automatically_syncs_and_respects_privacy() {
+        let server = identity("direct-add-server");
+        let client = identity("direct-add-client");
+        let other = identity("direct-add-other");
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("service-tests");
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let server_store = Arc::new(Mutex::new(Store::open(&dir.join(format!("direct-server-{unique}.sqlite"))).unwrap()));
+        let client_store = Arc::new(Mutex::new(Store::open(&dir.join(format!("direct-client-{unique}.sqlite"))).unwrap()));
+        let service = ProbeService::start_with_chat(Arc::clone(&server), 0, Arc::clone(&server_store)).unwrap();
+        let address: SocketAddr = format!("127.0.0.1:{}", service.port()).parse().unwrap();
+        let announce = probe::ContactAnnounce { nickname: "Alice".into(), username: Some("Alice_01".into()), kind: None, address: None, reason: None, request_id: None };
+        {
+            let store = client_store.lock().unwrap();
+            store.add_candidate(&server.fingerprint(), "Bob").unwrap();
+            store.confirm_candidate(&server.fingerprint()).unwrap();
+        }
+        assert!(probe::announce_contact_pinned(&client, address, &announce, &other.fingerprint()).is_err());
+        assert!(server_store.lock().unwrap().list_contacts().unwrap().is_empty());
+        assert!(probe::announce_contact_pinned(&client, address, &announce, &server.fingerprint()).unwrap());
+        assert!(probe::announce_contact_pinned(&client, address, &announce, &server.fingerprint()).unwrap(), "duplicate direct adds are idempotent");
+        {
+            let store = server_store.lock().unwrap();
+            assert!(store.is_verified(&client.fingerprint()).unwrap());
+            assert_eq!(store.list_contacts().unwrap().len(), 1);
+            assert!(store.list_contact_requests("in").unwrap().is_empty());
+        }
+        let message = client_store.lock().unwrap().queue_direct(&client.fingerprint(), &server.fingerprint(), "hello", 1).unwrap();
+        chat_transport::send_one(&client, &client_store, &server.fingerprint(), address, &message.id).unwrap();
+        assert_eq!(server_store.lock().unwrap().list_direct(&client.fingerprint(), 10, None).unwrap()[0].body, "hello");
+
+        server_store.lock().unwrap().set_auto_accept_contacts(false).unwrap();
+        assert!(!probe::announce_contact(&other, address, &announce).unwrap());
+        assert!(!server_store.lock().unwrap().is_verified(&other.fingerprint()).unwrap());
+        server_store.lock().unwrap().set_auto_accept_contacts(true).unwrap();
+        server_store.lock().unwrap().set_lan_visible(false).unwrap();
+        assert!(!probe::announce_contact(&other, address, &announce).unwrap());
+        assert!(!server_store.lock().unwrap().is_verified(&other.fingerprint()).unwrap());
+    }
+
+    #[test]
+    fn contact_verification_requires_approval_and_correlates_retries() {
+        use probe::{ContactAnnounce, ContactReply};
+        let server = identity("verify-server");
+        let client = identity("verify-client");
+        let stranger = identity("verify-stranger");
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("service-tests");
+        fs::create_dir_all(&dir).unwrap();
+        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let incoming = Arc::new(Mutex::new(Store::open(&dir.join(format!("verify-in-{stamp}.sqlite"))).unwrap()));
+        let outgoing = Store::open(&dir.join(format!("verify-out-{stamp}.sqlite"))).unwrap();
+        incoming.lock().unwrap().set_auto_accept_contacts(false).unwrap();
+        let service = ProbeService::start_with_chat(Arc::clone(&server), 0, Arc::clone(&incoming)).unwrap();
+        let addr: SocketAddr = format!("127.0.0.1:{}", service.port()).parse().unwrap();
+        let server_key = server.fingerprint();
+        let client_key = client.fingerprint();
+        let mut message = ContactAnnounce { nickname: "Alice".into(), username: None, address: None,
+            kind: Some("policy".into()), reason: None, request_id: None };
+        assert_eq!(probe::contact_exchange(&client, addr, &message, &server_key).unwrap(), ContactReply::VerifyRequired);
+        assert!(probe::contact_exchange(&client, addr, &message, &stranger.fingerprint()).is_err());
+        message.kind = Some("request".into());
+        message.reason = Some("Alice from the design team".into());
+        let first = outgoing.create_contact_request("out", &server_key, "Bob", None, Some(&addr.to_string()), 1).unwrap().unwrap();
+        message.request_id = Some(first.id.clone());
+        assert_eq!(probe::contact_exchange(&client, addr, &message, &server_key).unwrap(), ContactReply::Pending);
+        assert!(outgoing.list_contacts().unwrap().is_empty());
+        let request = incoming.lock().unwrap().list_contact_requests("in").unwrap().remove(0);
+        assert_eq!(incoming.lock().unwrap().get_setting(&format!("contact_reason_{}", request.id)).unwrap().as_deref(), Some("Alice from the design team"));
+        assert!(incoming.lock().unwrap().list_contacts().unwrap().is_empty());
+        incoming.lock().unwrap().resolve_contact_request(&request.id, false, 2).unwrap();
+        message.kind = Some("status".into());
+        message.reason = None;
+        assert_eq!(probe::contact_exchange(&client, addr, &message, &server_key).unwrap(), ContactReply::Rejected);
+        outgoing.resolve_contact_request(&first.id, false, 2).unwrap();
+        let second = outgoing.create_contact_request("out", &server_key, "Bob", None, Some(&addr.to_string()), 3).unwrap().unwrap();
+        message.kind = Some("request".into());
+        message.reason = Some("Please try again".into());
+        message.request_id = Some(second.id.clone());
+        assert_eq!(probe::contact_exchange(&client, addr, &message, &server_key).unwrap(), ContactReply::Pending);
+        message.kind = Some("status".into());
+        message.reason = None;
+        assert_eq!(probe::contact_exchange(&client, addr, &message, &server_key).unwrap(), ContactReply::Pending);
+        message.request_id = Some(first.id.clone());
+        assert_eq!(probe::contact_exchange(&client, addr, &message, &server_key).unwrap(), ContactReply::Rejected);
+        let pending = incoming.lock().unwrap().pending_contact_request(&client_key, "in").unwrap().unwrap();
+        incoming.lock().unwrap().resolve_contact_request(&pending.id, true, 4).unwrap();
+        message.request_id = Some(second.id.clone());
+        assert_eq!(probe::contact_exchange(&client, addr, &message, &server_key).unwrap(), ContactReply::Accepted);
+        outgoing.resolve_contact_request(&second.id, true, 4).unwrap();
+        assert!(incoming.lock().unwrap().is_verified(&client_key).unwrap());
+        assert!(outgoing.is_verified(&server_key).unwrap());
+    }
+
+    #[test]
     fn stopping_closes_connections_waiting_for_preface_or_tls() {
         use std::{io::{Read, Write}, net::TcpStream};
         let server = identity("stop-server");
@@ -307,47 +400,68 @@ impl ProbeService {
                             }
                             if detected && !stopping.load(Ordering::Acquire) {
                                 if first[0] == 0x16 {
-                                    if let Ok((fingerprint, kind)) = probe::accept_classified(&identity, &mut socket) {
+                                    if let Ok((fingerprint, kind, mut connection)) = probe::accept_classified(&identity, &mut socket) {
                                         match kind {
                                             probe::ProbeKind::Contact => {
                                                 // A peer asks to become a contact. The fingerprint always
                                                 // comes from TLS; the body only carries display hints and
                                                 // the requester's return address.
                                                 if let Some(store) = &store {
-                                                    let accepted = match probe::read_contact_announce(&mut socket) {
+                                                    let reply = match probe::read_contact_announce(&mut connection, &mut socket) {
                                                         Ok(announce) => {
                                                             let now = std::time::SystemTime::now()
                                                                 .duration_since(std::time::UNIX_EPOCH)
                                                                 .map(|value| value.as_secs() as i64).unwrap_or(0);
                                                             store.lock().ok().map(|store| {
+                                                                use probe::ContactReply as Reply;
                                                                 match announce.kind.as_deref().unwrap_or("announce") {
-                                                                    "accept" => {
-                                                                        let _ = store.confirm_candidate(&fingerprint);
-                                                                        let _ = store.resolve_contact_request_by_peer(&fingerprint, "out", true, now);
-                                                                        true
+                                                                    "accept" | "reject" => {
+                                                                        let Some(id) = announce.request_id.as_deref() else { return Reply::Unavailable; };
+                                                                        let request = store.contact_request(id).ok().flatten();
+                                                                        if !request.is_some_and(|r| r.peer == fingerprint && r.direction == "out" && r.status == "pending") { return Reply::Unavailable; }
+                                                                        if store.resolve_contact_request(id, announce.kind.as_deref() == Some("accept"), now).ok().flatten().is_some() { Reply::Accepted } else { Reply::Unavailable }
                                                                     }
-                                                                    "reject" => {
-                                                                        let _ = store.resolve_contact_request_by_peer(&fingerprint, "out", false, now);
-                                                                        true
-                                                                    }
-                                                                    _ => {
-                                                                        if !store.lan_visible().unwrap_or(true) { return false; }
-                                                                        let nickname = if announce.nickname.trim().is_empty() { fingerprint[..8].to_string() } else { announce.nickname.clone() };
-                                                                        let _ = store.create_contact_request("in", &fingerprint, &nickname,
-                                                                            announce.username.as_deref(), announce.address.as_deref(), now);
-                                                                        if store.contact_request_mode().unwrap_or_else(|_| "ask".into()) == "auto" {
-                                                                            let _ = store.add_candidate_with_username(&fingerprint, &nickname, announce.username.as_deref());
-                                                                            store.confirm_candidate(&fingerprint).unwrap_or(false)
-                                                                        } else {
-                                                                            false
+                                                                    "status" => {
+                                                                        if store.is_verified(&fingerprint).unwrap_or(false) { return Reply::Accepted; }
+                                                                        let Some(token) = announce.request_id.as_deref() else { return Reply::Unavailable; };
+                                                                        match store.list_contact_requests("in").ok().and_then(|items| items.into_iter().find(|item| item.peer == fingerprint && store.get_setting(&format!("contact_token_{}", item.id)).ok().flatten().as_deref() == Some(token))) {
+                                                                            Some(item) if item.status == "accepted" => Reply::Accepted,
+                                                                            Some(item) if item.status == "rejected" => Reply::Rejected,
+                                                                            Some(_) => Reply::Pending,
+                                                                            None => Reply::Unavailable,
                                                                         }
                                                                     }
+                                                                    "policy" => {
+                                                                        if !store.lan_visible().unwrap_or(false) { Reply::Unavailable }
+                                                                        else if store.auto_accept_contacts().unwrap_or(false) { Reply::Accepted }
+                                                                        else { Reply::VerifyRequired }
+                                                                    }
+                                                                    "announce" | "request" => {
+                                                                        if !store.lan_visible().unwrap_or(false) { return Reply::Unavailable; }
+                                                                        let nickname = if announce.nickname.trim().is_empty() { fingerprint[..8].to_string() } else { announce.nickname.clone() };
+                                                                        if store.is_verified(&fingerprint).unwrap_or(false) { return Reply::Accepted; }
+                                                                        if announce.kind.as_deref() == Some("request") && announce.request_id.is_none() { return Reply::Unavailable; }
+                                                                        if store.auto_accept_contacts().unwrap_or(false) {
+                                                                            if store.add_candidate_with_username(&fingerprint, &nickname, announce.username.as_deref()).is_err()
+                                                                                || !store.confirm_candidate(&fingerprint).unwrap_or(false) { return Reply::Unavailable; }
+                                                                            if let Some(address) = announce.address.as_deref() { let _ = store.set_contact_address(&fingerprint, address); }
+                                                                            Reply::Accepted
+                                                                        } else {
+                                                                            let Some(reason) = announce.reason.as_deref().filter(|s| !s.trim().is_empty()) else { return Reply::VerifyRequired; };
+                                                                            let Some(token) = announce.request_id.as_deref() else { return Reply::Unavailable; };
+                                                                            match store.create_contact_request("in", &fingerprint, &nickname, announce.username.as_deref(), announce.address.as_deref(), now) {
+                                                                                Ok(Some(request)) if store.set_setting(&format!("contact_reason_{}", request.id), Some(reason)).is_ok() && store.set_setting(&format!("contact_token_{}", request.id), Some(token)).is_ok() => Reply::Pending,
+                                                                                _ => Reply::Unavailable,
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                    _ => Reply::Unavailable,
                                                                 }
-                                                            }).unwrap_or(false)
+                                                            }).unwrap_or(probe::ContactReply::Unavailable)
                                                         }
-                                                        Err(_) => false,
+                                                        Err(_) => probe::ContactReply::Unavailable,
                                                     };
-                                                    let _ = probe::write_contact_ack(&mut socket, accepted);
+                                                    let _ = probe::write_contact_ack(&mut connection, &mut socket, reply);
                                                 }
                                             }
                                             probe::ProbeKind::Automatic => {}
