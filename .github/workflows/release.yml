@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
 
 permissions:
   actions: read
@@ -112,6 +112,7 @@ jobs:
           Compress-Archive -Path (Join-Path $portable '*') -DestinationPath (Join-Path $assets "Qbird-$env:VERSION-windows-x64-portable.zip") -CompressionLevel Optimal
           Get-ChildItem $assets -File | Select-Object Name,Length | Format-Table -AutoSize
       - name: Extract changelog section for the tag
+        id: changelog
         shell: pwsh
         env:
           VERSION: ${{ steps.release.outputs.version }}
@@ -123,16 +124,21 @@ jobs:
             if ($start -lt 0 -and $lines[$i] -match "^## \[$env:VERSION\]") { $start = $i; continue }
             if ($start -ge 0 -and $lines[$i] -match '^## ') { $end = $i; break }
           }
-          if ($start -lt 0) { throw "CHANGELOG.md has no section for version $env:VERSION" }
-          $stop = if ($end -ge 0) { $end } else { $lines.Count }
-          ($lines[($start+1)..($stop-1)] -join [Environment]::NewLine).Trim() | Set-Content -Encoding utf8 release-notes.md
+          if ($start -lt 0) {
+            "has_changelog=false" >> $env:GITHUB_OUTPUT
+            Set-Content -Encoding utf8 release-notes.md ''
+          } else {
+            "has_changelog=true" >> $env:GITHUB_OUTPUT
+            $stop = if ($end -ge 0) { $end } else { $lines.Count }
+            ($lines[($start+1)..($stop-1)] -join [Environment]::NewLine).Trim() | Set-Content -Encoding utf8 release-notes.md
+          }
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.release.outputs.tag }}
           name: Qbird ${{ steps.release.outputs.tag }}
           prerelease: true
-          generate_release_notes: true
+          generate_release_notes: ${{ steps.changelog.outputs.has_changelog == 'false' }}
           body_path: release-notes.md
           fail_on_unmatched_files: true
           overwrite_files: true
