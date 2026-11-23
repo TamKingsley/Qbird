@@ -27,6 +27,15 @@ pub mod scan;
 pub mod storage;
 pub mod tls;
 
+// The library test executable does not inherit Tauri's application manifest.
+// Common Controls v6 is required for TaskDialogIndirect on Windows.
+#[cfg(all(test, target_os = "windows", target_env = "msvc"))]
+core::arch::global_asm!(r#"
+    .section .drectve
+    .ascii " /MANIFEST:EMBED"
+    .ascii " /MANIFESTDEPENDENCY:\"type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\""
+"#);
+
 use std::path::{Path, PathBuf};
 use tauri::{Emitter, Manager, WindowEvent};
 
@@ -283,6 +292,8 @@ pub fn run() {
             app_state::v1_set_team_logo,
             app_state::v1_clear_team_logo,
             app_state::v1_avatar,
+            app_state::v1_peer_avatar,
+            app_state::v1_fetch_peer_avatar,
             app_state::v1_set_avatar,
             app_state::v1_clear_avatar,
             app_state::v1_read_image_file,

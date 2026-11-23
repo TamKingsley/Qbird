@@ -571,7 +571,7 @@ const bySource: Record<string, Entry> = {
   '搜索类别': { zh: '搜索类别', tw: '搜尋类別', en: 'Search category' },
   '搜索聊天记录': { zh: '搜索聊天记录', tw: '搜尋聊天記錄', en: 'Search chat history' },
   '撤回': { zh: '撤回', tw: '收回', en: 'Recall' },
-  '撤回了一条消息': { zh: '撤回了一条消息', tw: '收回了一條訊息', en: 'recalled a message' },
+  '撤回了一条消息': { zh: '撤回了一条消息', tw: '收回了一條訊息', en: ' recalled a message' },
   '撤回失败': { zh: '撤回失败', tw: '收回失败', en: 'Recall failed' },
   '撤回并取消发送': { zh: '撤回并取消发送', tw: '收回并取消傳送', en: 'Recall and cancel sending' },
   '撤回（已接收的文件保留）': { zh: '撤回（已接收的文件保留）', tw: '收回（已接收的檔案保留）', en: 'Recall (received files kept)' },

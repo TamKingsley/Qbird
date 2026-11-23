@@ -23,7 +23,7 @@ struct PinnedKeys {
 impl PinnedKeys {
     fn new(fingerprints: impl IntoIterator<Item = String>) -> Result<Self, Error> {
         let fingerprints: BTreeSet<String> = fingerprints.into_iter().collect();
-        if fingerprints.is_empty() || fingerprints.len() > 1000 || fingerprints.iter().any(|value|
+        if fingerprints.is_empty() || fingerprints.len() > 65_536 || fingerprints.iter().any(|value|
             value.len() != 64 || !value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))) {
             return Err(Error::General("invalid trusted fingerprints".into()));
         }

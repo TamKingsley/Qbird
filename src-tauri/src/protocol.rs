@@ -66,10 +66,16 @@ pub enum Payload {
     GroupAvatarRequest { id: String, group_id: String },
     /// Base64 PNG chosen by the owner; an empty string means the group has no avatar.
     GroupAvatar { id: String, group_id: String, png: String },
+    /// The response carries a byte length; bounded PNG bytes follow as raw chunks.
+    ProfileAvatarRequest { id: String },
+    ProfileAvatarResponse { id: String, size: u32 },
     /// Withdraw a direct message inside the recall window; the receiver keeps a placeholder.
     RecallDirect { id: String, message_id: String },
     /// Withdraw a group message; the receiver checks membership and authorship itself.
     RecallGroup { id: String, group_id: String, message_id: String },
+    /// Recall metadata can create a placeholder without transmitting the original body.
+    RecallDirectPlaceholder { id: String, message_id: String, created_at: i64, logical: i64 },
+    RecallGroupPlaceholder { id: String, group_id: String, message_id: String, created_at: i64, logical: i64 },
 }
 
 /// Decoded avatar budget shared by the wire, storage and UI (96 KiB).
@@ -188,6 +194,10 @@ fn validate(payload: &Payload) -> io::Result<()> {
         Payload::RecallDirect { id, message_id } if valid_id(id) && valid_id(message_id) => Ok(()),
         Payload::RecallGroup { id, group_id, message_id }
             if valid_id(id) && valid_group_id(group_id) && valid_id(message_id) => Ok(()),
+        Payload::RecallDirectPlaceholder { id, message_id, logical, .. }
+            if valid_id(id) && valid_id(message_id) && *logical > 0 && *logical < i64::MAX => Ok(()),
+        Payload::RecallGroupPlaceholder { id, group_id, message_id, logical, .. }
+            if valid_id(id) && valid_group_id(group_id) && valid_id(message_id) && *logical > 0 && *logical < i64::MAX => Ok(()),
         Payload::GroupLeave { id, group_id, member }
             if valid_id(id) && valid_group_id(group_id)
                 && member.len() == 64 && member.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) => Ok(()),
@@ -207,6 +217,9 @@ fn validate(payload: &Payload) -> io::Result<()> {
         Payload::GroupAvatar { id, group_id, png }
             if valid_id(id) && valid_group_id(group_id) && png.len() <= MAX_GROUP_AVATAR_BASE64
                 && png.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=')) => Ok(()),
+        Payload::ProfileAvatarRequest { id } if valid_id(id) => Ok(()),
+        Payload::ProfileAvatarResponse { id, size }
+            if valid_id(id) && (*size as usize) <= crate::avatar::MAX_AVATAR_BYTES => Ok(()),
         _ => Err(invalid("invalid message payload")),
     }
 }
@@ -270,6 +283,20 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
+    fn recall_placeholder_frames_roundtrip_and_reject_invalid_order() {
+        for payload in [
+            Payload::RecallDirectPlaceholder { id: "r1".into(), message_id: "m1".into(), created_at: 42, logical: 3 },
+            Payload::RecallGroupPlaceholder { id: "r2".into(), group_id: "a".repeat(32), message_id: "m2".into(), created_at: 43, logical: 4 },
+        ] {
+            let mut bytes = Vec::new();
+            write_frame(&mut bytes, &payload).unwrap();
+            assert_eq!(read_frame(Cursor::new(bytes)).unwrap(), payload);
+        }
+        assert!(write_frame(Vec::new(), &Payload::RecallDirectPlaceholder { id: "r1".into(), message_id: "m1".into(), created_at: 1, logical: 0 }).is_err());
+        assert!(write_frame(Vec::new(), &Payload::RecallDirectPlaceholder { id: "r1".into(), message_id: "m1".into(), created_at: 1, logical: i64::MAX }).is_err());
+    }
+
+    #[test]
     fn frames_roundtrip_and_enforce_length_version_and_fields() {
         let text = Payload::Text { id: "message-123".into(), body: "你好\nworld".into(), created_at: 42, logical: 1 };
         let mut bytes = Vec::new();
@@ -312,6 +339,22 @@ mod tests {
         assert!(write_frame(Vec::new(), &Payload::FileAccept { id: "m1".into(), offset: MAX_FILE_BYTES + 1 }).is_err());
         assert!(write_frame(Vec::new(), &Payload::FileReject { id: "m1".into(), reason: "crafted text".into() }).is_err());
         assert!(write_frame(Vec::new(), &Payload::FileReject { id: "m1".into(), reason: "no_space".into() }).is_ok());
+    }
+
+    #[test]
+    fn profile_avatar_frames_enforce_size_and_roundtrip() {
+        for payload in [
+            Payload::ProfileAvatarRequest { id: "avatar-1".into() },
+            Payload::ProfileAvatarResponse { id: "avatar-1".into(), size: crate::avatar::MAX_AVATAR_BYTES as u32 },
+            Payload::ProfileAvatarResponse { id: "avatar-1".into(), size: 0 },
+        ] {
+            let mut bytes = Vec::new();
+            write_frame(&mut bytes, &payload).unwrap();
+            assert_eq!(read_frame(Cursor::new(bytes)).unwrap(), payload);
+        }
+        assert!(write_frame(Vec::new(), &Payload::ProfileAvatarResponse {
+            id: "avatar-1".into(), size: crate::avatar::MAX_AVATAR_BYTES as u32 + 1,
+        }).is_err());
     }
 
     #[test]
