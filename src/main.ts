@@ -3629,6 +3629,9 @@ app.addEventListener('click', (event) => {
     return;
   }
   if (action?.dataset.action === 'direct-send') { void direct.send(); return; }
+  if (action?.dataset.action === 'direct-reply' && action.dataset.id) { direct.quote(action.dataset.id); return; }
+  if (action?.dataset.action === 'direct-cancel-reply') { direct.cancelQuote(); return; }
+  if (action?.dataset.action === 'direct-jump' && action.dataset.id) { void direct.jumpTo(action.dataset.id); return; }
   if (action?.dataset.action === 'direct-unstage') { direct.unstage(Number(action.dataset.index ?? '-1')); return; }
   if (action?.dataset.action === 'accept-contact' && action.dataset.peer) { void acceptContact(action.dataset.peer); return; }
   if (action?.dataset.action === 'decline-contact' && action.dataset.peer) { void declineContact(action.dataset.peer); return; }

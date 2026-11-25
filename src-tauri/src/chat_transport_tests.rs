@@ -44,7 +44,8 @@ fn profile_avatar_sync_allows_only_active_members_without_granting_chat() {
     let (identity, store) = (Arc::clone(&bob.identity), Arc::clone(&bob.store));
     let worker = thread::spawn(move || accept_one(&identity, &store, listener.accept().unwrap().0).is_err());
     let (mut stream, mut gate) = connect(&alice.identity, &b, addr).unwrap();
-    let payload = Payload::Text { id: "attack".into(), body: "no".into(), created_at: 1, logical: 1 };
+    let payload = Payload::Text { id: "attack".into(), body: "no".into(), created_at: 1, logical: 1,
+        reply_to: None, reply_sender: None, reply_preview: None };
     gate.outbound(&payload).unwrap();
     protocol::write_frame(&mut stream, &payload).unwrap();
     assert!(protocol::read_frame(&mut stream).is_err());

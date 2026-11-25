@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::{params, Connection, OptionalExtension, Result};
 use serde::{Deserialize, Serialize};
 
-const SCHEMA_VERSION: i64 = 26;
+const SCHEMA_VERSION: i64 = 27;
 /// Upper bound on remembered "do not ask again" senders.
 const MAX_REMEMBERED_SOURCES: usize = 200;
 
@@ -123,6 +123,9 @@ pub struct DirectMessage {
     pub created_at: i64,
     pub logical: i64,
     pub status: String,
+    pub reply_to: Option<String>,
+    pub reply_sender: Option<String>,
+    pub reply_preview: Option<String>,
     pub kind: String,
     pub file_name: Option<String>,
     pub file_size: Option<i64>,
@@ -182,7 +185,7 @@ pub enum GroupFileDecision {
     NotMember,
 }
 
-const MESSAGE_COLUMNS: &str = "m.id, m.peer, m.sender, m.body, m.created_at, m.logical, m.status, m.kind, m.file_name, m.file_size, m.file_sha256, f.status, f.transferred, f.error, m.recalled_at";
+const MESSAGE_COLUMNS: &str = "m.id, m.peer, m.sender, m.body, m.created_at, m.logical, m.status, m.kind, m.file_name, m.file_size, m.file_sha256, f.status, f.transferred, f.error, m.recalled_at, m.reply_to, m.reply_sender, m.reply_preview";
 
 #[derive(Debug, serde::Deserialize)]
 pub struct DirectCursor {
@@ -428,6 +431,7 @@ pub struct PluginRow {
 pub struct ImageBatch {
     pub message_id: String,
     pub batch_id: String,
+    pub anchor_id: String,
     pub caption: String,
 }
 
@@ -1109,6 +1113,20 @@ impl Store {
             transaction.execute_batch("PRAGMA user_version = 26;")?;
             transaction.commit()?;
         }
+        if version < 27 {
+            let transaction = connection.transaction()?;
+            for statement in [
+                "ALTER TABLE direct_messages ADD COLUMN reply_to TEXT",
+                "ALTER TABLE direct_messages ADD COLUMN reply_sender TEXT",
+                "ALTER TABLE direct_messages ADD COLUMN reply_preview TEXT",
+            ] {
+                if let Err(error) = transaction.execute_batch(statement) {
+                    if !error.to_string().contains("duplicate column name") { return Err(error); }
+                }
+            }
+            transaction.execute_batch("PRAGMA user_version = 27;")?;
+            transaction.commit()?;
+        }
         Ok(Self { connection, data_dir, address_revision: std::cell::Cell::new(0) })
     }
 
@@ -1518,12 +1536,18 @@ impl Store {
 
     /// Persist before attempting transmission; wall-clock time is for display only.
     pub fn queue_direct(&self, sender: &str, peer: &str, body: &str, created_at: i64) -> Result<DirectMessage> {
+        self.queue_direct_with_reply(sender, peer, body, created_at, None)
+    }
+
+    pub fn queue_direct_with_reply(&self, sender: &str, peer: &str, body: &str, created_at: i64,
+        reply_to: Option<&str>) -> Result<DirectMessage> {
         if !valid_fingerprint(sender) || !valid_fingerprint(peer) || sender == peer || body.trim().is_empty() || body.len() > 32768 {
             return Err(rusqlite::Error::InvalidQuery);
         }
         let tx = self.connection.unchecked_transaction()?;
         let verified: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM contacts WHERE fingerprint = ?1 AND trust_state = 'verified')", [peer], |r| r.get(0))?;
         if !verified { return Err(rusqlite::Error::InvalidQuery); }
+        let (reply_sender, reply_preview) = direct_quote(&tx, sender, peer, reply_to)?;
         tx.execute("INSERT INTO direct_conversations(peer, hidden) VALUES (?1, 0) ON CONFLICT(peer) DO UPDATE SET hidden = 0", [peer])?;
         if tx.execute("UPDATE logical_clock SET value = value + 1 WHERE singleton = 1 AND value < 9223372036854775807", [])? != 1 {
             return Err(rusqlite::Error::InvalidQuery);
@@ -1531,30 +1555,41 @@ impl Store {
         let (id, logical): (String, i64) = tx.query_row("SELECT lower(hex(randomblob(16))), value FROM logical_clock WHERE singleton = 1", [], |r| Ok((r.get(0)?, r.get(1)?)))?;
         let collision: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM local_messages WHERE id = ?1 UNION ALL SELECT 1 FROM messages WHERE id = ?1)", [&id], |r| r.get(0))?;
         if collision { return Err(rusqlite::Error::InvalidQuery); }
-        tx.execute("INSERT INTO direct_messages(id, peer, sender, body, created_at, logical, status) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending')", params![id, peer, sender, body, created_at, logical])?;
+        tx.execute("INSERT INTO direct_messages(id, peer, sender, body, created_at, logical, status, reply_to, reply_sender, reply_preview)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8, ?9)",
+            params![id, peer, sender, body, created_at, logical, reply_to, reply_sender, reply_preview])?;
         tx.commit()?;
         Ok(DirectMessage {
             id, peer: peer.into(), sender: sender.into(), body: body.into(), created_at, logical, status: "pending".into(),
             kind: "text".into(), file_name: None, file_size: None, file_sha256: None, file_status: None, file_transferred: None, file_error: None,
             recalled_at: None,
+            reply_to: reply_to.map(str::to_owned), reply_sender, reply_preview,
         })
     }
 
     /// `peer` must be the fingerprint authenticated by the transport, never a payload claim.
     /// Only Inserted or Duplicate may be acknowledged after this transaction returns.
     pub fn receive_direct(&self, peer: &str, id: &str, body: &str, created_at: i64, logical: i64) -> Result<IncomingResult> {
+        self.receive_direct_with_reply(peer, id, body, created_at, logical, None, None, None)
+    }
+
+    pub fn receive_direct_with_reply(&self, peer: &str, id: &str, body: &str, created_at: i64, logical: i64,
+        reply_to: Option<&str>, reply_sender: Option<&str>, reply_preview: Option<&str>) -> Result<IncomingResult> {
         if !valid_fingerprint(peer) || id.is_empty() || id.len() > 128 || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') || body.is_empty() || body.len() > 32768 || logical <= 0 || logical == i64::MAX {
             return Err(rusqlite::Error::InvalidQuery);
         }
+        if !valid_reply_metadata(reply_to, reply_sender, reply_preview) { return Err(rusqlite::Error::InvalidQuery); }
         let tx = self.connection.unchecked_transaction()?;
         let verified: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM contacts WHERE fingerprint = ?1 AND trust_state = 'verified')", [peer], |r| r.get(0))?;
         if !verified { return Ok(IncomingResult::Unverified); }
-        let existing: Option<(String, String, String, i64, i64, String)> = tx.query_row(
-            "SELECT peer, sender, body, created_at, logical, status FROM direct_messages WHERE id = ?1", [id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+        let existing: Option<(String, String, String, i64, i64, String, Option<String>, Option<String>, Option<String>)> = tx.query_row(
+            "SELECT peer, sender, body, created_at, logical, status, reply_to, reply_sender, reply_preview FROM direct_messages WHERE id = ?1", [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?)),
         ).optional()?;
-        if let Some((old_peer, sender, old_body, time, old_logical, status)) = existing {
-            return Ok(if old_peer == peer && sender == peer && old_body == body && time == created_at && old_logical == logical && status == "received" {
+        if let Some((old_peer, sender, old_body, time, old_logical, status, old_reply_to, old_reply_sender, old_reply_preview)) = existing {
+            return Ok(if old_peer == peer && sender == peer && old_body == body && time == created_at && old_logical == logical
+                && status == "received" && old_reply_to.as_deref() == reply_to && old_reply_sender.as_deref() == reply_sender
+                && old_reply_preview.as_deref() == reply_preview {
                 IncomingResult::Duplicate
             } else { IncomingResult::IdConflict });
         }
@@ -1567,7 +1602,9 @@ impl Store {
             "INSERT INTO direct_conversations(peer, hidden, unread) VALUES (?1, 0, 1)
              ON CONFLICT(peer) DO UPDATE SET hidden = 0, unread = unread + 1", [peer],
         )?;
-        tx.execute("INSERT INTO direct_messages(id, peer, sender, body, created_at, logical, status) VALUES (?1, ?2, ?2, ?3, ?4, ?5, 'received')", params![id, peer, body, created_at, logical])?;
+        tx.execute("INSERT INTO direct_messages(id, peer, sender, body, created_at, logical, status, reply_to, reply_sender, reply_preview)
+            VALUES (?1, ?2, ?2, ?3, ?4, ?5, 'received', ?6, ?7, ?8)",
+            params![id, peer, body, created_at, logical, reply_to, reply_sender, reply_preview])?;
         tx.commit()?;
         Ok(IncomingResult::Inserted)
     }
@@ -1793,6 +1830,11 @@ impl Store {
 
     /// Queue an outgoing file. The file stays at `source`; the receiver verifies the hash.
     pub fn queue_direct_file(&self, sender: &str, peer: &str, name: &str, size: u64, sha256: &str, source: &Path, created_at: i64) -> Result<DirectMessage> {
+        self.queue_direct_file_with_reply(sender, peer, name, size, sha256, source, created_at, None)
+    }
+
+    pub fn queue_direct_file_with_reply(&self, sender: &str, peer: &str, name: &str, size: u64, sha256: &str,
+        source: &Path, created_at: i64, reply_to: Option<&str>) -> Result<DirectMessage> {
         let clean = crate::files::sanitize_name(name).ok_or(rusqlite::Error::InvalidQuery)?;
         let source_text = source.to_str().ok_or(rusqlite::Error::InvalidQuery)?;
         if !valid_fingerprint(sender) || !valid_fingerprint(peer) || sender == peer
@@ -1804,6 +1846,7 @@ impl Store {
         let tx = self.connection.unchecked_transaction()?;
         let verified: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM contacts WHERE fingerprint = ?1 AND trust_state = 'verified')", [peer], |r| r.get(0))?;
         if !verified { return Err(rusqlite::Error::InvalidQuery); }
+        let (reply_sender, reply_preview) = direct_quote(&tx, sender, peer, reply_to)?;
         tx.execute("INSERT INTO direct_conversations(peer, hidden) VALUES (?1, 0) ON CONFLICT(peer) DO UPDATE SET hidden = 0", [peer])?;
         if tx.execute("UPDATE logical_clock SET value = value + 1 WHERE singleton = 1 AND value < 9223372036854775807", [])? != 1 {
             return Err(rusqlite::Error::InvalidQuery);
@@ -1812,9 +1855,9 @@ impl Store {
         let collision: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM messages WHERE id = ?1 UNION ALL SELECT 1 FROM local_messages WHERE id = ?1)", [&id], |r| r.get(0))?;
         if collision { return Err(rusqlite::Error::InvalidQuery); }
         tx.execute(
-            "INSERT INTO direct_messages(id, peer, sender, body, created_at, logical, status, kind, file_name, file_size, file_sha256)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', 'file', ?4, ?7, ?8)",
-            params![id, peer, sender, clean, created_at, logical, size, sha256],
+            "INSERT INTO direct_messages(id, peer, sender, body, created_at, logical, status, kind, file_name, file_size, file_sha256, reply_to, reply_sender, reply_preview)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', 'file', ?4, ?7, ?8, ?9, ?10, ?11)",
+            params![id, peer, sender, clean, created_at, logical, size, sha256, reply_to, reply_sender, reply_preview],
         )?;
         tx.execute(
             "INSERT INTO file_transfers(message_id, peer, direction, source_path, target_path, total, transferred, status, updated_at)
@@ -1827,6 +1870,7 @@ impl Store {
             kind: "file".into(), file_name: Some(clean), file_size: Some(size), file_sha256: Some(sha256.into()),
             file_status: Some("pending".into()), file_transferred: Some(0), file_error: None,
             recalled_at: None,
+            reply_to: reply_to.map(str::to_owned), reply_sender, reply_preview,
         })
     }
 
@@ -1974,7 +2018,17 @@ impl Store {
     /// Validate an offer against trust, existing records and any partial file.
     /// `peer` must be authenticated by the transport, never taken from the payload.
     pub fn receive_file_offer(&self, peer: &str, id: &str, name: &str, size: u64, sha256: &str, created_at: i64, logical: i64, now: i64) -> Result<FileOfferDecision> {
+        self.receive_file_offer_with_reply(peer, id, name, size, sha256, created_at, logical, None, None, None, now)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn receive_file_offer_with_reply(&self, peer: &str, id: &str, name: &str, size: u64, sha256: &str,
+        created_at: i64, logical: i64, reply_to: Option<&str>, reply_sender: Option<&str>, reply_preview: Option<&str>, now: i64)
+        -> Result<FileOfferDecision> {
         let clean = match crate::files::sanitize_name(name) { Some(clean) => clean, None => return Ok(FileOfferDecision::Conflict) };
+        if !valid_reply_metadata(reply_to, reply_sender, reply_preview) || (reply_to.is_some() && !is_image_file(&clean)) {
+            return Ok(FileOfferDecision::Conflict);
+        }
         if !valid_fingerprint(peer) || !valid_message_id(id) || size == 0 || size > crate::protocol::MAX_FILE_BYTES
             || !valid_sha256(sha256) || logical <= 0 || logical == i64::MAX {
             return Err(rusqlite::Error::InvalidQuery);
@@ -1986,13 +2040,15 @@ impl Store {
         let dir = self.incoming_dir_for(id, RecvKind::Direct)?;
         let target = crate::files::incoming_target(&dir, id, &clean);
         let partial = crate::files::incoming_partial(&dir, id);
-        let existing: Option<(String, String, Option<String>, Option<i64>, Option<String>, i64, i64)> = tx.query_row(
-            "SELECT peer, sender, kind, file_size, file_sha256, created_at, logical FROM direct_messages WHERE id = ?1", [id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+        let existing: Option<(String, String, Option<String>, Option<i64>, Option<String>, i64, i64, Option<String>, Option<String>, Option<String>)> = tx.query_row(
+            "SELECT peer, sender, kind, file_size, file_sha256, created_at, logical, reply_to, reply_sender, reply_preview FROM direct_messages WHERE id = ?1", [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?)),
         ).optional()?;
-        if let Some((old_peer, sender, kind, old_size, old_hash, old_created, old_logical)) = existing {
+        if let Some((old_peer, sender, kind, old_size, old_hash, old_created, old_logical, old_reply_to, old_reply_sender, old_reply_preview)) = existing {
             if old_peer != peer || sender != peer || kind.as_deref() != Some("file") || old_size != Some(size_i64)
-                || old_hash.as_deref() != Some(sha256) || old_created != created_at || old_logical != logical {
+                || old_hash.as_deref() != Some(sha256) || old_created != created_at || old_logical != logical
+                || old_reply_to.as_deref() != reply_to || old_reply_sender.as_deref() != reply_sender
+                || old_reply_preview.as_deref() != reply_preview {
                 return Ok(FileOfferDecision::Conflict);
             }
             let (status, _): (String, i64) = tx.query_row(
@@ -2022,9 +2078,9 @@ impl Store {
         }
         tx.execute("INSERT INTO direct_conversations(peer, hidden) VALUES (?1, 0) ON CONFLICT(peer) DO UPDATE SET hidden = 0", [peer])?;
         tx.execute(
-            "INSERT INTO direct_messages(id, peer, sender, body, created_at, logical, status, kind, file_name, file_size, file_sha256)
-             VALUES (?1, ?2, ?2, ?3, ?4, ?5, 'received', 'file', ?3, ?6, ?7)",
-            params![id, peer, clean, created_at, logical, size_i64, sha256],
+            "INSERT INTO direct_messages(id, peer, sender, body, created_at, logical, status, kind, file_name, file_size, file_sha256, reply_to, reply_sender, reply_preview)
+             VALUES (?1, ?2, ?2, ?3, ?4, ?5, 'received', 'file', ?3, ?6, ?7, ?8, ?9, ?10)",
+            params![id, peer, clean, created_at, logical, size_i64, sha256, reply_to, reply_sender, reply_preview],
         )?;
         tx.execute(
             "INSERT INTO file_transfers(message_id, peer, direction, source_path, target_path, total, transferred, status, updated_at)
@@ -3350,6 +3406,11 @@ impl Store {
     /// Queues one group file message: the local source is referenced, one outbox row
     /// is created per active member, and the message body is the cleaned file name.
     pub fn queue_group_file(&self, sender: &str, group_id: &str, name: &str, size: u64, sha256: &str, source: &Path, created_at: i64) -> Result<GroupMessage> {
+        self.queue_group_file_with_reply(sender, group_id, name, size, sha256, source, created_at, None)
+    }
+
+    pub fn queue_group_file_with_reply(&self, sender: &str, group_id: &str, name: &str, size: u64, sha256: &str,
+        source: &Path, created_at: i64, reply_to: Option<&str>) -> Result<GroupMessage> {
         let clean = crate::files::sanitize_name(name).ok_or(rusqlite::Error::InvalidQuery)?;
         let source_text = source.to_str().ok_or(rusqlite::Error::InvalidQuery)?;
         if !valid_fingerprint(sender) || !valid_group_id(group_id)
@@ -3364,6 +3425,7 @@ impl Store {
             params![group_id, sender], |row| row.get(0),
         )?;
         if !active { return Err(rusqlite::Error::InvalidQuery); }
+        let (reply_sender, reply_preview) = group_quote(&tx, group_id, reply_to)?;
         if tx.execute("UPDATE logical_clock SET value = value + 1 WHERE singleton = 1 AND value < 9223372036854775807", [])? != 1 {
             return Err(rusqlite::Error::InvalidQuery);
         }
@@ -3378,9 +3440,9 @@ impl Store {
         )?;
         if collision { return Err(rusqlite::Error::InvalidQuery); }
         tx.execute(
-            "INSERT INTO group_messages(id, group_id, sender, body, created_at, logical, kind, file_name, file_size, file_sha256)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'file', ?4, ?7, ?8)",
-            params![id, group_id, sender, clean, created_at, logical, size_i64, sha256],
+            "INSERT INTO group_messages(id, group_id, sender, body, created_at, logical, reply_to, reply_sender, reply_preview, kind, file_name, file_size, file_sha256)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'file', ?4, ?10, ?11)",
+            params![id, group_id, sender, clean, created_at, logical, reply_to, reply_sender, reply_preview, size_i64, sha256],
         )?;
         tx.execute("UPDATE group_members SET hidden = 0 WHERE group_id = ?1 AND member = ?2", params![group_id, sender])?;
         let pending = tx.execute(
@@ -3397,7 +3459,7 @@ impl Store {
         Ok(GroupMessage {
             id, group_id: group_id.into(), sender: sender.into(), sender_name: String::new(),
             body: clean.clone(), created_at, logical, pending: i64::try_from(pending).unwrap_or(0),
-            reply_to: None, reply_sender: None, reply_preview: None, mentions: Vec::new(),
+            reply_to: reply_to.map(str::to_owned), reply_sender, reply_preview, mentions: Vec::new(),
             kind: "file".into(), file_name: Some(clean), file_size: Some(size_i64), file_sha256: Some(sha256.into()),
             file_status: Some("pending".into()), file_transferred: Some(0), file_error: None,
             recalled_at: None,
@@ -3490,13 +3552,14 @@ impl Store {
             params![group_id, peer], |row| row.get(0),
         )?;
         if !sender_active { return Ok(IncomingResult::NotMember); }
-        let existing: Option<(String, String, String, i64, i64, Option<String>, String)> = tx.query_row(
-            "SELECT group_id, sender, body, created_at, logical, reply_to, mentions FROM group_messages WHERE id = ?1", [id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+        let existing: Option<(String, String, String, i64, i64, Option<String>, Option<String>, Option<String>, String)> = tx.query_row(
+            "SELECT group_id, sender, body, created_at, logical, reply_to, reply_sender, reply_preview, mentions FROM group_messages WHERE id = ?1", [id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?)),
         ).optional()?;
-        if let Some((old_group, sender, old_body, time, old_logical, old_reply, old_mentions)) = existing {
+        if let Some((old_group, sender, old_body, time, old_logical, old_reply, old_reply_sender, old_reply_preview, old_mentions)) = existing {
             let same = old_group == group_id && sender == peer && old_body == body && time == created_at
                 && old_logical == logical && old_reply.as_deref() == reply_to
+                && old_reply_sender.as_deref() == reply_sender && old_reply_preview.as_deref() == reply_preview
                 && parse_mentions(&old_mentions) == unique_mentions;
             return Ok(if same { IncomingResult::Duplicate } else { IncomingResult::IdConflict });
         }
@@ -3527,7 +3590,19 @@ impl Store {
     pub fn receive_group_file(&self, self_id: &str, peer: &str, group_id: &str, name: &str, owner: &str,
         members: &[String], id: &str, file_name: &str, size: u64, sha256: &str, created_at: i64, logical: i64, now: i64)
         -> Result<GroupFileDecision> {
+        self.receive_group_file_with_reply(self_id, peer, group_id, name, owner, members, id, file_name,
+            size, sha256, created_at, logical, None, None, None, now)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn receive_group_file_with_reply(&self, self_id: &str, peer: &str, group_id: &str, name: &str, owner: &str,
+        members: &[String], id: &str, file_name: &str, size: u64, sha256: &str, created_at: i64, logical: i64,
+        reply_to: Option<&str>, reply_sender: Option<&str>, reply_preview: Option<&str>, now: i64)
+        -> Result<GroupFileDecision> {
         let clean = match crate::files::sanitize_name(file_name) { Some(clean) => clean, None => return Ok(GroupFileDecision::Conflict) };
+        if !valid_reply_metadata(reply_to, reply_sender, reply_preview) || (reply_to.is_some() && !is_image_file(&clean)) {
+            return Ok(GroupFileDecision::Conflict);
+        }
         if !valid_fingerprint(self_id) || !valid_fingerprint(peer) || !valid_group_id(group_id)
             || size == 0 || size > crate::protocol::MAX_FILE_BYTES || !valid_sha256(sha256)
             || logical <= 0 || logical == i64::MAX {
@@ -3546,7 +3621,7 @@ impl Store {
             return Ok(GroupFileDecision::NoSpace);
         }
         let result = self.receive_group(self_id, peer, group_id, name, owner, members, id, &clean, created_at, logical,
-            None, None, None, &[], now)?;
+            reply_to, reply_sender, reply_preview, &[], now)?;
         if matches!(result, IncomingResult::NotMember) { return Ok(GroupFileDecision::NotMember); }
         if matches!(result, IncomingResult::Unverified) { return Ok(GroupFileDecision::Conflict); }
         if matches!(result, IncomingResult::Inserted) {
@@ -3562,12 +3637,14 @@ impl Store {
             return Ok(GroupFileDecision::Ready { offset: 0, target, partial });
         }
         // Duplicate or a matching conflict: only resume when the stored metadata is identical.
-        let stored: Option<(Option<i64>, Option<String>, i64, i64)> = self.connection.query_row(
-            "SELECT file_size, file_sha256, created_at, logical FROM group_messages WHERE id = ?1 AND group_id = ?2",
-            params![id, group_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        let stored: Option<(Option<i64>, Option<String>, i64, i64, Option<String>, Option<String>, Option<String>)> = self.connection.query_row(
+            "SELECT file_size, file_sha256, created_at, logical, reply_to, reply_sender, reply_preview FROM group_messages WHERE id = ?1 AND group_id = ?2",
+            params![id, group_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
         ).optional()?;
-        let same = matches!(stored, Some((Some(old_size), Some(old_hash), old_created, old_logical))
-            if old_size == size_i64 && old_hash == sha256 && old_created == created_at && old_logical == logical);
+        let same = matches!(stored, Some((Some(old_size), Some(old_hash), old_created, old_logical, old_reply_to, old_reply_sender, old_reply_preview))
+            if old_size == size_i64 && old_hash == sha256 && old_created == created_at && old_logical == logical
+                && old_reply_to.as_deref() == reply_to && old_reply_sender.as_deref() == reply_sender
+                && old_reply_preview.as_deref() == reply_preview);
         if !same { return Ok(GroupFileDecision::Conflict); }
         let state: Option<(String, i64)> = self.connection.query_row(
             "SELECT status, transferred FROM group_file_transfers WHERE message_id = ?1", [id],
@@ -4175,11 +4252,19 @@ impl Store {
     /// Batches for one conversation, bounded by the newest 2,000 images.
     pub fn list_image_batches(&self, kind: &str, target: &str) -> Result<Vec<ImageBatch>> {
         let sql = match kind {
-            "direct" => "SELECT b.message_id, b.batch_id, b.caption FROM image_batches b
-                         JOIN direct_messages m ON m.id = b.message_id WHERE m.peer = ?1
+            "direct" => "SELECT b.message_id, b.batch_id, b.caption,
+                         COALESCE((SELECT b0.message_id FROM image_batches b0
+                             JOIN direct_messages m0 ON m0.id = b0.message_id
+                             WHERE b0.batch_id = b.batch_id AND m0.peer = m.peer
+                             ORDER BY m0.logical, m0.sender, m0.id LIMIT 1), b.message_id)
+                         FROM image_batches b JOIN direct_messages m ON m.id = b.message_id WHERE m.peer = ?1
                          ORDER BY b.created_at DESC LIMIT 2000",
-            "group" => "SELECT b.message_id, b.batch_id, b.caption FROM image_batches b
-                        JOIN group_messages m ON m.id = b.message_id WHERE m.group_id = ?1
+            "group" => "SELECT b.message_id, b.batch_id, b.caption,
+                        COALESCE((SELECT b0.message_id FROM image_batches b0
+                            JOIN group_messages m0 ON m0.id = b0.message_id
+                            WHERE b0.batch_id = b.batch_id AND m0.group_id = m.group_id
+                            ORDER BY m0.logical, m0.sender, m0.id LIMIT 1), b.message_id)
+                        FROM image_batches b JOIN group_messages m ON m.id = b.message_id WHERE m.group_id = ?1
                         ORDER BY b.created_at DESC LIMIT 2000",
             _ => return Err(rusqlite::Error::InvalidQuery),
         };
@@ -4187,7 +4272,7 @@ impl Store {
         if kind == "direct" && !valid_fingerprint(target) { return Err(rusqlite::Error::InvalidQuery); }
         let mut statement = self.connection.prepare(sql)?;
         let rows = statement.query_map([target], |row| Ok(ImageBatch {
-            message_id: row.get(0)?, batch_id: row.get(1)?, caption: row.get(2)?,
+            message_id: row.get(0)?, batch_id: row.get(1)?, caption: row.get(2)?, anchor_id: row.get(3)?,
         }))?;
         rows.collect()
     }
@@ -4799,6 +4884,72 @@ fn quote_preview(body: &str) -> String {
     preview
 }
 
+fn valid_reply_metadata(reply_to: Option<&str>, reply_sender: Option<&str>, reply_preview: Option<&str>) -> bool {
+    reply_to.is_none_or(valid_message_id)
+        && reply_sender.is_none_or(|value| !value.is_empty() && value.chars().count() <= 128 && !value.chars().any(char::is_control))
+        && reply_preview.is_none_or(|value| value.chars().count() <= REPLY_PREVIEW_MAX)
+        && reply_to.is_some() == reply_preview.is_some()
+        && (reply_to.is_some() || reply_sender.is_none())
+}
+
+fn direct_quote(connection: &Connection, self_id: &str, peer: &str, reply_to: Option<&str>)
+    -> Result<(Option<String>, Option<String>)> {
+    let Some(message_id) = reply_to else { return Ok((None, None)); };
+    if !valid_message_id(message_id) { return Err(rusqlite::Error::InvalidQuery); }
+    let quoted: Option<(String, String, String, Option<String>, Option<i64>)> = connection.query_row(
+        "SELECT sender, body, kind, file_name, recalled_at FROM direct_messages WHERE peer = ?1 AND id = ?2",
+        params![peer, message_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+    ).optional()?;
+    let Some((quoted_sender, body, kind, file_name, recalled_at)) = quoted else { return Err(rusqlite::Error::InvalidQuery); };
+    if recalled_at.is_some() || ![self_id, peer].contains(&quoted_sender.as_str()) {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    let preview = if kind == "file" {
+        if !file_name.as_deref().is_some_and(is_image_file) { return Err(rusqlite::Error::InvalidQuery); }
+        connection.query_row("SELECT caption FROM image_batches WHERE message_id = ?1", [message_id], |row| row.get::<_, String>(0))
+            .optional()?.filter(|caption| !caption.trim().is_empty())
+            .map(|caption| quote_preview(&caption)).unwrap_or_else(|| "图片".into())
+    } else {
+        quote_preview(&body)
+    };
+    let display_name = if quoted_sender == self_id {
+        connection.query_row("SELECT value FROM settings WHERE key = 'profile_nickname'", [], |row| row.get::<_, String>(0))
+            .optional()?.filter(|name| !name.trim().is_empty()).unwrap_or_else(|| "我".into())
+    } else {
+        connection.query_row("SELECT COALESCE(NULLIF(remark, ''), display_name) FROM contacts WHERE fingerprint = ?1", [peer], |row| row.get::<_, String>(0))
+            .optional()?.unwrap_or_else(|| "联系人".into())
+    };
+    Ok((Some(display_name), Some(preview)))
+}
+
+fn group_quote(connection: &Connection, group_id: &str, reply_to: Option<&str>)
+    -> Result<(Option<String>, Option<String>)> {
+    let Some(message_id) = reply_to else { return Ok((None, None)); };
+    if !valid_message_id(message_id) { return Err(rusqlite::Error::InvalidQuery); }
+    let quoted: Option<(String, String, String, Option<String>, Option<i64>)> = connection.query_row(
+        "SELECT sender, body, kind, file_name, recalled_at FROM group_messages WHERE group_id = ?1 AND id = ?2",
+        params![group_id, message_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+    ).optional()?;
+    let Some((sender, body, kind, file_name, recalled_at)) = quoted else { return Err(rusqlite::Error::InvalidQuery); };
+    if recalled_at.is_some() { return Err(rusqlite::Error::InvalidQuery); }
+    let display_name: String = connection.query_row(
+        "SELECT COALESCE(NULLIF(c.display_name, ''), '群成员') FROM group_members gm
+         LEFT JOIN contacts c ON c.fingerprint = gm.member
+         WHERE gm.group_id = ?1 AND gm.member = ?2",
+        params![group_id, sender], |row| row.get(0))?;
+    let preview = if kind == "file" {
+        if !file_name.as_deref().is_some_and(is_image_file) { return Err(rusqlite::Error::InvalidQuery); }
+        connection.query_row("SELECT caption FROM image_batches WHERE message_id = ?1", [message_id], |row| row.get::<_, String>(0))
+            .optional()?.filter(|caption| !caption.trim().is_empty())
+            .map(|caption| quote_preview(&caption)).unwrap_or_else(|| "图片".into())
+    } else {
+        quote_preview(&body)
+    };
+    Ok((Some(display_name), Some(preview)))
+}
+
 fn parse_mentions(value: &str) -> Vec<String> {
     serde_json::from_str::<Vec<String>>(value).unwrap_or_default()
 }
@@ -4846,6 +4997,7 @@ fn map_message(row: &rusqlite::Row<'_>) -> Result<DirectMessage> {
         file_name: row.get(8)?, file_size: row.get(9)?, file_sha256: row.get(10)?,
         file_status: row.get(11)?, file_transferred: row.get(12)?, file_error: row.get(13)?,
         recalled_at: row.get(14)?,
+        reply_to: row.get(15)?, reply_sender: row.get(16)?, reply_preview: row.get(17)?,
     })
 }
 
@@ -5727,11 +5879,73 @@ mod tests {
         let listed = store.list_image_batches("direct", &peer).unwrap();
         assert_eq!(listed.len(), 2);
         assert!(listed.iter().all(|row| row.batch_id == batch));
+        assert!(listed.iter().all(|row| row.anchor_id == first.id));
         // Unknown messages, bad ids and over-long captions are rejected.
         assert!(!store.attach_image_batch("missing", &batch, "", 1).unwrap());
         assert!(store.attach_image_batch(&first.id, "short", "", 1).is_err());
         assert!(store.attach_image_batch(&first.id, &batch, &"x".repeat(crate::protocol::MAX_BATCH_CAPTION + 1), 1).is_err());
         assert!(store.list_image_batches("self", &peer).is_err());
+    }
+
+    #[test]
+    fn direct_and_group_image_quotes_persist_captions_and_reject_other_files() {
+        let store = memory_store();
+        let me = "a".repeat(64);
+        let peer = "b".repeat(64);
+        store.add_candidate(&peer, "Bob").unwrap();
+        store.confirm_candidate(&peer).unwrap();
+
+        let direct_image = store.queue_direct_file(&me, &peer, "photo.png", 3, &"c".repeat(64), Path::new("photo.png"), 1).unwrap();
+        let batch = store.new_batch_id().unwrap();
+        store.attach_image_batch(&direct_image.id, &batch, "直聊图片说明", 2).unwrap();
+        let direct_reply = store.queue_direct_file_with_reply(&me, &peer, "reply.jpg", 4, &"d".repeat(64), Path::new("reply.jpg"), 3, Some(&direct_image.id)).unwrap();
+        assert_eq!(direct_reply.reply_to.as_deref(), Some(direct_image.id.as_str()));
+        assert_eq!(direct_reply.reply_sender.as_deref(), Some("我"));
+        assert_eq!(direct_reply.reply_preview.as_deref(), Some("直聊图片说明"));
+        let listed_direct = store.list_direct(&peer, 10, None).unwrap();
+        let persisted_direct = listed_direct.iter().find(|message| message.id == direct_reply.id).unwrap();
+        assert_eq!(persisted_direct.reply_preview.as_deref(), Some("直聊图片说明"));
+
+        let document = store.queue_direct_file(&me, &peer, "notes.pdf", 5, &"e".repeat(64), Path::new("notes.pdf"), 4).unwrap();
+        assert!(store.queue_direct_with_reply(&me, &peer, "not allowed", 5, Some(&document.id)).is_err());
+
+        let incoming_reply = (Some("quoted-text"), Some("Alice"), Some("原消息"));
+        assert!(matches!(store.receive_file_offer_with_reply(&peer, "incomingimage01", "incoming.png", 6,
+            &"4".repeat(64), 11, 100, incoming_reply.0, incoming_reply.1, incoming_reply.2, 12).unwrap(),
+            FileOfferDecision::Ready { .. }));
+        assert!(matches!(store.receive_file_offer_with_reply(&peer, "incomingimage01", "incoming.png", 6,
+            &"4".repeat(64), 11, 100, incoming_reply.0, incoming_reply.1, incoming_reply.2, 13).unwrap(),
+            FileOfferDecision::Ready { .. }));
+        assert!(matches!(store.receive_file_offer_with_reply(&peer, "incomingimage01", "incoming.png", 6,
+            &"4".repeat(64), 11, 100, incoming_reply.0, incoming_reply.1, Some("被篡改"), 14).unwrap(),
+            FileOfferDecision::Conflict));
+
+        let (group_id, group_peer, group_other) = group_with_two_members(&store, &me);
+        let group_image = store.queue_group_file(&me, &group_id, "group.png", 3, &"f".repeat(64), Path::new("group.png"), 6).unwrap();
+        let group_batch = store.new_batch_id().unwrap();
+        store.attach_image_batch(&group_image.id, &group_batch, "群聊图片说明", 7).unwrap();
+        let group_batches = store.list_image_batches("group", &group_id).unwrap();
+        assert!(group_batches.iter().filter(|row| row.batch_id == group_batch).all(|row| row.anchor_id == group_image.id));
+        let group_reply = store.queue_group_file_with_reply(&me, &group_id, "reply.png", 4, &"1".repeat(64), Path::new("reply.png"), 8, Some(&group_image.id)).unwrap();
+        assert_eq!(group_reply.reply_to.as_deref(), Some(group_image.id.as_str()));
+        assert_eq!(group_reply.reply_preview.as_deref(), Some("群聊图片说明"));
+        let listed_group = store.list_group_messages(&group_id, 10, None).unwrap();
+        let persisted_group = listed_group.iter().find(|message| message.id == group_reply.id).unwrap();
+        assert_eq!(persisted_group.reply_preview.as_deref(), Some("群聊图片说明"));
+
+        let group_document = store.queue_group_file(&me, &group_id, "notes.pdf", 5, &"2".repeat(64), Path::new("notes.pdf"), 9).unwrap();
+        assert!(store.queue_group_file_with_reply(&me, &group_id, "reply.png", 4, &"3".repeat(64), Path::new("reply.png"), 10, Some(&group_document.id)).is_err());
+
+        let members = vec![me.clone(), group_peer.clone(), group_other];
+        assert!(matches!(store.receive_group_file_with_reply(&me, &group_peer, &group_id, "Team", &me,
+            &members, "groupincoming01", "incoming.png", 6, &"5".repeat(64), 11, 100,
+            incoming_reply.0, incoming_reply.1, incoming_reply.2, 12).unwrap(), GroupFileDecision::Ready { .. }));
+        assert!(matches!(store.receive_group_file_with_reply(&me, &group_peer, &group_id, "Team", &me,
+            &members, "groupincoming01", "incoming.png", 6, &"5".repeat(64), 11, 100,
+            incoming_reply.0, incoming_reply.1, incoming_reply.2, 13).unwrap(), GroupFileDecision::Ready { .. }));
+        assert!(matches!(store.receive_group_file_with_reply(&me, &group_peer, &group_id, "Team", &me,
+            &members, "groupincoming01", "incoming.png", 6, &"5".repeat(64), 11, 100,
+            incoming_reply.0, incoming_reply.1, Some("被篡改"), 14).unwrap(), GroupFileDecision::Conflict));
     }
 
     #[test]
@@ -6333,6 +6547,43 @@ mod tests {
         store.record_file_offer_request(&peer, &id, "a.pdf", 10, 1, Some(&"c".repeat(32))).unwrap();
         assert!(store.resolve_file_offer(&id, true, Some("D:\\接收")).unwrap());
         assert_eq!(store.file_offer_target_dir(&id).unwrap(), Some(PathBuf::from("D:\\接收")));
+    }
+
+    #[test]
+    fn v26_database_adds_direct_reply_columns_without_losing_messages() {
+        use std::{fs, time::{SystemTime, UNIX_EPOCH}};
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("storage-tests");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("reply-v26-{}-{}.sqlite", std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        {
+            let store = Store::open(&path).unwrap();
+            let me = "a".repeat(64);
+            let peer = "b".repeat(64);
+            store.add_candidate(&peer, "Bob").unwrap();
+            store.confirm_candidate(&peer).unwrap();
+            let existing = store.queue_direct(&me, &peer, "preserve me", 10).unwrap();
+            store.connection.execute_batch(
+                "ALTER TABLE direct_messages DROP COLUMN reply_to;
+                 ALTER TABLE direct_messages DROP COLUMN reply_sender;
+                 ALTER TABLE direct_messages DROP COLUMN reply_preview;
+                 PRAGMA user_version = 26;",
+            ).unwrap();
+            assert_eq!(existing.body, "preserve me");
+        }
+        let store = Store::open(&path).unwrap();
+        let version: i64 = store.connection.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
+        assert_eq!(version, 27);
+        let columns: Vec<String> = {
+            let mut statement = store.connection.prepare("PRAGMA table_info(direct_messages)").unwrap();
+            statement.query_map([], |row| row.get(1)).unwrap().collect::<Result<Vec<_>>>().unwrap()
+        };
+        assert!(columns.iter().any(|column| column == "reply_to"));
+        assert!(columns.iter().any(|column| column == "reply_sender"));
+        assert!(columns.iter().any(|column| column == "reply_preview"));
+        assert_eq!(store.list_direct(&"b".repeat(64), 10, None).unwrap().len(), 1);
+        drop(store);
+        let _ = fs::remove_file(path);
     }
 
     #[test]

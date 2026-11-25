@@ -129,10 +129,10 @@ pub fn v1_list_direct(state: tauri::State<'_, AppState>, peer: String, limit: u3
 }
 
 #[tauri::command]
-pub fn v1_queue_direct(state: tauri::State<'_, AppState>, peer: String, body: String) -> Result<crate::storage::DirectMessage, String> {
+pub fn v1_queue_direct(state: tauri::State<'_, AppState>, peer: String, body: String, reply_to: Option<String>) -> Result<crate::storage::DirectMessage, String> {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|_| "系统时间无效".to_owned())?.as_secs();
     let created_at = i64::try_from(now).map_err(|_| "系统时间无效".to_owned())?;
-    state.store.lock().map_err(|_| "本地存储不可用".to_owned())?.queue_direct(&state.identity.fingerprint(), &peer, &body, created_at)
+    state.store.lock().map_err(|_| "本地存储不可用".to_owned())?.queue_direct_with_reply(&state.identity.fingerprint(), &peer, &body, created_at, reply_to.as_deref())
         .map_err(|_| "联系人未确认，或消息为空、过长或无法保存".to_owned())
 }
 
@@ -2432,7 +2432,7 @@ fn batch_caption(caption: &str) -> Result<String, String> {
 }
 
 #[tauri::command]
-pub async fn v1_queue_direct_images(state: tauri::State<'_, AppState>, peer: String, paths: Vec<String>, caption: String)
+pub async fn v1_queue_direct_images(state: tauri::State<'_, AppState>, peer: String, paths: Vec<String>, caption: String, reply_to: Option<String>)
     -> Result<Vec<crate::storage::DirectMessage>, String> {
     let store = Arc::clone(&state.store);
     let sender = state.identity.fingerprint();
@@ -2449,7 +2449,7 @@ pub async fn v1_queue_direct_images(state: tauri::State<'_, AppState>, peer: Str
             if size > crate::protocol::MAX_FILE_BYTES { return Err("图片超过 512 MiB 限制".to_owned()); }
             let sha256 = crate::files::sha256_file(&source).map_err(|_| "无法计算校验值".to_owned())?;
             let message = store.lock().map_err(|_| "本地存储不可用".to_owned())?
-                .queue_direct_file(&sender, &peer, &name, size, &sha256, &source, created_at)
+                .queue_direct_file_with_reply(&sender, &peer, &name, size, &sha256, &source, created_at, reply_to.as_deref())
                 .map_err(|_| "对方须为已确认联系人".to_owned())?;
             store.lock().map_err(|_| "本地存储不可用".to_owned())?
                 .attach_image_batch(&message.id, &batch, &caption, created_at)
@@ -2461,7 +2461,7 @@ pub async fn v1_queue_direct_images(state: tauri::State<'_, AppState>, peer: Str
 }
 
 #[tauri::command]
-pub async fn v1_queue_group_images(state: tauri::State<'_, AppState>, group_id: String, paths: Vec<String>, caption: String)
+pub async fn v1_queue_group_images(state: tauri::State<'_, AppState>, group_id: String, paths: Vec<String>, caption: String, reply_to: Option<String>)
     -> Result<Vec<crate::storage::GroupMessage>, String> {
     let store = Arc::clone(&state.store);
     let sender = state.identity.fingerprint();
@@ -2478,7 +2478,7 @@ pub async fn v1_queue_group_images(state: tauri::State<'_, AppState>, group_id: 
             if size > crate::protocol::MAX_FILE_BYTES { return Err("图片超过 512 MiB 限制".to_owned()); }
             let sha256 = crate::files::sha256_file(&source).map_err(|_| "无法计算校验值".to_owned())?;
             let message = store.lock().map_err(|_| "本地存储不可用".to_owned())?
-                .queue_group_file(&sender, &group_id, &name, size, &sha256, &source, created_at)
+                .queue_group_file_with_reply(&sender, &group_id, &name, size, &sha256, &source, created_at, reply_to.as_deref())
                 .map_err(|_| "群不存在或你不是活跃成员".to_owned())?;
             store.lock().map_err(|_| "本地存储不可用".to_owned())?
                 .attach_image_batch(&message.id, &batch, &caption, created_at)
