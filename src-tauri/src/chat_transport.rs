@@ -127,8 +127,10 @@ pub fn accept_one(identity: &Identity, store: &Mutex<Store>, socket: TcpStream) 
             return Err(invalid("unverified chat peer").into());
         }
         match incoming {
-            Payload::Text { id, body, created_at, logical } => {
-                let result = store.lock().map_err(|_| invalid("store unavailable"))?.receive_direct(&peer, &id, &body, created_at, logical)?;
+            Payload::Text { id, body, created_at, logical, reply_to, reply_sender, reply_preview } => {
+                let result = store.lock().map_err(|_| invalid("store unavailable"))?
+                    .receive_direct_with_reply(&peer, &id, &body, created_at, logical,
+                        reply_to.as_deref(), reply_sender.as_deref(), reply_preview.as_deref())?;
                 if !matches!(result, crate::storage::IncomingResult::Inserted | crate::storage::IncomingResult::Duplicate) {
                     return Err(invalid("message rejected").into());
                 }
@@ -139,9 +141,9 @@ pub fn accept_one(identity: &Identity, store: &Mutex<Store>, socket: TcpStream) 
                 gate.outbound(&ack)?;
                 protocol::write_frame(&mut stream, &ack)?;
             }
-            Payload::FileOffer { id, name, size, sha256, created_at, logical, batch_id, caption } => {
+            Payload::FileOffer { id, name, size, sha256, created_at, logical, batch_id, caption, reply_to, reply_sender, reply_preview } => {
                 receive_file(&mut stream, &mut gate, store, &peer,
-                    FileOffer { id, name, size, sha256, created_at, logical, batch_id, caption })?;
+                    FileOffer { id, name, size, sha256, created_at, logical, batch_id, caption, reply_to, reply_sender, reply_preview })?;
             }
             Payload::GroupText { id, group_id, name, owner, members, body, created_at, logical, reply_to, reply_sender, reply_preview, mentions } => {
                 let result = store.lock().map_err(|_| invalid("store unavailable"))?
@@ -156,9 +158,10 @@ pub fn accept_one(identity: &Identity, store: &Mutex<Store>, socket: TcpStream) 
                 }
                 acknowledge(&mut stream, &mut gate, &id)?;
             }
-            Payload::GroupFileOffer { id, group_id, name, owner, members, file_name, size, sha256, created_at, logical, batch_id, caption } => {
+            Payload::GroupFileOffer { id, group_id, name, owner, members, file_name, size, sha256, created_at, logical, batch_id, caption, reply_to, reply_sender, reply_preview } => {
                 receive_group_file(&mut stream, &mut gate, store, &self_id, &peer, GroupFilePayload {
                     id, group_id, name, owner, members, file_name, size, sha256, created_at, logical, batch_id, caption,
+                    reply_to, reply_sender, reply_preview,
                 })?;
             }
             Payload::GroupUpdate { id, group_id, name, owner, members } => {
@@ -315,6 +318,9 @@ struct FileOffer {
     logical: i64,
     batch_id: Option<String>,
     caption: Option<String>,
+    reply_to: Option<String>,
+    reply_sender: Option<String>,
+    reply_preview: Option<String>,
 }
 
 /// Records the shared bubble for a received image; a failure here never blocks the
@@ -333,7 +339,7 @@ fn reject(stream: &mut StreamOwned<ServerConnection, DeadlineStream>, gate: &mut
 }
 
 fn receive_file(stream: &mut StreamOwned<ServerConnection, DeadlineStream>, gate: &mut ReadyGate, store: &Mutex<Store>, peer: &str, offer: FileOffer) -> ChatResult<()> {
-    let FileOffer { id, name, size, sha256, created_at, logical, batch_id, caption } = offer;
+    let FileOffer { id, name, size, sha256, created_at, logical, batch_id, caption, reply_to, reply_sender, reply_preview } = offer;
     {
         let store = store.lock().map_err(|_| invalid("store unavailable"))?;
         let mode = store.file_accept_mode()?;
@@ -356,7 +362,8 @@ fn receive_file(stream: &mut StreamOwned<ServerConnection, DeadlineStream>, gate
         }
     }
     let decision = store.lock().map_err(|_| invalid("store unavailable"))?
-        .receive_file_offer(peer, &id, &name, size, &sha256, created_at, logical, unix_now())?;
+        .receive_file_offer_with_reply(peer, &id, &name, size, &sha256, created_at, logical,
+            reply_to.as_deref(), reply_sender.as_deref(), reply_preview.as_deref(), unix_now())?;
     attach_batch(store, &id, batch_id.as_deref(), caption.as_deref())?;
     let (offset, target, partial) = match decision {
         FileOfferDecision::Untrusted => { let _ = reject(stream, gate, &id, "untrusted"); return Err(invalid("untrusted file offer").into()); }
@@ -452,6 +459,9 @@ struct GroupFilePayload {
     members: Vec<String>,
     batch_id: Option<String>,
     caption: Option<String>,
+    reply_to: Option<String>,
+    reply_sender: Option<String>,
+    reply_preview: Option<String>,
     file_name: String,
     size: u64,
     sha256: String,
@@ -463,7 +473,7 @@ struct GroupFilePayload {
 /// validates membership through `receive_group_file`.
 fn receive_group_file(stream: &mut StreamOwned<ServerConnection, DeadlineStream>, gate: &mut ReadyGate,
     store: &Mutex<Store>, self_id: &str, peer: &str, offer: GroupFilePayload) -> ChatResult<()> {
-    let GroupFilePayload { id, group_id, name, owner, members, file_name, size, sha256, created_at, logical, batch_id, caption } = offer;
+    let GroupFilePayload { id, group_id, name, owner, members, file_name, size, sha256, created_at, logical, batch_id, caption, reply_to, reply_sender, reply_preview } = offer;
     {
         let store = store.lock().map_err(|_| invalid("store unavailable"))?;
         let mode = store.file_accept_mode()?;
@@ -487,7 +497,8 @@ fn receive_group_file(stream: &mut StreamOwned<ServerConnection, DeadlineStream>
         }
     }
     let decision = store.lock().map_err(|_| invalid("store unavailable"))?
-        .receive_group_file(self_id, peer, &group_id, &name, &owner, &members, &id, &file_name, size, &sha256, created_at, logical, unix_now())?;
+        .receive_group_file_with_reply(self_id, peer, &group_id, &name, &owner, &members, &id, &file_name, size, &sha256,
+            created_at, logical, reply_to.as_deref(), reply_sender.as_deref(), reply_preview.as_deref(), unix_now())?;
     attach_batch(store, &id, batch_id.as_deref(), caption.as_deref())?;
     let (offset, target, partial) = match decision {
         GroupFileDecision::NotMember => { let _ = reject(stream, gate, &id, "untrusted"); return Err(invalid("not a group member").into()); }
@@ -598,6 +609,7 @@ fn send_group_file(identity: &Identity, store: &Mutex<Store>, member: &str, addr
             file_name: dispatch.file_name.clone().unwrap_or_else(|| "file".into()),
             size, sha256: sha256.clone(), created_at: dispatch.created_at, logical: dispatch.logical,
             batch_id, caption,
+            reply_to: dispatch.reply_to.clone(), reply_sender: dispatch.reply_sender.clone(), reply_preview: dispatch.reply_preview.clone(),
         };
         gate.outbound(&offer)?;
         {
@@ -918,7 +930,10 @@ fn connect(identity: &Identity, peer: &str, address: SocketAddr) -> ChatResult<(
 
 fn send_text(identity: &Identity, store: &Mutex<Store>, peer: &str, address: SocketAddr, message: &DirectMessage) -> ChatResult<()> {
     let (mut stream, mut gate) = connect(identity, peer, address)?;
-    let text = Payload::Text { id: message.id.clone(), body: message.body.clone(), created_at: message.created_at, logical: message.logical };
+    let text = Payload::Text {
+        id: message.id.clone(), body: message.body.clone(), created_at: message.created_at, logical: message.logical,
+        reply_to: message.reply_to.clone(), reply_sender: message.reply_sender.clone(), reply_preview: message.reply_preview.clone(),
+    };
     gate.outbound(&text)?;
     {
         let current = store.lock().map_err(|_| invalid("store unavailable"))?;
@@ -968,6 +983,7 @@ fn send_file(identity: &Identity, store: &Mutex<Store>, peer: &str, address: Soc
             id: message.id.clone(), name: message.file_name.clone().unwrap_or_else(|| "file".into()),
             size, sha256: sha256.clone(), created_at: message.created_at, logical: message.logical,
             batch_id, caption,
+            reply_to: message.reply_to.clone(), reply_sender: message.reply_sender.clone(), reply_preview: message.reply_preview.clone(),
         };
         gate.outbound(&offer)?;
         {

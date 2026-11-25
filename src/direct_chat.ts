@@ -18,6 +18,7 @@ type DirectMessage = {
   file_name: string | null; file_size: number | null; file_sha256: string | null;
   file_status: 'pending' | 'transferring' | 'completed' | 'failed' | null; file_transferred: number | null; file_error: string | null;
   recalled_at: number | null;
+  reply_to: string | null; reply_sender: string | null; reply_preview: string | null;
 };
 type TextPreview = { name: string; kind: string; text: string };
 type FileOffer = { message_id: string; peer: string; name: string; total: number; created_at: number; status: string; group_id?: string | null };
@@ -47,7 +48,9 @@ export class DirectChat {
   private staged: Staged[] = [];
   private batches = new Map<string, string>();
   private batchCaptions = new Map<string, string>();
+  private batchAnchors = new Map<string, string>();
   private renderedBatches = new Set<string>();
+  private quoted: { id: string; name: string; preview: string } | null = null;
   /// 'lightbox' keeps the in-app viewer; 'workspace' opens the right panel instead.
   imageOpenMode: 'lightbox' | 'workspace' = 'lightbox';
   /// What clicking a file bubble does; the workspace previews it or the system app opens it.
@@ -59,14 +62,46 @@ export class DirectChat {
     return `<section class="self-chat" aria-label="${t('单聊')}">
       <header class="chat-header"><div><strong id="direct-name"></strong><span id="direct-presence" class="presence-dot" hidden></span><span id="direct-presence-text" class="presence-text"></span><small>${t('端到端加密 · 已添加联系人')}</small></div><div class="group-actions"><button class="outline chat-more" data-action="chat-menu" data-kind="direct" aria-label="${t('会话菜单')}" title="${t('会话菜单')}">⋯</button></div></header>
       <div class="chat-history" id="direct-history" aria-label="${t('单聊记录')}"><div class="direct-address"><label for="direct-address">${t('联系人地址（仅连接提示）')}</label><div class="probe-row"><input id="direct-address" type="text" placeholder="192.168.1.8:42853"><button class="outline" data-action="save-direct-address">${t('保存地址')}</button></div><small>${t('地址不代表身份，连接时仍核对指纹。请在发现页面启动聊天服务；离线消息与文件须双方同时在线才能补发或续传。')}</small><p id="direct-address-status" role="status"></p></div><button class="load-older" data-action="direct-older" hidden>${t('加载更早消息')}</button><div id="direct-messages"></div><div id="direct-offers" class="direct-offers" hidden></div></div>
-      <div class="chat-compose"><label for="direct-input">${t('消息')}</label><div class="compose-staging" id="direct-staging" aria-label="${t('待发送附件')}" hidden></div><textarea id="direct-input" rows="3" maxlength="32768" placeholder="${t('写点什么，或把文件/图片拖进窗口…')}"></textarea>${composerTools('direct', t('Enter 发送 · Shift+Enter 换行'))}<p id="direct-file-status" role="status"></p><p id="direct-error" role="status"></p></div>
+      <div class="chat-compose"><div class="reply-bar" id="direct-reply-bar" hidden><span id="direct-reply-text"></span><button class="outline" data-action="direct-cancel-reply">${t('取消引用')}</button></div><label for="direct-input">${t('消息')}</label><div class="compose-staging" id="direct-staging" aria-label="${t('待发送附件')}" hidden></div><textarea id="direct-input" rows="3" maxlength="32768" placeholder="${t('写点什么，或把文件/图片拖进窗口…')}"></textarea>${composerTools('direct', t('Enter 发送 · Shift+Enter 换行'))}<p id="direct-file-status" role="status"></p><p id="direct-error" role="status"></p></div>
     </section>`;
   }
 
-  clear(): void { this.peer = ''; this.generation++; this.offers = []; this.staged = []; this.paintStaging(); this.stopPolling(); }
+  clear(): void { this.peer = ''; this.generation++; this.offers = []; this.staged = []; this.quoted = null; this.paintStaging(); this.stopPolling(); }
 
   draft(value: string): void { if (this.peer) this.drafts.set(this.peer, value); }
   addressDraft(value: string): void { if (this.peer) this.addressDrafts.set(this.peer, value); }
+
+  quote(messageId: string): void {
+    const message = this.messages.find(item => item.id === messageId);
+    if (!message || message.recalled_at) return;
+    const image = this.isImageMessage(message);
+    if (message.kind === 'file' && !image) return;
+    const batch = image ? this.batches.get(message.id) : undefined;
+    const preview = image
+      ? (batch && this.batchCaptions.get(batch)?.trim() ? previewOfDirect(this.batchCaptions.get(batch)!) : t('图片'))
+      : previewOfDirect(message.body);
+    this.quoted = {
+      id: batch ? this.batchAnchors.get(batch) ?? message.id : message.id,
+      name: message.sender === this.peer ? this.name || t('对方') : t('我'),
+      preview,
+    };
+    this.paintReplyBar();
+    this.root.querySelector<HTMLTextAreaElement>('#direct-input')?.focus();
+  }
+
+  cancelQuote(): void { this.quoted = null; this.paintReplyBar(); }
+
+  private paintReplyBar(): void {
+    const bar = this.root.querySelector<HTMLElement>('#direct-reply-bar');
+    const text = this.root.querySelector<HTMLElement>('#direct-reply-text');
+    if (!bar || !text) return;
+    bar.hidden = !this.quoted;
+    text.textContent = this.quoted ? `${t('引用')}${this.quoted.name}：${this.quoted.preview}` : '';
+  }
+
+  private isImageMessage(message: DirectMessage): boolean {
+    return message.kind === 'file' && /\.(png|jpe?g|gif|webp|bmp)$/i.test(message.file_name ?? '');
+  }
 
   async hide(): Promise<void> {
     if (!this.peer) return;
@@ -107,19 +142,21 @@ export class DirectChat {
     if (!this.peer || !input || this.sending) return;
     const peer = this.peer, generation = this.generation, body = input.value;
     const staged = this.staged.slice();
+    const replyTo = this.quoted?.id ?? null;
     if (!body.trim() && !staged.length) { this.status('#direct-error', t('请输入消息，或先添加图片/文件')); return; }
     this.sending = true; if (button) button.disabled = true; this.status('#direct-error', '');
     try {
       if (staged.length) {
         const images = staged.filter((item) => item.image).map((item) => item.path);
         const files = staged.filter((item) => !item.image).map((item) => item.path);
-        if (images.length) await invoke<DirectMessage[]>('v1_queue_direct_images', { peer, paths: images, caption: body });
+        if (images.length) await invoke<DirectMessage[]>('v1_queue_direct_images', { peer, paths: images, caption: body, replyTo });
         for (const path of files) await invoke<DirectMessage>('v1_queue_direct_file', { peer, path });
         // A plain file cannot carry a caption yet, so the typed text goes out as its own message.
-        if (!images.length && body.trim()) await invoke<DirectMessage>('v1_queue_direct', { peer, body });
+        if (!images.length && body.trim()) await invoke<DirectMessage>('v1_queue_direct', { peer, body, replyTo });
         this.staged = [];
         this.paintStaging();
         if (this.drafts.get(peer) === body) this.drafts.set(peer, '');
+        if (images.length || body.trim()) { this.quoted = null; this.paintReplyBar(); }
         if (generation === this.generation) {
           if (input.isConnected && input.value === body) input.value = '';
           await this.load(false, true);
@@ -130,8 +167,9 @@ export class DirectChat {
         }
         return;
       }
-      const message = await invoke<DirectMessage>('v1_queue_direct', { peer, body });
+      const message = await invoke<DirectMessage>('v1_queue_direct', { peer, body, replyTo });
       if (this.drafts.get(peer) === body) this.drafts.set(peer, '');
+      this.quoted = null; this.paintReplyBar();
       if (generation === this.generation) {
         if (input.isConnected && input.value === body) input.value = '';
         if (!this.messages.some(item => item.id === message.id)) { this.messages.push(message); this.messages.sort(compare); }
@@ -168,10 +206,11 @@ export class DirectChat {
     const peer = this.peer, generation = this.generation;
     const input = this.root.querySelector<HTMLTextAreaElement>('#direct-input');
     const caption = input?.value ?? '';
+    const replyTo = this.quoted?.id ?? null;
     this.attaching = true;
     this.status('#direct-file-status', t('正在计算校验值…'));
     try {
-      const messages = await invoke<DirectMessage[]>('v1_queue_direct_images', { peer, paths, caption });
+      const messages = await invoke<DirectMessage[]>('v1_queue_direct_images', { peer, paths, caption, replyTo });
       if (generation !== this.generation) return;
       for (const message of messages) {
         if (!this.messages.some(item => item.id === message.id)) this.messages.push(message);
@@ -179,6 +218,7 @@ export class DirectChat {
       this.messages.sort(compare);
       if (input && caption) input.value = '';
       await this.loadBatches();
+      this.quoted = null; this.paintReplyBar();
       this.paint('bottom'); this.onChangeConversations();
       this.status('#direct-file-status', `${t('已加入待发送：')}${messages.length}${t('张图片（对方在线后自动发送）')}`);
     } catch (error) {
@@ -189,9 +229,9 @@ export class DirectChat {
   private async loadBatches(): Promise<void> {
     if (!isTauri() || !this.peer) return;
     try {
-      const rows = await invoke<{ message_id: string; batch_id: string; caption: string }[]>('v1_image_batches', { kind: 'direct', target: this.peer });
-      this.batches.clear(); this.batchCaptions.clear();
-      for (const row of rows) { this.batches.set(row.message_id, row.batch_id); this.batchCaptions.set(row.batch_id, row.caption); }
+      const rows = await invoke<{ message_id: string; batch_id: string; anchor_id: string; caption: string }[]>('v1_image_batches', { kind: 'direct', target: this.peer });
+      this.batches.clear(); this.batchCaptions.clear(); this.batchAnchors.clear();
+      for (const row of rows) { this.batches.set(row.message_id, row.batch_id); this.batchCaptions.set(row.batch_id, row.caption); this.batchAnchors.set(row.batch_id, row.anchor_id); }
     } catch { /* keep the previous grouping */ }
   }
 
@@ -402,7 +442,7 @@ export class DirectChat {
     const generation = ++this.generation;
     await invoke('v1_open_direct', { peer });
     if (generation !== this.generation) return;
-    this.peer = peer; this.name = name; this.messages = []; this.address = ''; this.hasOlder = false; this.refreshBefore = null;
+    this.peer = peer; this.name = name; this.messages = []; this.address = ''; this.hasOlder = false; this.refreshBefore = null; this.quoted = null;
     this.loading = false; this.previews.clear(); this.previewPending.clear(); this.offers = []; this.staged = []; this.paintStaging(); this.onChange();
     try {
       const address = await invoke<string | null>('v1_contact_address', { peer });
@@ -618,6 +658,7 @@ export class DirectChat {
         if (this.renderedBatches.has(batch)) continue;
         this.renderedBatches.add(batch);
         const bubble = document.createElement('div'); bubble.className = 'message-bubble image-batch';
+        this.appendQuoteBlock(bubble, message);
         const caption = this.batchCaptions.get(batch) ?? '';
         if (caption) {
           const text = document.createElement('div');
@@ -640,6 +681,7 @@ export class DirectChat {
         column.append(bubble);
       } else if (message.kind === 'file') {
         const bubble = document.createElement('div'); bubble.className = 'message-bubble file-bubble';
+        this.appendQuoteBlock(bubble, message);
         const name = document.createElement('div'); name.className = 'file-title'; name.textContent = message.file_name ?? message.body;
         bubble.append(name);
         const preview = document.createElement('div'); preview.className = 'file-preview'; preview.dataset.preview = message.id;
@@ -648,7 +690,7 @@ export class DirectChat {
         bubble.append(meta);
         bubble.addEventListener('contextmenu', (event) => this.fileMenu(event, message));
         bubble.addEventListener('click', (event) => {
-          if ((event.target as HTMLElement).closest('.linkish')) return;
+          if ((event.target as HTMLElement).closest('.linkish, .quote-block')) return;
           this.activateFile(message);
         });
         if (message.file_status === 'completed') {
@@ -665,13 +707,22 @@ export class DirectChat {
         column.append(bubble);
         this.ensurePreview(message);
       } else {
-        const body = document.createElement('div'); body.className = 'message-bubble'; body.append(linkifiedText(message.body));
+        const body = document.createElement('div'); body.className = 'message-bubble';
+        this.appendQuoteBlock(body, message);
+        body.append(linkifiedText(message.body));
         body.addEventListener('contextmenu', (event) => this.textMenu(event, message));
         column.append(body);
       }
       const time = document.createElement('small'); time.className = 'message-time';
       time.textContent = formatStamp(message.created_at);
       column.prepend(time);
+      if (message.kind === 'text' || this.isImageMessage(message)) {
+        const tools = document.createElement('div'); tools.className = 'message-tools';
+        const reply = document.createElement('button');
+        reply.className = 'linkish'; reply.textContent = t('引用');
+        reply.dataset.action = 'direct-reply'; reply.dataset.id = message.id;
+        tools.append(reply); column.append(tools);
+      }
       if (!incoming) {
         const status = document.createElement('small'); status.className = 'message-status';
         status.textContent = message.kind === 'file' ? '' : message.status === 'delivered' ? t('已送达') : t('待发送');
@@ -697,8 +748,25 @@ export class DirectChat {
     if (input) input.value = this.drafts.get(this.peer) ?? '';
     if (address) address.value = this.addressDrafts.get(this.peer) ?? this.address;
     this.paintStaging();
+    this.paintReplyBar();
     this.paint('bottom');
   }
+
+  private appendQuoteBlock(container: HTMLElement, message: DirectMessage): void {
+    if (!message.reply_preview) return;
+    const quote = document.createElement('button');
+    quote.className = 'quote-block';
+    quote.dataset.action = 'direct-jump';
+    if (message.reply_to) quote.dataset.id = message.reply_to;
+    quote.textContent = `${message.reply_sender ?? t('原消息')}：${message.reply_preview}`;
+    container.append(quote);
+  }
+}
+
+function previewOfDirect(body: string): string {
+  const collapsed = body.split(/\s+/).filter(Boolean).join(' ');
+  const chars = Array.from(collapsed);
+  return chars.length > 160 ? `${chars.slice(0, 160).join('')}…` : collapsed;
 }
 
 function fileStatus(message: DirectMessage): string {
@@ -791,6 +859,7 @@ function sameMessages(a: DirectMessage[], b: DirectMessage[]): boolean {
   return a.every((item, index) => {
     const other = b[index];
     return other && item.id === other.id && item.status === other.status && item.recalled_at === other.recalled_at
-      && item.file_status === other.file_status && item.file_transferred === other.file_transferred;
+      && item.file_status === other.file_status && item.file_transferred === other.file_transferred
+      && item.reply_to === other.reply_to && item.reply_sender === other.reply_sender && item.reply_preview === other.reply_preview;
   });
 }

@@ -73,6 +73,7 @@ export class GroupChat {
   private avatarBytes: Uint8Array | null = null;
   private batches = new Map<string, string>();
   private batchCaptions = new Map<string, string>();
+  private batchAnchors = new Map<string, string>();
   private renderedBatches = new Set<string>();
   private offers: FileOffer[] = [];
   /// Attachments picked, dropped or pasted but not sent yet, so text and files
@@ -337,7 +338,7 @@ export class GroupChat {
     const caption = input?.value ?? '';
     this.attaching = true;
     try {
-      const messages = await invoke<GroupMessage[]>('v1_queue_group_images', { groupId, paths, caption });
+      const messages = await invoke<GroupMessage[]>('v1_queue_group_images', { groupId, paths, caption, replyTo: this.quoted?.id ?? null });
       if (generation !== this.generation) return;
       for (const message of messages) {
         if (!this.messages.some(item => item.id === message.id)) this.messages.push(message);
@@ -345,6 +346,7 @@ export class GroupChat {
       this.messages.sort(compare);
       if (input && caption) input.value = '';
       await this.loadBatches();
+      this.quoted = null; this.paintReplyBar();
       this.paint('bottom');
       this.status('#group-file-status', `${t('已加入待发送：')}${messages.length}${t('张图片（成员在线后自动发送）')}`);
     } catch (error) { this.status('#group-error', trError(error, t('无法加入图片'))); }
@@ -354,9 +356,9 @@ export class GroupChat {
   private async loadBatches(): Promise<void> {
     if (!isTauri() || !this.groupId) return;
     try {
-      const rows = await invoke<{ message_id: string; batch_id: string; caption: string }[]>('v1_image_batches', { kind: 'group', target: this.groupId });
-      this.batches.clear(); this.batchCaptions.clear();
-      for (const row of rows) { this.batches.set(row.message_id, row.batch_id); this.batchCaptions.set(row.batch_id, row.caption); }
+      const rows = await invoke<{ message_id: string; batch_id: string; anchor_id: string; caption: string }[]>('v1_image_batches', { kind: 'group', target: this.groupId });
+      this.batches.clear(); this.batchCaptions.clear(); this.batchAnchors.clear();
+      for (const row of rows) { this.batches.set(row.message_id, row.batch_id); this.batchCaptions.set(row.batch_id, row.caption); this.batchAnchors.set(row.batch_id, row.anchor_id); }
     } catch { /* keep the previous grouping */ }
   }
 
@@ -435,7 +437,7 @@ export class GroupChat {
         const images = staged.filter((item) => item.image).map((item) => item.path);
         const files = staged.filter((item) => !item.image).map((item) => item.path);
         if (images.length) {
-          const sent = await invoke<GroupMessage[]>('v1_queue_group_images', { groupId, paths: images, caption: body });
+          const sent = await invoke<GroupMessage[]>('v1_queue_group_images', { groupId, paths: images, caption: body, replyTo: this.quoted?.id ?? null });
           for (const item of sent) { if (!this.messages.some(existing => existing.id === item.id)) this.messages.push(item); }
           this.messages.sort(compare);
           await this.loadBatches();
@@ -449,7 +451,8 @@ export class GroupChat {
         if (this.drafts.get(groupId) === body) this.drafts.set(groupId, '');
         if (generation === this.generation) {
           if (input.isConnected && input.value === body) input.value = '';
-          this.quoted = null; this.mentioned.clear(); this.mentionQuery = null;
+          if (images.length || body.trim()) this.quoted = null;
+          this.mentioned.clear(); this.mentionQuery = null;
           await this.load(false, true);
           this.paint('bottom'); this.paintReplyBar(); this.paintMentionPicker(); this.dispatchChanged();
           this.status('#group-file-status', images.length
@@ -638,13 +641,20 @@ export class GroupChat {
   async quote(messageId: string): Promise<void> {
     const message = this.messages.find(item => item.id === messageId);
     if (!message) return;
-    if (message.kind === 'file') {
+    const image = this.isImageMessage(message);
+    if (message.kind === 'file' && !image) {
       try {
         const settings = await invoke<{ group_file_quote: boolean }>('v1_experiment_settings');
         if (!settings.group_file_quote) { this.status('#group-error', t('群文件引用实验功能未开启（设置 → 实验功能）')); return; }
       } catch { this.status('#group-error', t('无法读取实验设置')); return; }
     }
-    this.quoted = { id: message.id, name: message.sender_name, preview: previewOf(message.body) };
+    const batch = image ? this.batches.get(message.id) : undefined;
+    const caption = batch ? this.batchCaptions.get(batch)?.trim() : '';
+    this.quoted = {
+      id: batch ? this.batchAnchors.get(batch) ?? message.id : message.id,
+      name: message.sender_name,
+      preview: image ? caption ? previewOf(caption) : t('图片') : previewOf(message.body),
+    };
     this.paintReplyBar();
     const input = this.root.querySelector<HTMLTextAreaElement>('#group-input');
     input?.focus();
